@@ -200,6 +200,30 @@ struct FileCtx {
     /// file-scope binding for its routes — always Heuristic, because
     /// single-lambda-per-file is an assumption, not knowledge.
     cdk_lambda: FxHashMap<u32, Option<u32>>,
+    /// ASP.NET class name -> class-level `[Route(...)]` template, from
+    /// `type_decorations`. Keyed by bare class name project-wide because
+    /// attribute routing inherits across files (`Controller : BaseApi`).
+    /// `None` = conflicting templates under one name.
+    aspnet_route: FxHashMap<String, Option<String>>,
+    /// C# derived class -> direct bases, for walking inherited `[Route]`
+    /// templates up the controller hierarchy.
+    csharp_bases: FxHashMap<String, Vec<String>>,
+    /// file id -> the file's single minimal-API `MapGroup` (prefix, receiver
+    /// of the MapGroup call). Same single-declaration assumption as
+    /// `cdk_lambda`: `var api = app.MapGroup("/api")` binds through an
+    /// assignment the extractor never surfaces, so Map* calls whose receiver
+    /// differs from the group's own receiver borrow the prefix, Heuristic.
+    csharp_group: FxHashMap<u32, Option<(String, String)>>,
+    /// Rust router-composition edge: function id -> (prefix, function whose
+    /// body nests/merges it). From `nest("/api", api_router())` /
+    /// `merge(users::router())` — the target resolved by name (+ module-path
+    /// hint against file stem / containing mod). `None` = mounted at
+    /// conflicting prefixes. Walked transitively at emission.
+    rust_parent: FxHashMap<u32, Option<(String, u32)>>,
+    /// actix handler function id -> `web::scope(...)` prefix chain from a
+    /// `.service(handler)` registration elsewhere. `None` = registered under
+    /// conflicting scopes.
+    actix_scope: FxHashMap<u32, Option<String>>,
 }
 
 /// CDK import evidence: v2 monopackage + v1 scoped packages (JS/TS) and the
@@ -207,27 +231,30 @@ struct FileCtx {
 const CDK_EV_JS: &[&str] = &["aws-cdk-lib", "@aws-cdk/"];
 const CDK_EV_PY: &[&str] = &["aws_cdk"];
 
-/// Record a mount prefix, degrading to `None` when the same key is mounted
-/// at two different prefixes (ambiguous joins are worse than no join).
-fn upsert_mount<K: std::hash::Hash + Eq>(
-    map: &mut FxHashMap<K, Option<String>>,
+/// Record a mount prefix (or any join fact), degrading to `None` when the
+/// same key is recorded with two different values (ambiguous joins are worse
+/// than no join).
+fn upsert_mount<K: std::hash::Hash + Eq, V: PartialEq>(
+    map: &mut FxHashMap<K, Option<V>>,
     key: K,
-    prefix: String,
+    val: V,
 ) {
     map.entry(key)
         .and_modify(|v| {
-            if v.as_deref() != Some(prefix.as_str()) {
+            if v.as_ref() != Some(&val) {
                 *v = None;
             }
         })
-        .or_insert(Some(prefix));
+        .or_insert(Some(val));
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn detect(
     files: &[FileInfo],
     functions: &[FunctionInfo],
     raw_calls: &[Vec<RawCall>],
     decorations: &[Vec<RawDecoration>],
+    type_decorations: &[Vec<(String, RawDecoration)>],
     name_index: &FxHashMap<String, Vec<u32>>,
     file_hierarchy: &[Vec<(String, String)>],
     project_evidence: &str,
@@ -486,6 +513,86 @@ pub fn detect(
                     cdk_decls.entry(fid).or_default(),
                 );
             }
+            Lang::CSharp => {
+                // Minimal-API groups: `app.MapGroup("/api")`. The `var api =`
+                // binding is an assignment the extractor never surfaces, so
+                // record (prefix, MapGroup receiver) per file; emission
+                // borrows it for Map* calls on OTHER receivers when the file
+                // declares exactly one group (cdk_lambda-style assumption).
+                for call in calls {
+                    if call.name != "MapGroup" {
+                        continue;
+                    }
+                    let Some(prefix) = first_str_lit(call).filter(|p| !p.trim().is_empty()) else {
+                        continue;
+                    };
+                    let recv = call.receiver.clone().unwrap_or_default();
+                    ctx.csharp_group
+                        .entry(fid)
+                        .and_modify(|v| {
+                            if v.as_ref().is_none_or(|(p, r)| (p, r) != (&prefix, &recv)) {
+                                *v = None;
+                            }
+                        })
+                        .or_insert(Some((prefix, recv)));
+                }
+            }
+            Lang::Rust => {
+                // axum router composition: `nest("/api", api_router())` /
+                // `merge(users::router())` — resolve the called router fn by
+                // name (module-path hint checked against the candidate's file
+                // stem / containing mod) and record a prefix edge from it to
+                // this function. Walked transitively at emission.
+                if has(fid, &["axum"]) {
+                    for call in calls {
+                        let prefix = match call.name.as_str() {
+                            "nest" | "nest_service" => {
+                                let Some(p) = first_path_lit(call) else {
+                                    continue;
+                                };
+                                p
+                            }
+                            "merge" => String::new(),
+                            _ => continue,
+                        };
+                        let Some(target) =
+                            rust_scoped_target(call, functions, name_index, Some(func.id))
+                        else {
+                            continue;
+                        };
+                        upsert_mount(&mut ctx.rust_parent, target, (prefix, func.id));
+                    }
+                }
+                // actix `web::scope("/api").service(handler)`: the handler's
+                // attribute-macro route (declared on the fn, wherever it
+                // lives) joins the scope chain of the registering call.
+                if has(fid, &["actix"]) {
+                    for call in calls {
+                        if call.name != "service" {
+                            continue;
+                        }
+                        let prefix = actix_chain_prefix(calls, call, 0);
+                        if prefix.is_empty() {
+                            continue;
+                        }
+                        let Some(target) =
+                            rust_scoped_target(call, functions, name_index, Some(func.id))
+                        else {
+                            continue;
+                        };
+                        // Only handlers that actually carry a verb attribute:
+                        // `.service(other_scope)` idents must not bind.
+                        let is_handler = decorations[target as usize].iter().any(|d| {
+                            d.name == "route"
+                                || HttpMethod::from_name(&d.name)
+                                    .is_some_and(|m| m != HttpMethod::Any)
+                        });
+                        if is_handler {
+                            upsert_mount(&mut ctx.actix_scope, target, prefix);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -494,6 +601,28 @@ pub fn detect(
         // declaration becomes a borrowable binding.
         ctx.cdk_lambda
             .insert(fid, if decls.len() == 1 { decls[0] } else { None });
+    }
+
+    // ASP.NET class-level `[Route]` templates from type_decorations, keyed
+    // project-wide by class name (attribute routing inherits across files),
+    // plus the C# hierarchy for walking templates up to base controllers.
+    for (fid, tds) in type_decorations.iter().enumerate() {
+        if files[fid].language != Lang::CSharp {
+            continue;
+        }
+        for (class, d) in tds {
+            if d.name == "Route" || d.name == "RouteAttribute" {
+                if let Some(tpl) = first_deco_str(d) {
+                    upsert_mount(&mut ctx.aspnet_route, class.clone(), tpl);
+                }
+            }
+        }
+        for (derived, base) in &file_hierarchy[fid] {
+            let bases = ctx.csharp_bases.entry(derived.clone()).or_default();
+            if !bases.contains(base) {
+                bases.push(base.clone());
+            }
+        }
     }
 
     for func in functions {
@@ -1393,6 +1522,7 @@ fn detect_server(
                             "laravel",
                             fid,
                             call.line,
+                            None,
                         );
                     }
                     _ => {
@@ -1821,7 +1951,25 @@ fn detect_server(
             }
         }
         Lang::CSharp => {
-            // Attribute routing [HttpGet("{id}")] + minimal APIs app.MapGet("/x", ...)
+            // Attribute routing: `[HttpGet("{id}")]` composed with the
+            // class-level `[Route("api/[controller]")]` template (validated
+            // against gothinkster/aspnetcore-realworld and eShopOnWeb).
+            // `[controller]`/`[action]` tokens are substituted (class name
+            // minus the Controller suffix / the method name), templates
+            // starting with `/` or `~/` override the class prefix, and a
+            // method-less base controller's template is inherited through the
+            // C# hierarchy (Heuristic — name-keyed across files).
+            let class_route = func
+                .containing_type
+                .as_deref()
+                .and_then(|t| aspnet_class_route(t, ctx));
+            // Method-level `[Route("Logout")]` acts as the template for
+            // verb attributes on the same method that lack their own.
+            let method_routes: Vec<&RawDecoration> = decos
+                .iter()
+                .filter(|d| d.name == "Route" || d.name == "RouteAttribute")
+                .collect();
+            let mut verbs = 0usize;
             for d in decos {
                 let method = match d.name.as_str() {
                     "HttpGet" => HttpMethod::Get,
@@ -1829,15 +1977,16 @@ fn detect_server(
                     "HttpPut" => HttpMethod::Put,
                     "HttpDelete" => HttpMethod::Delete,
                     "HttpPatch" => HttpMethod::Patch,
+                    "HttpHead" => HttpMethod::Head,
+                    "HttpOptions" => HttpMethod::Options,
                     _ => continue,
                 };
-                let path = d
-                    .arg_lits
-                    .iter()
-                    .find(|l| l.kind == LitKind::Str)
-                    .map(|l| l.text.clone())
+                verbs += 1;
+                let tpl = first_deco_str(d)
+                    .or_else(|| method_routes.first().and_then(|r| first_deco_str(r)))
                     .unwrap_or_default();
-                let Some(norm) = normalize_path(&ensure_slash(&path)) else {
+                let (path, conf) = aspnet_compose(&tpl, class_route.as_ref(), func);
+                let Some(norm) = normalize_path(&path) else {
                     continue;
                 };
                 idx.endpoints.push(Endpoint {
@@ -1850,9 +1999,39 @@ fn detect_server(
                     file_id: fid,
                     line: d.line,
                     handler: Some(func.id),
-                    confidence: Confidence::High,
+                    confidence: conf,
                 });
             }
+            // `[Route("x")]` with no verb attribute on a controller method:
+            // routable via any verb.
+            if verbs == 0 && class_route.is_some() {
+                for r in &method_routes {
+                    let tpl = first_deco_str(r).unwrap_or_default();
+                    let (path, conf) = aspnet_compose(&tpl, class_route.as_ref(), func);
+                    let Some(norm) = normalize_path(&path) else {
+                        continue;
+                    };
+                    idx.endpoints.push(Endpoint {
+                        id: idx.endpoints.len() as u32,
+                        kind: ApiKind::Http,
+                        method: HttpMethod::Any,
+                        path_raw: path,
+                        path_norm: norm,
+                        framework: "aspnet".into(),
+                        file_id: fid,
+                        line: r.line,
+                        handler: Some(func.id),
+                        confidence: conf,
+                    });
+                }
+            }
+            // Minimal APIs: app.MapGet("/x", ...) — slash-less route
+            // patterns are legal (`MapGet("api/catalog-items", ...)`,
+            // eShopOnWeb) — plus MapGroup prefix joins: a chained
+            // `app.MapGroup("/api").MapGet(...)` shares the chain-start byte;
+            // a `var api = app.MapGroup(...)` group is borrowed file-wide
+            // when the Map* receiver differs from the group's own receiver
+            // (single-group-per-file assumption, Heuristic).
             for call in calls {
                 let method = match call.name.as_str() {
                     "MapGet" => HttpMethod::Get,
@@ -1862,23 +2041,41 @@ fn detect_server(
                     "MapPatch" => HttpMethod::Patch,
                     _ => continue,
                 };
-                let Some(path) = first_path_lit(call) else {
+                let Some(path) = first_str_lit(call)
+                    .filter(|p| !p.trim().is_empty() && !p.contains(' ') && !p.contains("://"))
+                else {
                     continue;
+                };
+                // Chained MapGroup(s) on the same builder chain.
+                let mut group: Vec<&RawCall> = calls
+                    .iter()
+                    .filter(|g| {
+                        g.name == "MapGroup"
+                            && g.start_byte == call.start_byte
+                            && g.end_byte < call.end_byte
+                    })
+                    .collect();
+                group.sort_by_key(|g| g.end_byte);
+                let chain_prefix = group
+                    .iter()
+                    .filter_map(|g| first_str_lit(g))
+                    .fold(String::new(), |acc, p| join_prefix(&acc, &p));
+                let (path, conf) = if !chain_prefix.is_empty() {
+                    (join_prefix(&chain_prefix, &path), Confidence::Heuristic)
+                } else if let Some(Some((p, grecv))) = ctx.csharp_group.get(&fid) {
+                    match &call.receiver {
+                        Some(r) if r != grecv => {
+                            (join_prefix(p, &path), Confidence::Heuristic)
+                        }
+                        _ => (ensure_slash(&path), Confidence::High),
+                    }
+                } else {
+                    (ensure_slash(&path), Confidence::High)
                 };
                 let Some(norm) = normalize_path(&path) else {
                     continue;
                 };
-                push_endpoint(
-                    idx,
-                    method,
-                    path,
-                    norm,
-                    "aspnet",
-                    func,
-                    call,
-                    None,
-                    Confidence::High,
-                );
+                push_endpoint(idx, method, path, norm, "aspnet", func, call, None, conf);
             }
         }
         Lang::Go => {
@@ -1993,13 +2190,89 @@ fn detect_server(
             if !sinatra && !rails_routes {
                 return;
             }
+            // Container blocks. A Ruby call node's span INCLUDES its
+            // `do..end` block, so byte containment recovers the (possibly
+            // nested) prefix chain: Rails `resources :users do ... end`,
+            // `member`/`collection`, `namespace :admin`, `scope '/api'`, and
+            // Sinatra's `namespace '/gollum'` (sinatra-namespace, validated
+            // against gollum). Validated against mhartl/sample_app_6th_ed
+            // and redmine's config/routes.rb.
+            let ctns: Vec<RubyCtn> = calls
+                .iter()
+                .filter(|c| c.receiver.is_none())
+                .filter_map(|c| {
+                    let kind = match c.name.as_str() {
+                        "resources" | "resource" if rails_routes => {
+                            let base = rb_symbol_arg(c)?;
+                            RubyCtnKind::Res {
+                                base,
+                                plural: c.name == "resources",
+                            }
+                        }
+                        "namespace" if rails_routes => RubyCtnKind::Prefix(rb_symbol_arg(c)?),
+                        "namespace" if sinatra => {
+                            let p = first_path_lit(c)?;
+                            RubyCtnKind::Prefix(p.trim_matches('/').to_string())
+                        }
+                        "scope" if rails_routes => {
+                            // Path-less `scope module: 'api'` alters
+                            // controllers, not paths — no prefix.
+                            let p = rb_symbol_arg(c).or_else(|| {
+                                c.arg_lits
+                                    .iter()
+                                    .find(|l| {
+                                        l.kind == LitKind::Str
+                                            && rb_key(l).as_deref() == Some("path")
+                                    })
+                                    .map(|l| l.text.trim_matches('/').to_string())
+                            })?;
+                            RubyCtnKind::Prefix(p)
+                        }
+                        "member" if rails_routes => RubyCtnKind::Member,
+                        "collection" if rails_routes => RubyCtnKind::Collection,
+                        _ => return None,
+                    };
+                    Some(RubyCtn {
+                        start: c.start_byte,
+                        end: c.end_byte,
+                        kind,
+                    })
+                })
+                .collect();
             for call in calls {
                 if call.receiver.is_some() {
                     continue;
                 }
+                // `root to: 'home#index'` / `root 'home#index'` -> GET on
+                // the enclosing prefix.
+                if rails_routes && call.name == "root" {
+                    let prefix = rb_prefix(&ctns, call, None);
+                    let path = join_prefix(&prefix, "");
+                    let Some(norm) = normalize_path(&path) else {
+                        continue;
+                    };
+                    let conf = if prefix.is_empty() {
+                        Confidence::High
+                    } else {
+                        Confidence::Heuristic
+                    };
+                    push_endpoint(
+                        idx,
+                        HttpMethod::Get,
+                        path,
+                        norm,
+                        "rails",
+                        func,
+                        call,
+                        None,
+                        conf,
+                    );
+                    continue;
+                }
                 // Rails `resources :users` / `resource :profile` ->
-                // conventional route expansion (Heuristic; `only:`/`except:`
-                // options are not interpreted).
+                // conventional route expansion under the enclosing prefix
+                // chain (nested resources included), honoring
+                // `only:`/`except:` (Heuristic: implied by convention).
                 if rails_routes && matches!(call.name.as_str(), "resources" | "resource") {
                     let plural = call.name == "resources";
                     for lit in call
@@ -2011,7 +2284,23 @@ fn detect_server(
                         if base.is_empty() || base.contains(['/', '.', ':']) {
                             continue;
                         }
-                        expand_resource(idx, base, ":id", plural, false, "rails", fid, call.line);
+                        let prefix = rb_prefix(&ctns, call, None);
+                        let full = if prefix.is_empty() {
+                            base.to_string()
+                        } else {
+                            format!("{}/{base}", prefix.trim_matches('/'))
+                        };
+                        expand_resource(
+                            idx,
+                            &full,
+                            ":id",
+                            plural,
+                            false,
+                            "rails",
+                            fid,
+                            call.line,
+                            rb_action_filter(call).as_ref(),
+                        );
                     }
                     continue;
                 }
@@ -2021,34 +2310,102 @@ fn detect_server(
                 if method == HttpMethod::Any && call.name != "match" {
                     continue;
                 }
-                let Some(path) = first_str_lit(call) else {
-                    continue;
+                // `match ..., via: [:get, :post]` -> one row per verb.
+                let methods: Vec<HttpMethod> = if rails_routes && call.name == "match" {
+                    let via: Vec<HttpMethod> = call
+                        .arg_lits
+                        .iter()
+                        .filter(|l| {
+                            l.kind == LitKind::Str && rb_key(l).as_deref() == Some("via")
+                        })
+                        .filter_map(|l| HttpMethod::from_name(l.text.trim_start_matches(':')))
+                        .collect();
+                    if via.is_empty() || via.contains(&HttpMethod::Any) {
+                        vec![HttpMethod::Any]
+                    } else {
+                        via
+                    }
+                } else {
+                    vec![method]
                 };
-                if !path.starts_with('/') {
-                    continue;
+                // `on: :member` / `on: :collection` shifts the enclosing
+                // resources context without a block.
+                let leaf_on = call
+                    .arg_lits
+                    .iter()
+                    .find(|l| l.kind == LitKind::Str && rb_key(l).as_deref() == Some("on"))
+                    .map(|l| l.text.trim_start_matches(':') == "member");
+                for lit in call
+                    .arg_lits
+                    .iter()
+                    .filter(|l| l.kind == LitKind::Str && l.key.is_none())
+                {
+                    // Controller refs ('home#index') and option values never
+                    // name a path; symbols (`get :following`) become action
+                    // segments under the member/collection context.
+                    if lit.text.contains(['#', ' ']) || lit.text.is_empty() {
+                        continue;
+                    }
+                    let is_symbol = lit.text.starts_with(':');
+                    let seg = lit.text.trim_start_matches(':');
+                    if seg.is_empty() || (is_symbol && seg.contains('/')) {
+                        continue;
+                    }
+                    if !rails_routes && !lit.text.starts_with('/') {
+                        continue; // Sinatra: literal paths only.
+                    }
+                    if is_symbol && !rails_routes {
+                        continue;
+                    }
+                    let prefix = rb_prefix(&ctns, call, leaf_on);
+                    // Rails optional segments (`'(projects/:id)/search'`)
+                    // keep the segment, dropping only the parens (the
+                    // with-segment variant of the route).
+                    let seg = if rails_routes && seg.contains('(') {
+                        seg.replace(['(', ')'], "")
+                    } else {
+                        seg.to_string()
+                    };
+                    let path = join_prefix(&prefix, &seg);
+                    let Some(norm) = normalize_path(&path) else {
+                        continue;
+                    };
+                    let fw = if rails_routes { "rails" } else { "sinatra" };
+                    let conf = if prefix.is_empty() && !is_symbol {
+                        Confidence::High
+                    } else {
+                        Confidence::Heuristic
+                    };
+                    for m in &methods {
+                        push_endpoint(
+                            idx,
+                            *m,
+                            path.clone(),
+                            norm.clone(),
+                            fw,
+                            func,
+                            call,
+                            None,
+                            conf,
+                        );
+                    }
+                    // Only the first literal path counts for string routes
+                    // (`get '/help', ...`); symbol lists (`get :following,
+                    // :followers`) emit one route each.
+                    if !is_symbol {
+                        break;
+                    }
                 }
-                let Some(norm) = normalize_path(&path) else {
-                    continue;
-                };
-                let fw = if rails_routes { "rails" } else { "sinatra" };
-                push_endpoint(
-                    idx,
-                    method,
-                    path,
-                    norm,
-                    fw,
-                    func,
-                    call,
-                    None,
-                    Confidence::High,
-                );
             }
         }
         Lang::Rust => {
             // actix-web: `#[get("/users/{id}")]` attribute macros captured as
             // decorations (the attribute precedes the fn item; the extractor
-            // associates it via nearest-following-function).
+            // associates it via nearest-following-function). A scope prefix
+            // recorded by a `web::scope("/api").service(handler)`
+            // registration elsewhere joins here (Heuristic).
             if has(fid, &["actix"]) {
+                let scope = ctx.actix_scope.get(&func.id).cloned().flatten();
                 for d in decos {
                     let is_route = d.name == "route";
                     let method = HttpMethod::from_name(&d.name);
@@ -2063,9 +2420,6 @@ fn detect_server(
                     else {
                         continue;
                     };
-                    let Some(norm) = normalize_path(&path) else {
-                        continue;
-                    };
                     // #[route("/x", method = "GET")]: token_tree args are
                     // flat, so the method is any non-path string literal.
                     let method = if is_route {
@@ -2077,6 +2431,13 @@ fn detect_server(
                     } else {
                         method.unwrap()
                     };
+                    let (path, conf) = match &scope {
+                        Some(p) => (join_prefix(p, &path), Confidence::Heuristic),
+                        None => (path, Confidence::High),
+                    };
+                    let Some(norm) = normalize_path(&path) else {
+                        continue;
+                    };
                     idx.endpoints.push(Endpoint {
                         id: idx.endpoints.len() as u32,
                         kind: ApiKind::Http,
@@ -2087,13 +2448,103 @@ fn detect_server(
                         file_id: fid,
                         line: d.line,
                         handler: Some(func.id),
-                        confidence: Confidence::High,
+                        confidence: conf,
+                    });
+                }
+                // Builder-style routes (validated against actix/examples):
+                // `web::resource("/auth").route(web::post().to(login))`,
+                // `.route("/path", web::get().to(handler))`, both under
+                // `web::scope(...)` chains composed by `actix_chain_prefix`.
+                // Anchored on each `.to(handler)` call: the chained
+                // `web::get()` supplies the verb (chain links share their
+                // start byte), the enclosing `route`/`resource` chain the
+                // path.
+                for t in calls {
+                    if t.name != "to" {
+                        continue;
+                    }
+                    let Some(verb) = calls
+                        .iter()
+                        .filter(|v| {
+                            v.start_byte == t.start_byte
+                                && v.end_byte < t.end_byte
+                                && v.receiver.as_deref() == Some("web")
+                        })
+                        .find_map(|v| HttpMethod::from_name(&v.name))
+                    else {
+                        continue; // not a route chain (`web::to(...)` etc.)
+                    };
+                    // Same-chain resource (`web::resource("/x").to(h)`), else
+                    // the smallest enclosing `route` call.
+                    let same_chain_res = calls.iter().find(|r| {
+                        r.name == "resource"
+                            && r.start_byte == t.start_byte
+                            && r.end_byte < t.end_byte
+                            && first_str_lit(r).is_some()
+                    });
+                    let (anchor, base): (&RawCall, String) = match same_chain_res {
+                        Some(r) => (t, first_str_lit(r).unwrap_or_default()),
+                        None => {
+                            let Some(rt) = calls
+                                .iter()
+                                .filter(|r| {
+                                    r.name == "route"
+                                        && r.start_byte < t.start_byte
+                                        && r.end_byte >= t.end_byte
+                                })
+                                .min_by_key(|r| r.end_byte - r.start_byte)
+                            else {
+                                continue;
+                            };
+                            let base = calls
+                                .iter()
+                                .find(|r| {
+                                    r.name == "resource"
+                                        && r.start_byte == rt.start_byte
+                                        && r.end_byte < rt.end_byte
+                                        && first_str_lit(r).is_some()
+                                })
+                                .and_then(|r| first_str_lit(r))
+                                .or_else(|| first_path_lit(rt));
+                            let Some(base) = base else {
+                                continue;
+                            };
+                            (rt, base)
+                        }
+                    };
+                    let prefix = actix_chain_prefix(calls, anchor, 0);
+                    let path = join_prefix(&prefix, &base);
+                    let Some(norm) = normalize_path(&path) else {
+                        continue;
+                    };
+                    let handler = handler_from_ident(t, func, functions, name_index)
+                        .or_else(|| rust_scoped_target(t, functions, name_index, None));
+                    let conf = if prefix.is_empty() {
+                        Confidence::High
+                    } else {
+                        Confidence::Heuristic
+                    };
+                    idx.endpoints.push(Endpoint {
+                        id: idx.endpoints.len() as u32,
+                        kind: ApiKind::Http,
+                        method: verb,
+                        path_raw: path,
+                        path_norm: norm,
+                        framework: "actix".into(),
+                        file_id: fid,
+                        line: t.line,
+                        handler,
+                        confidence: conf,
                     });
                 }
             }
             if !has(fid, &["axum"]) {
                 return;
             }
+            // Function-level prefix: this function's Router is nested/merged
+            // elsewhere (`nest("/api", api_router())`), possibly through
+            // several levels (validated against tokio-rs/axum examples).
+            let fn_prefix = rust_fn_prefix(ctx, func.id);
             for call in calls {
                 if call.name != "route" {
                     continue;
@@ -2101,32 +2552,84 @@ fn detect_server(
                 let Some(path) = first_path_lit(call) else {
                     continue;
                 };
+                // Inline `.nest("/api", Router::new().route(...))`: the nest
+                // call's span contains this route call (a chained route
+                // SHARES the nest's start byte and must not join).
+                let mut inline: Vec<&RawCall> = calls
+                    .iter()
+                    .filter(|n| {
+                        matches!(n.name.as_str(), "nest" | "nest_service")
+                            && n.start_byte < call.start_byte
+                            && n.end_byte >= call.end_byte
+                    })
+                    .collect();
+                inline.sort_by_key(|n| n.start_byte);
+                let prefix = inline
+                    .iter()
+                    .filter_map(|n| first_path_lit(n))
+                    .fold(fn_prefix.clone(), |acc, p| join_prefix(&acc, &p));
+                // Verbs live in the ARGUMENT region: past the receiver
+                // chain (all same-start calls ending before this one), so a
+                // chained `.route("/a", post(x)).route("/b", get(y))` binds
+                // each verb to its own route call, not the chain's first.
+                let recv_end = calls
+                    .iter()
+                    .filter(|c| {
+                        c.start_byte == call.start_byte && c.end_byte < call.end_byte
+                    })
+                    .map(|c| c.end_byte)
+                    .max()
+                    .unwrap_or(call.start_byte);
+                let verbs: Vec<&RawCall> = calls
+                    .iter()
+                    .filter(|v| {
+                        v.start_byte > recv_end
+                            && v.start_byte > call.start_byte
+                            && v.end_byte <= call.end_byte
+                            && rust_verb(&v.name).is_some()
+                    })
+                    .collect();
+                let conf = if prefix.is_empty() {
+                    Confidence::High
+                } else {
+                    Confidence::Heuristic
+                };
+                let path = join_prefix(&prefix, &path);
                 let Some(norm) = normalize_path(&path) else {
                     continue;
                 };
-                // Method from the nested `get(handler)` call inside this
-                // route call's byte range.
-                let inner = calls.iter().find(|c| {
-                    c.start_byte > call.start_byte
-                        && c.end_byte <= call.end_byte
-                        && VERBS.contains(&c.name.as_str())
-                });
-                let method = inner
-                    .and_then(|c| HttpMethod::from_name(&c.name))
-                    .unwrap_or(HttpMethod::Any);
-                let handler =
-                    inner.and_then(|c| handler_from_ident(c, func, functions, name_index));
-                push_endpoint(
-                    idx,
-                    method,
-                    path,
-                    norm,
-                    "axum",
-                    func,
-                    call,
-                    handler,
-                    Confidence::High,
-                );
+                if verbs.is_empty() {
+                    push_endpoint(
+                        idx,
+                        HttpMethod::Any,
+                        path,
+                        norm,
+                        "axum",
+                        func,
+                        call,
+                        None,
+                        conf,
+                    );
+                    continue;
+                }
+                // One endpoint per method-router verb: `get(a).post(b)`.
+                for v in verbs {
+                    let method = rust_verb(&v.name).unwrap();
+                    let handler = handler_from_ident(v, func, functions, name_index)
+                        .or_else(|| rust_scoped_target(v, functions, name_index, None));
+                    idx.endpoints.push(Endpoint {
+                        id: idx.endpoints.len() as u32,
+                        kind: ApiKind::Http,
+                        method,
+                        path_raw: path.clone(),
+                        path_norm: norm.clone(),
+                        framework: "axum".into(),
+                        file_id: fid,
+                        line: call.line,
+                        handler,
+                        confidence: conf,
+                    });
+                }
             }
         }
         _ => {}
@@ -3096,11 +3599,306 @@ fn push_endpoint(
     });
 }
 
+/// axum method-router verb, including tower-service variants
+/// (`post_service(...)`).
+fn rust_verb(name: &str) -> Option<HttpMethod> {
+    let base = name.strip_suffix("_service").unwrap_or(name);
+    if !VERBS.contains(&base) {
+        return None;
+    }
+    HttpMethod::from_name(base)
+}
+
+/// Resolve a function referenced by a `nest`/`merge`/`service`/`to`
+/// argument. Each ident argument (a scoped path survives as ONE ident,
+/// `"users::router"`) splits into name + module hint; the hint must match
+/// the candidate's file stem (`users.rs` / `users/mod.rs`) or containing
+/// `mod`. Unhinted names only bind when project-unique. First unique hit
+/// wins, so `get(kv_get.layer(...))` resolves `kv_get`, not `layer`.
+fn rust_scoped_target(
+    call: &RawCall,
+    functions: &[FunctionInfo],
+    name_index: &FxHashMap<String, Vec<u32>>,
+    exclude: Option<u32>,
+) -> Option<u32> {
+    for lit in call
+        .arg_lits
+        .iter()
+        .filter(|l| l.kind == LitKind::Ident && l.key.is_none())
+    {
+        let parts: Vec<&str> = lit
+            .text
+            .split([':', '.'])
+            .filter(|s| !s.is_empty())
+            .collect();
+        let Some(name) = parts.last() else {
+            continue;
+        };
+        let hint = (parts.len() >= 2).then(|| parts[parts.len() - 2]);
+        let Some(ids) = name_index.get(*name) else {
+            continue;
+        };
+        let candidates: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|&id| !functions[id as usize].is_toplevel && Some(id) != exclude)
+            .filter(|&id| {
+                hint.is_none_or(|h| {
+                    let f = &functions[id as usize];
+                    f.containing_type.as_deref() == Some(h)
+                        || f.qualified_name
+                            .split("::")
+                            .next()
+                            .is_some_and(|scope| rust_mod_matches(scope, h))
+                })
+            })
+            .collect();
+        if candidates.len() == 1 {
+            return Some(candidates[0]);
+        }
+    }
+    None
+}
+
+/// Does a function's file-derived scope (`src/http/users` or
+/// `src/http/users/mod`) name the module `hint`?
+fn rust_mod_matches(scope: &str, hint: &str) -> bool {
+    let scope = scope.strip_suffix("/mod").unwrap_or(scope);
+    scope.rsplit('/').next() == Some(hint)
+}
+
+/// Walk `nest`/`merge` composition edges up from a router-declaring
+/// function, joining prefixes outermost-first (`nest("/api", router())` in
+/// main, `nest("/user", user_routes())` in router -> "/api/user").
+fn rust_fn_prefix(ctx: &FileCtx, id: u32) -> String {
+    let mut segs: Vec<&str> = Vec::new();
+    let mut cur = id;
+    let mut seen = vec![id];
+    while let Some(Some((p, parent))) = ctx.rust_parent.get(&cur) {
+        if seen.contains(parent) {
+            break; // cycle guard
+        }
+        if !p.trim_matches('/').is_empty() {
+            segs.push(p);
+        }
+        seen.push(*parent);
+        cur = *parent;
+    }
+    segs.iter()
+        .rev()
+        .fold(String::new(), |acc, p| join_prefix(&acc, p))
+}
+
+/// actix scope composition for a chained call: `web::scope("/api")` links
+/// share their chain's start byte with every call chained onto them; nested
+/// chains (`.service(web::scope("/v1").service(...))`) climb through the
+/// smallest properly-enclosing `service` call. Validated against
+/// actix/examples nested-routing (three scope levels).
+fn actix_chain_prefix(calls: &[RawCall], c: &RawCall, depth: usize) -> String {
+    if depth > 12 {
+        return String::new();
+    }
+    let mut own: Vec<&RawCall> = calls
+        .iter()
+        .filter(|s| {
+            s.name == "scope" && s.start_byte == c.start_byte && s.end_byte <= c.end_byte
+        })
+        .collect();
+    own.sort_by_key(|s| s.end_byte);
+    let own_path = own
+        .iter()
+        .filter_map(|s| first_str_lit(s))
+        .filter(|p| !p.trim_matches('/').is_empty())
+        .fold(String::new(), |acc, p| join_prefix(&acc, &p));
+    let parent = calls
+        .iter()
+        .filter(|p| {
+            p.name == "service" && p.start_byte < c.start_byte && p.end_byte >= c.end_byte
+        })
+        .min_by_key(|p| p.end_byte - p.start_byte);
+    match parent {
+        Some(p) => {
+            let up = actix_chain_prefix(calls, p, depth + 1);
+            if up.is_empty() {
+                own_path
+            } else if own_path.is_empty() {
+                up
+            } else {
+                join_prefix(&up, &own_path)
+            }
+        }
+        None => own_path,
+    }
+}
+
+/// A Rails/Sinatra routing container block (`resources :users do ... end`,
+/// `namespace :admin`, `scope '/api'`, `member`/`collection`, Sinatra
+/// `namespace '/gollum'`): a call whose span (including the `do..end` block)
+/// encloses the routes it prefixes.
+struct RubyCtn {
+    start: u32,
+    end: u32,
+    kind: RubyCtnKind,
+}
+
+enum RubyCtnKind {
+    /// `resources`/`resource` — contributes `base/:id` under `member`,
+    /// `base` under `collection`, `base/:{singular}_id` for nested routes.
+    Res { base: String, plural: bool },
+    /// `namespace`/`scope` (Rails) or `namespace` (Sinatra): a plain path
+    /// segment.
+    Prefix(String),
+    Member,
+    Collection,
+}
+
+/// First unkeyed symbol-or-string argument as a path segment (`:admin` ->
+/// "admin", `'/api/v2'` -> "api/v2").
+fn rb_symbol_arg(call: &RawCall) -> Option<String> {
+    call.arg_lits
+        .iter()
+        .find(|l| l.kind == LitKind::Str && l.key.is_none())
+        .map(|l| l.text.trim_start_matches(':').trim_matches('/').to_string())
+        .filter(|s| !s.is_empty() && !s.contains(['#', ' ']))
+}
+
+/// Kwarg key with the old hash-rocket colon stripped (`:via =>` and `via:`
+/// both harvest, with keys ":via" / "via").
+fn rb_key(l: &crate::extract::ArgLit) -> Option<String> {
+    l.key.as_ref().map(|k| k.trim_start_matches(':').to_string())
+}
+
+fn rb_singular(base: &str) -> &str {
+    base.strip_suffix('s').unwrap_or(base)
+}
+
+/// Fold the enclosing container chain into a path prefix. `leaf_on` carries
+/// a block-less `on: :member` (true) / `on: :collection` (false) kwarg,
+/// which shifts the innermost `resources` context.
+fn rb_prefix(ctns: &[RubyCtn], call: &RawCall, leaf_on: Option<bool>) -> String {
+    let mut chain: Vec<&RubyCtn> = ctns
+        .iter()
+        .filter(|c| c.start < call.start_byte && c.end >= call.end_byte)
+        .collect();
+    chain.sort_by_key(|c| c.start); // outermost first
+    let mut out = String::new();
+    for (i, c) in chain.iter().enumerate() {
+        match &c.kind {
+            RubyCtnKind::Prefix(p) => out = join_prefix(&out, p),
+            RubyCtnKind::Member | RubyCtnKind::Collection => {}
+            RubyCtnKind::Res { base, plural } => {
+                if !plural {
+                    out = join_prefix(&out, base);
+                    continue;
+                }
+                let member = match chain.get(i + 1).map(|n| &n.kind) {
+                    Some(RubyCtnKind::Member) => Some(true),
+                    Some(RubyCtnKind::Collection) => Some(false),
+                    None => leaf_on,
+                    _ => None,
+                };
+                let seg = match member {
+                    Some(true) => format!("{base}/:id"),
+                    Some(false) => base.clone(),
+                    // Nested routes/resources scope under the parent id
+                    // (`resources :users do resources :posts end` ->
+                    // /users/:user_id/posts).
+                    None => format!("{base}/:{}_id", rb_singular(base)),
+                };
+                out = join_prefix(&out, &seg);
+            }
+        }
+    }
+    out
+}
+
+/// `only:` / `except:` action lists on `resources`/`resource` (symbols
+/// harvested one level down with the kwarg key attached).
+fn rb_action_filter(call: &RawCall) -> Option<(bool, Vec<String>)> {
+    for (is_only, key) in [(true, "only"), (false, "except")] {
+        let acts: Vec<String> = call
+            .arg_lits
+            .iter()
+            .filter(|l| l.kind == LitKind::Str && rb_key(l).as_deref() == Some(key))
+            .map(|l| l.text.trim_start_matches(':').to_string())
+            .collect();
+        if !acts.is_empty() {
+            return Some((is_only, acts));
+        }
+    }
+    None
+}
+
+/// Resolve a controller class's `[Route]` template: the class's own, else
+/// the nearest base's (ASP.NET attribute-routing inherits through the class
+/// hierarchy — eShopOnWeb's method-less `BaseApiController` carries
+/// `api/[controller]/[action]` for every derived controller). The bool is
+/// `inherited`: cross-file and name-keyed, so joined routes drop to
+/// Heuristic.
+fn aspnet_class_route(class: &str, ctx: &FileCtx) -> Option<(String, bool)> {
+    if let Some(t) = ctx.aspnet_route.get(class) {
+        return t.clone().map(|t| (t, false));
+    }
+    let mut frontier = vec![class.to_string()];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for c in &frontier {
+            for b in ctx.csharp_bases.get(c).into_iter().flatten() {
+                if let Some(Some(t)) = ctx.aspnet_route.get(b) {
+                    return Some((t.clone(), true));
+                }
+                next.push(b.clone());
+            }
+        }
+        if next.is_empty() {
+            return None;
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// Compose a method-level ASP.NET route template with the class `[Route]`
+/// prefix and substitute `[controller]` (class name minus the Controller
+/// suffix) and `[action]` (method name) tokens. Templates starting with `/`
+/// or `~/` override the class prefix, per the attribute-routing spec.
+fn aspnet_compose(
+    tpl: &str,
+    class_route: Option<&(String, bool)>,
+    func: &FunctionInfo,
+) -> (String, Confidence) {
+    let (path, conf) = if let Some(abs) = tpl.strip_prefix("~/") {
+        (ensure_slash(abs), Confidence::High)
+    } else if tpl.starts_with('/') {
+        (tpl.to_string(), Confidence::High)
+    } else if let Some((prefix, inherited)) = class_route {
+        let conf = if *inherited {
+            Confidence::Heuristic
+        } else {
+            Confidence::High
+        };
+        (join_prefix(prefix, tpl), conf)
+    } else {
+        (ensure_slash(tpl), Confidence::High)
+    };
+    let ctrl = func
+        .containing_type
+        .as_deref()
+        .map(|t| t.strip_suffix("Controller").unwrap_or(t))
+        .unwrap_or("");
+    let path = path
+        .replace("[controller]", ctrl)
+        .replace("[action]", &func.name);
+    (path, conf)
+}
+
 /// Conventional REST resource expansion (Rails `resources`, Laravel
 /// `Route::resource` / `Route::apiResource`). Always Heuristic: the routes
 /// are implied by convention, not written in the source. `api` drops the
 /// HTML-form routes (new/create-form, edit) the way Laravel's apiResource
-/// does.
+/// does. `filter` is a Rails `only:`/`except:` action list
+/// (`(true, [...])` = only).
+#[allow(clippy::too_many_arguments)]
 fn expand_resource(
     idx: &mut EndpointIndex,
     base: &str,
@@ -3110,32 +3908,38 @@ fn expand_resource(
     framework: &str,
     file_id: u32,
     line: u32,
+    filter: Option<&(bool, Vec<String>)>,
 ) {
     let root = format!("/{base}");
-    let routes: Vec<(HttpMethod, String)> = if plural {
+    let routes: Vec<(&str, HttpMethod, String)> = if plural {
         let mut r = vec![
-            (HttpMethod::Get, root.clone()), // index
-            (HttpMethod::Post, root.clone()), // create/store
-            (HttpMethod::Get, format!("{root}/{param}")), // show
-            (HttpMethod::Patch, format!("{root}/{param}")), // update
-            (HttpMethod::Delete, format!("{root}/{param}")), // destroy
+            ("index", HttpMethod::Get, root.clone()),
+            ("create", HttpMethod::Post, root.clone()),
+            ("show", HttpMethod::Get, format!("{root}/{param}")),
+            ("update", HttpMethod::Patch, format!("{root}/{param}")),
+            ("destroy", HttpMethod::Delete, format!("{root}/{param}")),
         ];
         if !api {
-            r.push((HttpMethod::Get, format!("{root}/new"))); // new
-            r.push((HttpMethod::Get, format!("{root}/{param}/edit"))); // edit
+            r.push(("new", HttpMethod::Get, format!("{root}/new")));
+            r.push(("edit", HttpMethod::Get, format!("{root}/{param}/edit")));
         }
         r
     } else {
         vec![
-            (HttpMethod::Get, format!("{root}/new")),
-            (HttpMethod::Post, root.clone()),
-            (HttpMethod::Get, root.clone()),
-            (HttpMethod::Get, format!("{root}/edit")),
-            (HttpMethod::Patch, root.clone()),
-            (HttpMethod::Delete, root.clone()),
+            ("new", HttpMethod::Get, format!("{root}/new")),
+            ("create", HttpMethod::Post, root.clone()),
+            ("show", HttpMethod::Get, root.clone()),
+            ("edit", HttpMethod::Get, format!("{root}/edit")),
+            ("update", HttpMethod::Patch, root.clone()),
+            ("destroy", HttpMethod::Delete, root.clone()),
         ]
     };
-    for (method, path) in routes {
+    for (action, method, path) in routes {
+        if let Some((is_only, acts)) = filter {
+            if acts.iter().any(|a| a == action) != *is_only {
+                continue;
+            }
+        }
         let Some(norm) = normalize_path(&path) else {
             continue;
         };
