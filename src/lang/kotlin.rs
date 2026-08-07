@@ -25,6 +25,36 @@ use crate::types::{ImportStyle, Lang};
 // - `import` holds a `qualified_identifier` plus, for `import a.b.C as D`,
 //   a trailing alias `identifier`. Wildcard imports keep only the package
 //   part in the qualified_identifier (the `.*` is anonymous tokens).
+// - DI type captures (verified via probe dumps):
+//   - `class_parameter` is `modifiers? ('val'|'var')? identifier ':' type`;
+//     the binding keyword is an anonymous token, so `["val" "var"]` in the
+//     pattern restricts @field captures to real constructor properties —
+//     plain (non-val) ctor params are NOT emitted as fields. They are not
+//     emitted as locals either: Kotlin primary constructors produce no
+//     function node, so a @local capture there would be dropped by the
+//     extractor's innermost-function attribution anyway.
+//   - `user_type` is `identifier ('.' identifier)*` with optional trailing
+//     `type_arguments`; the `(identifier) @x .` anchor picks the last
+//     segment of a qualified name (`com.example.Clock` -> `Clock`) and
+//     deliberately fails on generics (`List<Order>` ends in type_arguments),
+//     matching clean_type's wholesale rejection of generics. `T?` wraps the
+//     `user_type` in a `nullable_type`; dedicated patterns unwrap it for
+//     ctor properties and function params.
+//   - `property_declaration` holds the type INSIDE `variable_declaration`
+//     (`(variable_declaration (identifier) (user_type))`); a constructed
+//     initializer (`val x = OrderStore()`) is a sibling `call_expression`
+//     whose callee is its first named child. Class-body properties become
+//     @field (the `class_body` wrapper keeps method-body locals from being
+//     promoted to fields — containing_type would find the class ancestor
+//     for those too); the unconstrained @local twins rely on the extractor
+//     dropping bindings outside any function. Constructed captures are
+//     gated on an uppercase callee (`#match? "^[A-Z]"`). Properties in
+//     `enum_class_body` are not captured (only `class_body` is matched).
+//   - Supertypes live in `(delegation_specifiers (delegation_specifier ...))`
+//     on both `class_declaration` (also covers interfaces and enum classes)
+//     and `object_declaration`; the payload is a `constructor_invocation`
+//     for `Base()`, a bare `user_type` for interfaces, and an
+//     `explicit_delegation` for `Iface by impl`.
 // - Annotations with arguments (`@GET("/x")`, `@GetMapping("/x")`) sit in a
 //   `modifiers` child INSIDE the `function_declaration` node, as
 //   `(annotation (constructor_invocation (user_type ...) (value_arguments)))`.
@@ -100,6 +130,66 @@ const QUERY: &str = r#"
         (user_type (identifier) @deco.name)
         (value_arguments) @deco.args)) @deco))
   (#eq? @deco.name "RequestMapping"))
+
+(class_parameter
+  ["val" "var"]
+  (identifier) @field.name
+  (user_type (identifier) @field.type .))
+
+(class_parameter
+  ["val" "var"]
+  (identifier) @field.name
+  (nullable_type (user_type (identifier) @field.type .)))
+
+(parameter
+  (identifier) @local.name
+  (user_type (identifier) @local.type .))
+
+(parameter
+  (identifier) @local.name
+  (nullable_type (user_type (identifier) @local.type .)))
+
+(class_body
+  (property_declaration
+    (variable_declaration
+      (identifier) @field.name
+      (user_type (identifier) @field.type .))))
+
+((class_body
+  (property_declaration
+    (variable_declaration (identifier) @field.name .)
+    (call_expression
+      . (identifier) @field.type
+      (value_arguments))))
+  (#match? @field.type "^[A-Z]"))
+
+(property_declaration
+  (variable_declaration
+    (identifier) @local.name
+    (user_type (identifier) @local.type .)))
+
+((property_declaration
+  (variable_declaration (identifier) @local.name .)
+  (call_expression
+    . (identifier) @local.type
+    (value_arguments)))
+  (#match? @local.type "^[A-Z]"))
+
+(class_declaration
+  name: (identifier) @hier.type
+  (delegation_specifiers
+    (delegation_specifier
+      [(user_type (identifier) @hier.base .)
+       (constructor_invocation (user_type (identifier) @hier.base .))
+       (explicit_delegation (user_type (identifier) @hier.base .))])))
+
+(object_declaration
+  name: (identifier) @hier.type
+  (delegation_specifiers
+    (delegation_specifier
+      [(user_type (identifier) @hier.base .)
+       (constructor_invocation (user_type (identifier) @hier.base .))
+       (explicit_delegation (user_type (identifier) @hier.base .))])))
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &["identifier"];

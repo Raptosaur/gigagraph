@@ -216,6 +216,8 @@ pub fn build_index(root: &Path, force: bool) -> Result<Index> {
                     functions: Vec::new(),
                     type_decorations: Vec::new(),
                     consts: Vec::new(),
+                    fields: Vec::new(),
+                    hierarchy: Vec::new(),
                 },
             };
             Some(Processed {

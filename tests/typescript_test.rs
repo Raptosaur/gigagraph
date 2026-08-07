@@ -173,6 +173,85 @@ fn extracts_javascript_shapes() {
 }
 
 #[test]
+fn captures_typescript_di_types() {
+    let file = extract_fixture("ts", "typescript/di.ts");
+
+    // Declared fields: plain, nested (cdk.Bucket keeps last segment), and
+    // abstract on an abstract class.
+    assert_eq!(
+        field_of(&file, "EmailNotifier", "transport"),
+        Some("SmtpTransport")
+    );
+    assert_eq!(field_of(&file, "EmailNotifier", "bucket"), Some("Bucket"));
+    assert_eq!(field_of(&file, "BaseHandler", "queue"), Some("JobQueue"));
+
+    // Constructor parameter properties: accessibility modifier, bare
+    // readonly, and optional (`?:`) forms all become fields.
+    assert_eq!(field_of(&file, "EmailNotifier", "mailer"), Some("Mailer"));
+    assert_eq!(field_of(&file, "EmailNotifier", "clock"), Some("Clock"));
+    assert_eq!(field_of(&file, "EmailNotifier", "tag"), Some("TagService"));
+    assert_eq!(
+        field_of(&file, "EmailNotifier", "retries"),
+        Some("RetryPolicy")
+    );
+    // `this.fallback = new ConsoleNotifier()` joins the untyped (`any`)
+    // declaration to the constructed type.
+    assert_eq!(
+        field_of(&file, "EmailNotifier", "fallback"),
+        Some("ConsoleNotifier")
+    );
+    // A plain (non-property) ctor param is a local, not a field.
+    assert_eq!(field_of(&file, "EmailNotifier", "plainLimit"), None);
+    assert_eq!(
+        local_of(func(&file, "constructor"), "plainLimit"),
+        Some("RateLimit")
+    );
+
+    // Locals in a method body: constructed, annotated, and nested-annotated.
+    let notify = func(&file, "notify");
+    assert_eq!(local_of(notify, "svc"), Some("AuthService"));
+    assert_eq!(local_of(notify, "helper"), Some("Helper"));
+    assert_eq!(local_of(notify, "stack"), Some("Stack"));
+
+    // Hierarchy: extends, implements, abstract-class extends,
+    // interface-extends-interface, and extends of a member expression.
+    for edge in [
+        ("EmailNotifier", "BaseHandler"),
+        ("EmailNotifier", "Notifier"),
+        ("AuditedNotifier", "Notifier"),
+        ("InfraStack", "Stack"),
+    ] {
+        let edge = (edge.0.to_string(), edge.1.to_string());
+        assert!(
+            file.hierarchy.contains(&edge),
+            "missing hierarchy edge {edge:?}; got {:?}",
+            file.hierarchy
+        );
+    }
+}
+
+#[test]
+fn captures_javascript_di_types() {
+    let file = extract_fixture("js", "javascript/store.js");
+
+    // `this.db = new Database()` in the ctor: owner is the enclosing class.
+    assert_eq!(field_of(&file, "Store", "db"), Some("Database"));
+
+    // `const q = new QueryBuilder()` attaches to the enclosing method.
+    assert_eq!(local_of(func(&file, "run"), "q"), Some("QueryBuilder"));
+
+    // extends with a plain identifier and with a member expression.
+    for edge in [("Store", "BaseStore"), ("RemoteStore", "HttpStore")] {
+        let edge = (edge.0.to_string(), edge.1.to_string());
+        assert!(
+            file.hierarchy.contains(&edge),
+            "missing hierarchy edge {edge:?}; got {:?}",
+            file.hierarchy
+        );
+    }
+}
+
+#[test]
 fn comments_feed_doc_features() {
     let src = "// Retry with exponential backoff.\nfunction retryBackoff(): void {\n  // jitter the delay window\n  const x = 1;\n}\n";
     let file = extract_str("ts", src);

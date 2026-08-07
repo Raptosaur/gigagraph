@@ -20,6 +20,17 @@ use crate::types::{ImportStyle, Lang};
 //   they're matched by method-identifier text via `#eq?`. The method
 //   identifier is captured as `@import.name` so the classifier can tell
 //   `require` from `require_relative` (names hack — see spec docs).
+// - DI type captures: Ruby has no type annotations, so receiver-type
+//   resolution relies on `Klass.new` construction shapes only —
+//   `x = DbStore.new` becomes a typed local and `@store = DbStore.new` a
+//   field of the enclosing class. The `instance_variable` node's text keeps
+//   the `@` sigil, so the field-table key is `@store`; receiver text for a
+//   later `@store.persist` is also `@store`, and the resolver's bare
+//   receiver_binding branch passes it through (it rejects only
+//   `.`/`-`/`:`/`[`/`$`, not `@`), so key and lookup stay consistent.
+//   `@store = store` (plain param assignment in initialize) is NOT captured —
+//   there is no declared param type to join against. `class Service < Base`
+//   yields one hierarchy edge via the `superclass` field.
 const QUERY: &str = r#"
 (method
   name: (identifier) @func.name) @func.def
@@ -48,6 +59,24 @@ const QUERY: &str = r#"
    method: (identifier) @import.name
    arguments: (argument_list . (string (string_content) @import.path))) @import
   (#eq? @import.name "require_relative"))
+
+((assignment
+   left: (identifier) @local.name
+   right: (call
+     receiver: (constant) @local.type
+     method: (identifier) @_new))
+  (#eq? @_new "new"))
+
+((assignment
+   left: (instance_variable) @field.name
+   right: (call
+     receiver: (constant) @field.type
+     method: (identifier) @_new))
+  (#eq? @_new "new"))
+
+(class
+  name: (constant) @hier.type
+  superclass: (superclass (constant) @hier.base))
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &["identifier", "constant"];

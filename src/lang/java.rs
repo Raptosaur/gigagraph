@@ -27,6 +27,26 @@ use crate::types::{ImportStyle, Lang};
 //   next function in the file. Gated to `RequestMapping` so ordinary class
 //   annotations (`@Entity(...)`) don't pollute the decoration stream or set
 //   `has_decorations` on unrelated methods.
+// - DI type captures (shapes verified via probe dump):
+//   - `field_declaration` keeps annotations (`@Autowired`) inside `modifiers`,
+//     so one pattern covers plain and annotated fields alike. Generic fields
+//     (`List<Book> books`) capture the container's `type_identifier` (`List`)
+//     — `clean_type` rejects the full `generic_type` text, and no container
+//     type is ever indexed, so this is harmless; the type-argument is NOT
+//     captured (it would wrongly resolve `this.books.add()` to `Book`).
+//     Primitive fields (`int count`, kind `integral_type`) don't match and are
+//     skipped by design.
+//   - `formal_parameter type:`/`name:` are named fields; catch params are a
+//     different kind (`catch_formal_parameter`) and stay out.
+//   - `local_variable_declaration` carries the declared type; `var` parses as
+//     a `type_identifier` with text "var", so the declared-type pattern is
+//     gated with `#not-eq?` and a value-side pattern recovers the type from
+//     `var x = new Foo()` instead.
+//   - Hierarchy: `superclass:` is a named field holding a `(superclass
+//     (type_identifier))` node; class/record `implements` is `interfaces:
+//     (super_interfaces (type_list ...))`; interface `extends` is an unnamed
+//     `(extends_interfaces (type_list ...))` child. A multi-entry `type_list`
+//     yields one query match per base, i.e. one `@hier` edge each.
 const QUERY: &str = r#"
 (method_declaration
   name: (identifier) @func.name
@@ -99,6 +119,48 @@ const QUERY: &str = r#"
     value: (string_literal) @const.value))
 
 (return_statement (string_literal) @ret.str)
+
+(field_declaration
+  type: (type_identifier) @field.type
+  declarator: (variable_declarator
+    name: (identifier) @field.name))
+
+(field_declaration
+  type: (generic_type (type_identifier) @field.type)
+  declarator: (variable_declarator
+    name: (identifier) @field.name))
+
+(formal_parameter
+  type: (type_identifier) @local.type
+  name: (identifier) @local.name)
+
+((local_variable_declaration
+  type: (type_identifier) @local.type
+  declarator: (variable_declarator
+    name: (identifier) @local.name))
+  (#not-eq? @local.type "var"))
+
+(local_variable_declaration
+  declarator: (variable_declarator
+    name: (identifier) @local.name
+    value: (object_creation_expression
+      type: (type_identifier) @local.type)))
+
+(class_declaration
+  name: (identifier) @hier.type
+  superclass: (superclass (type_identifier) @hier.base))
+
+(class_declaration
+  name: (identifier) @hier.type
+  interfaces: (super_interfaces (type_list (type_identifier) @hier.base)))
+
+(interface_declaration
+  name: (identifier) @hier.type
+  (extends_interfaces (type_list (type_identifier) @hier.base)))
+
+(record_declaration
+  name: (identifier) @hier.type
+  interfaces: (super_interfaces (type_list (type_identifier) @hier.base)))
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &["identifier", "type_identifier"];

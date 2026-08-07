@@ -29,6 +29,30 @@ use crate::types::{ImportStyle, Lang};
 //   same node with extra anonymous keywords, so the same patterns match.
 // - Namespaces: `namespace_declaration` and `file_scoped_namespace_declaration`
 //   both hold `name: (qualified_name | identifier)`.
+// - Type captures (verified via probe dump): `field_declaration` wraps a
+//   `variable_declaration` with a `type:` field (`identifier`, `generic_name`,
+//   `qualified_name`, or `predefined_type` — primitives are skipped) and one or
+//   more `variable_declarator name:` children. `property_declaration` carries
+//   `type:`/`name:` fields directly (auto-properties and `{ get; init; }`
+//   alike). Typed locals sit under `local_declaration_statement` — the SAME
+//   `variable_declaration` node kind as fields, so both patterns are anchored
+//   by their parent kind to keep fields and locals apart. `var` parses as
+//   `(implicit_type)` with no identifier, so implicitly typed locals are only
+//   recovered through the `variable_declarator` + `object_creation_expression`
+//   initializer pattern (`var x = new Foo()`); `Foo y = new Foo()` matches
+//   both the declared-type and constructed patterns (identical type either
+//   way). `parameter` has `type:`/`name:` fields and covers method, ctor and
+//   interface-signature params as `@local.*`. Primary constructors put a
+//   `parameter_list` directly on `class_declaration`/`record_declaration`;
+//   those params are additionally captured as `@field.*` (owner = the nearest
+//   TYPE_KINDS ancestor, i.e. the declaring type). `base_list` children are
+//   `identifier`, `qualified_name` (clean_type keeps the last segment), or
+//   `generic_name` (inner identifier captured) on class/struct/interface/
+//   record declarations alike. Ctor-body joins (`_store = store;`) use a bare
+//   identifier on the left (no `this.`), indistinguishable from local
+//   assignment — not captured; C# fields always have declared types, so the
+//   declaration patterns suffice. Bare-field receivers (`_store.Save()`)
+//   resolve through the field capture (resolver checks locals, then fields).
 const QUERY: &str = r#"
 (method_declaration
   name: (identifier) @func.name
@@ -118,6 +142,109 @@ const QUERY: &str = r#"
 
 (file_scoped_namespace_declaration
   name: (identifier) @package.name)
+
+(field_declaration
+  (variable_declaration
+    type: [
+      (identifier) @field.type
+      (qualified_name) @field.type
+      (generic_name (identifier) @field.type)
+    ]
+    (variable_declarator
+      name: (identifier) @field.name)))
+
+(property_declaration
+  type: [
+    (identifier) @field.type
+    (qualified_name) @field.type
+    (generic_name (identifier) @field.type)
+  ]
+  name: (identifier) @field.name)
+
+(parameter
+  type: [
+    (identifier) @local.type
+    (qualified_name) @local.type
+    (generic_name (identifier) @local.type)
+  ]
+  name: (identifier) @local.name)
+
+(local_declaration_statement
+  (variable_declaration
+    type: [
+      (identifier) @local.type
+      (qualified_name) @local.type
+      (generic_name (identifier) @local.type)
+    ]
+    (variable_declarator
+      name: (identifier) @local.name)))
+
+(local_declaration_statement
+  (variable_declaration
+    (variable_declarator
+      name: (identifier) @local.name
+      (object_creation_expression
+        type: [
+          (identifier) @local.type
+          (qualified_name) @local.type
+          (generic_name (identifier) @local.type)
+        ]))))
+
+(class_declaration
+  (parameter_list
+    (parameter
+      type: [
+        (identifier) @field.type
+        (qualified_name) @field.type
+        (generic_name (identifier) @field.type)
+      ]
+      name: (identifier) @field.name)))
+
+(record_declaration
+  (parameter_list
+    (parameter
+      type: [
+        (identifier) @field.type
+        (qualified_name) @field.type
+        (generic_name (identifier) @field.type)
+      ]
+      name: (identifier) @field.name)))
+
+(class_declaration
+  name: (identifier) @hier.type
+  (base_list
+    [
+      (identifier) @hier.base
+      (qualified_name) @hier.base
+      (generic_name (identifier) @hier.base)
+    ]))
+
+(struct_declaration
+  name: (identifier) @hier.type
+  (base_list
+    [
+      (identifier) @hier.base
+      (qualified_name) @hier.base
+      (generic_name (identifier) @hier.base)
+    ]))
+
+(interface_declaration
+  name: (identifier) @hier.type
+  (base_list
+    [
+      (identifier) @hier.base
+      (qualified_name) @hier.base
+      (generic_name (identifier) @hier.base)
+    ]))
+
+(record_declaration
+  name: (identifier) @hier.type
+  (base_list
+    [
+      (identifier) @hier.base
+      (qualified_name) @hier.base
+      (generic_name (identifier) @hier.base)
+    ]))
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &["identifier"];

@@ -53,6 +53,15 @@ pub struct RawDecoration {
     pub line: u32,
 }
 
+/// A typed field/property on a class-like type: owner type, field name,
+/// declared (simple) type name. Fuels receiver-type call narrowing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypeField {
+    pub owner: String,
+    pub name: String,
+    pub type_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedFunction {
     pub name: String,
@@ -71,6 +80,11 @@ pub struct ExtractedFunction {
     /// String literals this function returns (`return "Payments";`,
     /// Kotlin `= "Payments"`), capped — fuels RN getName() aliasing.
     pub ret_strs: Vec<String>,
+    /// Typed bindings visible in this function's body: parameters and
+    /// `x = new T()` locals. (variable name, simple type name), capped.
+    /// Build-time only downstream — never serialized into FunctionInfo.
+    #[serde(default)]
+    pub locals: Vec<(String, String)>,
     /// Semantic feature bag (feature string -> term frequency) used for the
     /// similarity vectors. Structural, not textual: callee names, identifiers,
     /// AST shape, control flow.
@@ -89,6 +103,12 @@ pub struct ExtractedFile {
     /// Single-assignment string constants (`const API = "/users"`,
     /// `static final String BASE = "/api"`): name -> literal.
     pub consts: Vec<(String, String)>,
+    /// Typed fields/properties declared on class-like types in this file.
+    #[serde(default)]
+    pub fields: Vec<TypeField>,
+    /// (declaring type, base class / implemented interface) edges.
+    #[serde(default)]
+    pub hierarchy: Vec<(String, String)>,
 }
 
 struct Caps {
@@ -112,6 +132,13 @@ struct Caps {
     const_name: Option<u32>,
     const_value: Option<u32>,
     ret_str: Option<u32>,
+    field_owner: Option<u32>,
+    field_name: Option<u32>,
+    field_type: Option<u32>,
+    local_name: Option<u32>,
+    local_type: Option<u32>,
+    hier_type: Option<u32>,
+    hier_base: Option<u32>,
 }
 
 impl Caps {
@@ -138,6 +165,13 @@ impl Caps {
             const_name: idx("const.name"),
             const_value: idx("const.value"),
             ret_str: idx("ret.str"),
+            field_owner: idx("field.owner"),
+            field_name: idx("field.name"),
+            field_type: idx("field.type"),
+            local_name: idx("local.name"),
+            local_type: idx("local.type"),
+            hier_type: idx("hier.type"),
+            hier_base: idx("hier.base"),
         }
     }
 }
@@ -191,6 +225,11 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
     let mut consts: Vec<(String, String)> = Vec::new();
     // (start byte, text) — attributed to the innermost function later.
     let mut ret_strs: Vec<(u32, String)> = Vec::new();
+    let mut fields: Vec<TypeField> = Vec::new();
+    let mut hierarchy: Vec<(String, String)> = Vec::new();
+    // (name-node start byte, var name, type name) — attributed to the
+    // innermost function later, like ret_strs.
+    let mut locals: Vec<(u32, String, String)> = Vec::new();
     let mut calls: Vec<CallCand> = Vec::new();
     let mut call_slots: FxHashMap<(u32, u32, u32), usize> = FxHashMap::default();
     let mut imports: FxHashMap<usize, ImportBuilder> = FxHashMap::default();
@@ -312,6 +351,46 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
             }
         }
 
+        if let (Some(n), Some(t)) = (get(caps.field_name), get(caps.field_type)) {
+            if fields.len() < MAX_TYPE_ENTRIES {
+                // An explicit @field.owner in the same match beats the
+                // ancestor scan — needed where the owner is a sibling, not an
+                // ancestor with a name field (Go struct type_spec).
+                let owner = get(caps.field_owner)
+                    .map(|o| node_text(o, source))
+                    .or_else(|| containing_type(spec, n, source));
+                if let (Some(owner), Some(ty)) = (owner, clean_type(&node_text(t, source))) {
+                    let tf = TypeField {
+                        owner,
+                        name: node_text(n, source),
+                        type_name: ty,
+                    };
+                    if !fields.contains(&tf) {
+                        fields.push(tf);
+                    }
+                }
+            }
+        }
+
+        if let (Some(n), Some(t)) = (get(caps.local_name), get(caps.local_type)) {
+            if locals.len() < MAX_TYPE_ENTRIES {
+                if let Some(ty) = clean_type(&node_text(t, source)) {
+                    locals.push((n.start_byte() as u32, node_text(n, source), ty));
+                }
+            }
+        }
+
+        if let (Some(t), Some(b)) = (get(caps.hier_type), get(caps.hier_base)) {
+            if hierarchy.len() < MAX_TYPE_ENTRIES {
+                if let Some(base) = clean_type(&node_text(b, source)) {
+                    let edge = (node_text(t, source), base);
+                    if !hierarchy.contains(&edge) {
+                        hierarchy.push(edge);
+                    }
+                }
+            }
+        }
+
         if package.is_none() {
             if let Some(p) = get(caps.package_name) {
                 package = Some(node_text(p, source));
@@ -388,6 +467,26 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
         }
     }
 
+    // Typed locals/params attach to their innermost function; toplevel ones
+    // are dropped (module-level bindings rarely receive method calls that
+    // name-based resolution can't already handle).
+    for (pos, name, ty) in locals {
+        let start_idx = funcs.partition_point(|f| f.def.start_byte() as u32 <= pos);
+        for i in (0..start_idx).rev() {
+            if prefix_max_end[i] <= pos {
+                break;
+            }
+            if funcs[i].def.end_byte() as u32 > pos {
+                if out_funcs[i].locals.len() < 64
+                    && !out_funcs[i].locals.iter().any(|(n, _)| n == &name)
+                {
+                    out_funcs[i].locals.push((name, ty));
+                }
+                break;
+            }
+        }
+    }
+
     if !toplevel_calls.is_empty() {
         let mut features = FxHashMap::default();
         for c in &toplevel_calls {
@@ -408,6 +507,7 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
             calls: toplevel_calls,
             decorations: Vec::new(),
             ret_strs: Vec::new(),
+            locals: Vec::new(),
             features,
         });
     }
@@ -467,6 +567,7 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
                 calls: Vec::new(),
                 decorations: orphan_decos,
                 ret_strs: Vec::new(),
+                locals: Vec::new(),
                 features: FxHashMap::default(),
             }),
         }
@@ -495,11 +596,33 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
         functions: out_funcs,
         type_decorations,
         consts,
+        fields,
+        hierarchy,
     })
 }
 
 const MAX_ARG_LITS: usize = 8;
 const MAX_LIT_LEN: usize = 200;
+const MAX_TYPE_ENTRIES: usize = 400;
+const MAX_TYPE_NAME_LEN: usize = 64;
+
+/// A captured type node is usable only as a bare simple name. Generic
+/// wrappers, unions, tuples and function types are rejected wholesale rather
+/// than half-parsed; qualified names keep their last segment (`cdk.App` ->
+/// `App`, `App\Models\User` -> `User`).
+fn clean_type(s: &str) -> Option<String> {
+    let t = s.trim().trim_start_matches('?').trim_end_matches('?');
+    if t.is_empty()
+        || t.len() > MAX_TYPE_NAME_LEN
+        || t.contains(|c: char| c.is_whitespace())
+        || t.contains([
+            '<', '>', '(', ')', '[', ']', '|', '&', ',', '{', '}', '*', '\'',
+        ])
+    {
+        return None;
+    }
+    Some(t.rsplit(['.', ':', '\\']).next().unwrap_or(t).to_string())
+}
 
 /// Distill string literals and identifier-ish arguments from a call's
 /// argument-list node. Depth 1: direct children. Depth 2: kwarg / object-field
@@ -719,6 +842,7 @@ fn build_function(spec: &LangSpec, f: &FuncCand, source: &str) -> ExtractedFunct
         calls: Vec::new(),
         decorations: docblock_decorations(def, source),
         ret_strs: Vec::new(),
+        locals: Vec::new(),
         features,
     }
 }

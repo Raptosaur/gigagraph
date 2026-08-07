@@ -37,6 +37,23 @@ pub struct GigaGraph {
     pub referenced_names: FxHashSet<String>,
     /// React Native bridge: JS call sites matched to native implementations.
     pub bridge: crate::bridge::BridgeIndex,
+    /// type name -> function ids whose containing_type is that type.
+    pub type_index: FxHashMap<String, Vec<u32>>,
+    /// (type name, field name) -> declared type names, merged across files.
+    /// More than one entry means a cross-file name collision — no narrowing.
+    pub type_fields: FxHashMap<(String, String), Vec<String>>,
+    /// Type-binding table: abstract/base name -> concrete names. Sources:
+    /// hierarchy edges inverted (base -> derived); DI container registrations
+    /// append here as just more entries.
+    pub type_bindings: FxHashMap<String, Vec<String>>,
+    /// Explicit DI container registrations (Laravel `$app->bind(A::class,
+    /// B::class)` / `singleton`): abstract -> concrete. Takes precedence over
+    /// hierarchy expansion — the container names THE implementation, so a
+    /// unique entry resolves High even when several implementors exist.
+    /// (NestJS `{provide, useClass}` objects sit below the arg-lit harvest
+    /// depth and stay invisible; .NET `AddScoped<I,T>` type args are not
+    /// captured — documented gaps.)
+    pub di_bindings: FxHashMap<String, Vec<String>>,
 }
 
 /// Per-file input to the graph build: relative path, content hash, extraction.
@@ -64,6 +81,9 @@ impl GigaGraph {
         let mut raw_calls: Vec<Vec<RawCall>> = Vec::new();
         let mut decorations: Vec<Vec<crate::extract::RawDecoration>> = Vec::new();
         let mut ret_strs: Vec<Vec<String>> = Vec::new();
+        // Typed locals/params per function — resolution-time only, never
+        // serialized (would grow index.bin per-function for a build-time need).
+        let mut fn_locals: Vec<Vec<(String, String)>> = Vec::new();
         // (file_id, start_byte, end_byte) per function for same-file ranking.
         let mut fn_files: Vec<u32> = Vec::new();
 
@@ -91,6 +111,9 @@ impl GigaGraph {
                     None => format!("{scope}::{}", ef.name),
                 };
                 g.name_index.entry(ef.name.clone()).or_default().push(fn_id);
+                if let Some(t) = &ef.containing_type {
+                    g.type_index.entry(t.clone()).or_default().push(fn_id);
+                }
                 g.qname_index
                     .entry(qualified_name.clone())
                     .or_default()
@@ -114,8 +137,18 @@ impl GigaGraph {
                 raw_calls.push(std::mem::take(&mut ef.calls));
                 decorations.push(fn_decorations);
                 ret_strs.push(std::mem::take(&mut ef.ret_strs));
+                fn_locals.push(std::mem::take(&mut ef.locals));
                 features.push(std::mem::take(&mut ef.features));
                 fn_files.push(file_id);
+            }
+            for tf in input.extracted.fields {
+                g.type_fields
+                    .entry((tf.owner, tf.name))
+                    .or_default()
+                    .push(tf.type_name);
+            }
+            for (derived, base) in input.extracted.hierarchy {
+                g.type_bindings.entry(base).or_default().push(derived);
             }
             g.path_index.insert(input.path.clone(), file_id);
             g.files.push(FileInfo {
@@ -127,6 +160,76 @@ impl GigaGraph {
                 consts: input.extracted.consts,
                 content_hash: input.content_hash,
             });
+        }
+
+        // ---- Type-table finalization ----
+        // Python's `self.x = x` fields are captured with the ctor PARAM NAME
+        // in type position (the real type lives on the `__init__` parameter
+        // hint); substitute it here — same one-hop idea as substitute_consts.
+        let ctor_of: FxHashMap<&str, usize> = g
+            .functions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                let t = f.containing_type.as_deref()?;
+                let is_ctor = matches!(f.name.as_str(), "__init__" | "constructor" | "__construct" | "init")
+                    || f.name == t;
+                is_ctor.then_some((t, i))
+            })
+            .collect();
+        for ((owner, _), tys) in g.type_fields.iter_mut() {
+            for ty in tys.iter_mut() {
+                if let Some(&ctor) = ctor_of.get(owner.as_str()) {
+                    if let Some((_, param_ty)) =
+                        fn_locals[ctor].iter().find(|(n, _)| n == ty)
+                    {
+                        *ty = param_ty.clone();
+                    }
+                }
+            }
+            tys.sort_unstable();
+            tys.dedup();
+        }
+        // Deterministic candidate order feeds `callee = hits[0]`.
+        for v in g.type_bindings.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+
+        // Laravel container registrations: `$this->app->bind(A::class,
+        // B::class)` arrives as per-index Ident pairs (the `::class` suffix is
+        // a separate "class" Ident at the same index). String-keyed
+        // registrations (`singleton('cache', ...)`) carry no abstract type
+        // and are skipped.
+        for (fn_id, calls) in raw_calls.iter().enumerate() {
+            if g.functions[fn_id].language != Lang::Php {
+                continue;
+            }
+            for call in calls {
+                if !matches!(call.name.as_str(), "bind" | "singleton")
+                    || !call.receiver.as_deref().is_some_and(|r| r.contains("app"))
+                {
+                    continue;
+                }
+                let ident_at = |i: u16| {
+                    call.arg_lits.iter().find(|l| {
+                        l.index == i
+                            && l.kind == crate::extract::LitKind::Ident
+                            && l.text != "class"
+                            && l.text.chars().next().is_some_and(|c| c.is_uppercase())
+                    })
+                };
+                if let (Some(a), Some(c)) = (ident_at(0), ident_at(1)) {
+                    g.di_bindings
+                        .entry(a.text.clone())
+                        .or_default()
+                        .push(c.text.clone());
+                }
+            }
+        }
+        for v in g.di_bindings.values_mut() {
+            v.sort_unstable();
+            v.dedup();
         }
 
         // ---- Import classification (external vs internal) ----
@@ -158,7 +261,7 @@ impl GigaGraph {
                 calls
                     .iter()
                     .map(|c| {
-                        let resolution = resolve_call(&g, fn_id as u32, c);
+                        let resolution = resolve_call(&g, fn_id as u32, c, &fn_locals[fn_id]);
                         CallSite {
                             caller: fn_id as u32,
                             name: c.name.clone(),
@@ -764,9 +867,15 @@ fn resolve_include(
 }
 
 /// Heuristic call resolution. Ranking:
-/// same file > import-directed > same package > same directory >
-/// same language > any language. External attribution via imports.
-fn resolve_call(g: &GigaGraph, caller_id: u32, call: &RawCall) -> Resolution {
+/// receiver's declared type (DI-aware) > self > import-directed >
+/// same file > same package > same directory > same language > any
+/// language. External attribution via imports.
+fn resolve_call(
+    g: &GigaGraph,
+    caller_id: u32,
+    call: &RawCall,
+    caller_locals: &[(String, String)],
+) -> Resolution {
     let caller = &g.functions[caller_id as usize];
     let file = &g.files[caller.file_id as usize];
     let spec = lang::spec_for_lang(file.language);
@@ -775,7 +884,17 @@ fn resolve_call(g: &GigaGraph, caller_id: u32, call: &RawCall) -> Resolution {
     if let Some(recv) = &call.receiver {
         let recv_base = recv.split('.').next().unwrap_or(recv);
 
-        if matches!(recv_base, "this" | "self" | "$this" | "Self") {
+        // Receiver -> declared type -> methods of that type (with
+        // interface->implementation expansion). Strictly more specific than
+        // every rung below, so it goes first.
+        if let Some(res) = resolve_via_type(g, caller, caller_locals, recv, &call.name) {
+            return res;
+        }
+
+        // Exact match only: `this.field.m()` must not enter the self rung —
+        // the field's type, not the containing type, owns the method (the
+        // type rung above already had its chance at it).
+        if matches!(recv.as_str(), "this" | "self" | "$this" | "Self") {
             if let Some(t) = &caller.containing_type {
                 if let Some(cands) = g.name_index.get(&call.name) {
                     let same_type: Vec<u32> = cands
@@ -959,6 +1078,105 @@ fn resolve_call(g: &GigaGraph, caller_id: u32, call: &RawCall) -> Resolution {
 }
 
 /// Filter candidates; if any survive, resolve High with ambiguity noted.
+/// Split a receiver expression into (is_self_qualified, binding name):
+/// `this.userService` -> (true, "userService"); `$this->repo` -> (true,
+/// "repo"); `self.users` -> (true, "users"); `userService` -> (false, ..).
+/// Multi-hop (`this.a.b`) and subscripted receivers are rejected — one hop
+/// is all the field table can answer.
+fn receiver_binding(recv: &str) -> Option<(bool, &str)> {
+    for (prefix, sep) in [("this", "."), ("self", "."), ("$this", "->"), ("Self", "::")] {
+        if let Some(rest) = recv.strip_prefix(prefix).and_then(|r| r.strip_prefix(sep)) {
+            return (!rest.contains(['.', '-', ':', '['])).then_some((true, rest));
+        }
+    }
+    (!recv.contains(['.', '-', ':', '[', '$'])).then_some((false, recv))
+}
+
+/// A (type, field) pair with exactly one declared type resolves; a colliding
+/// pair (same-named classes in different files disagreeing) does not.
+fn field_type<'a>(g: &'a GigaGraph, owner: &str, field: &str) -> Option<&'a str> {
+    let v = g.type_fields.get(&(owner.to_string(), field.to_string()))?;
+    (v.len() == 1).then(|| v[0].as_str())
+}
+
+/// DI-aware rung: receiver text -> declared type (fields for
+/// self-qualified receivers, locals/params then fields for bare ones) ->
+/// methods of that type, expanded through type_bindings
+/// (interface -> implementations, container registrations).
+fn resolve_via_type(
+    g: &GigaGraph,
+    caller: &FunctionInfo,
+    locals: &[(String, String)],
+    recv: &str,
+    name: &str,
+) -> Option<Resolution> {
+    let (self_qualified, binding) = receiver_binding(recv)?;
+
+    let ty: &str = if self_qualified {
+        let owner = caller.containing_type.as_deref()?;
+        field_type(g, owner, binding)?
+    } else {
+        // Bare receivers starting uppercase are static-style (`Bar.baz()`) —
+        // leave them to the existing static rung.
+        if binding.chars().next().is_some_and(|c| c.is_uppercase()) {
+            return None;
+        }
+        match locals.iter().find(|(n, _)| n == binding) {
+            Some((_, t)) => t.as_str(),
+            None => field_type(g, caller.containing_type.as_deref()?, binding)?,
+        }
+    };
+
+    // One-hop expansion only — transitive closure would balloon
+    // ambiguous_with; deep chains belong in a build-time fixpoint if ever.
+    // A container registration names THE implementation, so it pre-empts the
+    // (potentially wider) hierarchy fan-out.
+    let mut concrete: Vec<&str> = vec![ty];
+    match g.di_bindings.get(ty) {
+        Some(bound) => concrete.extend(bound.iter().map(|s| s.as_str())),
+        None => {
+            if let Some(impls) = g.type_bindings.get(ty) {
+                concrete.extend(impls.iter().map(|s| s.as_str()));
+            }
+        }
+    }
+
+    let mut hits: Vec<u32> = Vec::new();
+    for t in &concrete {
+        if let Some(ids) = g.type_index.get(*t) {
+            hits.extend(
+                ids.iter()
+                    .copied()
+                    .filter(|&id| g.functions[id as usize].name == name),
+            );
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort_unstable();
+    hits.dedup();
+    // Prefer implementations over interface signatures: abstract methods are
+    // single-line, real bodies span lines (cheap body proxy).
+    hits.sort_by_key(|&id| {
+        let f = &g.functions[id as usize];
+        (f.end_line == f.start_line, id)
+    });
+
+    // Overloads within the declared type itself stay High (Java/C#);
+    // multi-implementor interface fan-out is honest Heuristic.
+    let declared_only = g
+        .type_index
+        .get(ty)
+        .is_some_and(|ids| ids.iter().any(|&id| g.functions[id as usize].name == name));
+    let conf = if hits.len() == 1 || declared_only {
+        Confidence::High
+    } else {
+        Confidence::Heuristic
+    };
+    Some(internal(&hits, conf))
+}
+
 fn pick(cands: &[u32], pred: impl Fn(&u32) -> bool) -> Option<Resolution> {
     let hits: Vec<u32> = cands.iter().copied().filter(|id| pred(id)).collect();
     if hits.is_empty() {

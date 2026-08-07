@@ -332,3 +332,79 @@ fn extracts_csharp_file_scoped_namespace_and_structs() {
     }
     assert!(file.imports.iter().all(|i| !i.system));
 }
+
+#[test]
+fn extracts_csharp_type_information() {
+    let file = extract_fixture("cs", "csharp/Wiring.cs");
+
+    // Declared field: `private readonly IUserStore _store;`. This capture is
+    // what lets the resolver narrow the bare-field receiver `_store.Save()`
+    // (locals rung misses, fields rung hits).
+    assert_eq!(field_of(&file, "UserService", "_store"), Some("IUserStore"));
+
+    // Auto-property `public IUserStore Store { get; }`.
+    assert_eq!(field_of(&file, "UserService", "Store"), Some("IUserStore"));
+
+    // Generic field keeps the simple outer name (`List<string>` -> `List`).
+    assert_eq!(field_of(&file, "DbUserStore", "_rows"), Some("List"));
+
+    // Primary-constructor params become fields of the declaring type
+    // (class and record positional forms).
+    assert_eq!(field_of(&file, "AuditService", "store"), Some("IUserStore"));
+    assert_eq!(field_of(&file, "AuditService", "_audit"), Some("IUserStore"));
+    assert_eq!(field_of(&file, "Wiring", "Store"), Some("IUserStore"));
+
+    // Predefined types (string/int) are not DI-relevant and are skipped.
+    assert_eq!(field_of(&file, "Wiring", "Label"), None);
+    assert_eq!(field_of(&file, "Slot", "Rank"), None);
+
+    // Hierarchy: class implements, interface extends, qualified base keeps
+    // its last segment, generic base keeps the simple name, record base.
+    for (t, b) in [
+        ("DbUserStore", "IUserStore"),
+        ("IAuditStore", "IUserStore"),
+        ("MemoryStore", "IUserStore"),
+        ("AuditService", "IAuditSource"),
+        ("Wiring", "IAuditSource"),
+        ("Slot", "IComparable"),
+    ] {
+        assert!(
+            file.hierarchy.contains(&(t.into(), b.into())),
+            "missing hierarchy edge {t} -> {b}; got {:?}",
+            file.hierarchy
+        );
+    }
+
+    // Interface-typed ctor param is a local of the constructor.
+    let ctor = func(&file, "UserService");
+    assert_eq!(local_of(ctor, "store"), Some("IUserStore"));
+
+    // Method param with a user type; predefined-type params are skipped.
+    let compare = func(&file, "CompareTo");
+    assert_eq!(local_of(compare, "other"), Some("Slot"));
+    let register = func(&file, "Register");
+    assert_eq!(local_of(register, "name"), None);
+
+    // Locals in Wire(): `var x = new T()` recovers T from the initializer,
+    // `T x = new T()` and `IUserStore x = new MemoryStore()` from the
+    // declared type (declared type wins for the interface-typed binding).
+    let wire = func(&file, "Wire");
+    assert_eq!(local_of(wire, "store"), Some("DbUserStore"));
+    assert_eq!(local_of(wire, "backup"), Some("DbUserStore"));
+    assert_eq!(local_of(wire, "svc"), Some("UserService"));
+    assert!(
+        matches!(local_of(wire, "fallback"), Some("IUserStore" | "MemoryStore")),
+        "fallback should be typed; got {:?}",
+        local_of(wire, "fallback")
+    );
+
+    // The DI call-site shape: bare-field receiver in Register.
+    let save = register.calls.iter().find(|c| c.name == "Save").unwrap();
+    assert_eq!(save.receiver.as_deref(), Some("_store"));
+
+    // Expression-bodied Flush also calls through the primary-ctor-backed
+    // field.
+    let flush = func(&file, "Flush");
+    let audit_save = flush.calls.iter().find(|c| c.name == "Save").unwrap();
+    assert_eq!(audit_save.receiver.as_deref(), Some("_audit"));
+}

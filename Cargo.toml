@@ -1,6 +1,6 @@
 [package]
 name = "gigagraph"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Semantic code-graph MCP server for coding agents: call graphs, structural similarity, API endpoint maps, blast radius"
 license = "MIT"

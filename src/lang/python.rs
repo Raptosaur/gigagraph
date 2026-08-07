@@ -23,6 +23,24 @@ use crate::types::{ImportStyle, Lang};
 //   text keeps the leading dots (`.`, `..pkg`) — plus one `name:` child per
 //   imported symbol (`dotted_name`, or `aliased_import` for `x as z`).
 // - Python has no package declaration, so there is no `@package.name`.
+// - Type captures (verified via probe dump): `typed_parameter` puts the bare
+//   `identifier` first and wraps the annotation in a `type:` field whose
+//   `(type ...)` node contains the actual `identifier` (generics become
+//   `generic_type` inside `(type ...)` and simply don't match the
+//   `(type (identifier))` shape — intended, `clean_type` rejects them anyway).
+//   `typed_default_parameter` is the same but with a `name:` field. Annotated
+//   assignments (`x: T = ...`) put the same `type: (type ...)` field on the
+//   `assignment` node. Constructed locals/fields (`x = Klass()`,
+//   `self.x = Klass()`) capture the callee as the type, guarded by
+//   `#match? "^[A-Z]"` because Python calls are case-blind — without the
+//   guard every `x = helper()` would record `helper` as a type.
+//   `self.x = param` captures the ctor PARAM NAME in `@field.type` position
+//   (deferred join, same as PHP `$this->repo = $repo`): the graph build
+//   substitutes the `__init__` parameter's declared type, so this pattern
+//   stays UNGUARDED by case — the param name is lowercase by convention.
+//   Hierarchy: `class_definition` lists bases in a `superclasses:`
+//   `argument_list`; one `@hier.type`/`@hier.base` pair per base identifier
+//   (dotted bases like `abc.ABC` are `attribute` nodes and are skipped).
 const QUERY: &str = r#"
 (function_definition
   name: (identifier) @func.name
@@ -72,6 +90,44 @@ const QUERY: &str = r#"
 (import_from_statement
   name: (aliased_import
     alias: (identifier) @import.name)) @import
+
+(typed_parameter
+  (identifier) @local.name
+  type: (type (identifier) @local.type))
+
+(typed_default_parameter
+  name: (identifier) @local.name
+  type: (type (identifier) @local.type))
+
+(assignment
+  left: (identifier) @local.name
+  type: (type (identifier) @local.type))
+
+(assignment
+  left: (identifier) @local.name
+  right: (call
+    function: (identifier) @local.type)
+  (#match? @local.type "^[A-Z]"))
+
+(assignment
+  left: (attribute
+    object: (identifier) @_self
+    attribute: (identifier) @field.name)
+  right: (call
+    function: (identifier) @field.type)
+  (#eq? @_self "self")
+  (#match? @field.type "^[A-Z]"))
+
+(assignment
+  left: (attribute
+    object: (identifier) @_self
+    attribute: (identifier) @field.name)
+  right: (identifier) @field.type
+  (#eq? @_self "self"))
+
+(class_definition
+  name: (identifier) @hier.type
+  superclasses: (argument_list (identifier) @hier.base))
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &["identifier"];

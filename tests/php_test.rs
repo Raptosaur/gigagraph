@@ -160,3 +160,23 @@ fn extracts_php_helpers() {
         assert!(paths.contains(&p), "missing import {p}; got {paths:?}");
     }
 }
+
+#[test]
+fn extracts_php_type_information() {
+    let file = extract_fixture("php", "php/Service.php");
+
+    // Typed property + promoted-param-free ctor: field from declaration.
+    assert_eq!(
+        field_of(&file, "MailerService", "repo"),
+        Some("UserRepository")
+    );
+    // `$this->repo = $repo` also captures the join form; declaration wins the
+    // dedup (identical resolved type either way after the graph-build join).
+
+    // implements edge.
+    assert!(file.hierarchy.contains(&("MailerService".into(), "Notifier".into())));
+
+    // Typed ctor param becomes a local of __construct.
+    let ctor = func(&file, "__construct");
+    assert_eq!(local_of(ctor, "repo"), Some("UserRepository"));
+}

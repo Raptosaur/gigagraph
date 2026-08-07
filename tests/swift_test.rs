@@ -261,3 +261,83 @@ fn extracts_swift_shapes() {
     assert_eq!(combine.names, vec!["Combine".to_string()]);
     assert_eq!(file.package, None);
 }
+
+#[test]
+fn extracts_swift_di_types() {
+    let file = extract_fixture("swift", "swift/wiring.swift");
+
+    // Typed stored properties: `let store: Store` / `var label: String` in a
+    // class body land as @field pairs owned by the enclosing type.
+    assert_eq!(field_of(&file, "Service", "store"), Some("Store"));
+    assert_eq!(field_of(&file, "Service", "label"), Some("String"));
+
+    // The @field pattern is restricted to class-body children, so a
+    // function-body `let annotated: Store` must NOT become a Service field.
+    assert_eq!(field_of(&file, "Service", "annotated"), None);
+    assert_eq!(field_of(&file, "Service", "fallback"), None);
+
+    // Conversely, class-body properties also match the unrestricted @local
+    // pattern but are dropped by the extractor (no containing function), so
+    // `label` never surfaces as anyone's local.
+    for f in &file.functions {
+        assert_eq!(
+            local_of(f, "label"),
+            None,
+            "class property `label` leaked into locals of `{}`",
+            f.name
+        );
+    }
+
+    // Init injection: the ctor parameter is a typed local of `init`.
+    let init_fn = func(&file, "init");
+    assert_eq!(local_of(init_fn, "store"), Some("Store"));
+
+    // Plain typed parameter.
+    let persist = func(&file, "persist");
+    assert_eq!(local_of(persist, "record"), Some("String"));
+
+    // External argument label: `func send(to target: Store, ...)` binds the
+    // internal name `target`, never the label `to`.
+    let send = func(&file, "send");
+    assert_eq!(local_of(send, "target"), Some("Store"));
+    assert_eq!(local_of(send, "count"), Some("Int"));
+    assert_eq!(local_of(send, "to"), None);
+
+    // Constructed local (`let fallback = DbStore()`) takes the callee type;
+    // an annotated-and-constructed local (`let annotated: Store =
+    // MemoryStore()`) takes the DECLARED type exactly once — the adjacency
+    // anchor keeps the constructed pattern from double-capturing it.
+    let rebuild = func(&file, "rebuild");
+    assert_eq!(local_of(rebuild, "fallback"), Some("DbStore"));
+    assert_eq!(local_of(rebuild, "annotated"), Some("Store"));
+    assert_eq!(
+        rebuild.locals.iter().filter(|(n, _)| n == "annotated").count(),
+        1,
+        "annotated local captured more than once: {:?}",
+        rebuild.locals
+    );
+
+    // DI call site keeps its dotted receiver text for graph-side resolution.
+    let recvs: Vec<Option<&str>> = persist
+        .calls
+        .iter()
+        .filter(|c| c.name == "save")
+        .map(|c| c.receiver.as_deref())
+        .collect();
+    assert_eq!(recvs, vec![Some("self.store"), Some("store")]);
+
+    // Hierarchy edges: class conformance, struct conformance, and protocol
+    // inheritance each produce one declaring-type -> base edge.
+    for edge in [
+        ("DbStore", "Store"),
+        ("MemoryStore", "Store"),
+        ("Cache", "Store"),
+    ] {
+        assert!(
+            file.hierarchy
+                .contains(&(edge.0.to_string(), edge.1.to_string())),
+            "missing hierarchy edge {edge:?}; got {:?}",
+            file.hierarchy
+        );
+    }
+}

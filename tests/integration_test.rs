@@ -237,3 +237,35 @@ fn incremental_reindex_reuses_cache() {
     assert_eq!(second.stats.functions, first.stats.functions);
     assert_eq!(second.stats.calls, first.stats.calls);
 }
+
+#[test]
+fn di_field_type_narrows_interface_call_to_implementation() {
+    let index = index();
+
+    // Publisher.release: `$this->store->persist(...)` — the field's declared
+    // type is the SlugStore interface; the hierarchy expands it to the sole
+    // implementor, and body-over-signature ranking picks DbSlugStore.
+    assert_eq!(
+        callee_qname(&index, "release", "persist").as_deref(),
+        Some("Acme\\Web::DbSlugStore::persist")
+    );
+}
+
+#[test]
+fn di_container_binding_disambiguates_multiple_implementors() {
+    let index = index();
+
+    // SlugStore has TWO implementors (DbSlugStore, CachingSlugStore) — bare
+    // hierarchy expansion would be an ambiguous Heuristic. The Laravel-style
+    // `$this->app->bind(SlugStore::class, DbSlugStore::class)` names the
+    // implementation, so the call resolves to it with confidence intact.
+    let g = &index.graph;
+    assert_eq!(
+        g.di_bindings.get("SlugStore"),
+        Some(&vec!["DbSlugStore".to_string()])
+    );
+    assert_eq!(
+        callee_qname(&index, "release", "persist").as_deref(),
+        Some("Acme\\Web::DbSlugStore::persist")
+    );
+}

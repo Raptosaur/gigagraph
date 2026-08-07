@@ -83,10 +83,40 @@ pub(crate) const CORE_QUERY: &str = r#"
 "#;
 
 /// Class-property arrow methods: JS grammar calls the node `field_definition`.
+///
+/// JS type captures (verified via probe dump) — untyped grammar, so the only
+/// type evidence is construction: `const x = new T()` locals and
+/// `this.x = new T()` fields (owner = nearest TYPE_KINDS ancestor of the
+/// property name, i.e. the enclosing class). Heritage differs from TS:
+/// `class_heritage` has no `extends_clause` wrapper — the base sits directly
+/// under it as an `identifier` (or `member_expression` for `ns.Base`), and
+/// the class name is a plain `identifier`, not `type_identifier`, so the
+/// heritage patterns cannot be shared with TS. The two `new T()` shapes DO
+/// parse identically in both grammars but live per-side anyway (TS_EXTRA
+/// carries its own copies) to keep CORE_QUERY purely structural/function
+/// captures.
 const JS_EXTRA: &str = r#"
 (field_definition
   property: (property_identifier) @func.name
   value: [(arrow_function) (function_expression)] @func.body) @func.def
+
+(variable_declarator
+  name: (identifier) @local.name
+  value: (new_expression constructor: (identifier) @local.type))
+
+(assignment_expression
+  left: (member_expression
+    object: (this)
+    property: (property_identifier) @field.name)
+  right: (new_expression constructor: (identifier) @field.type))
+
+(class_declaration
+  name: (identifier) @hier.type
+  (class_heritage (identifier) @hier.base))
+
+(class_declaration
+  name: (identifier) @hier.type
+  (class_heritage (member_expression property: (property_identifier) @hier.base)))
 "#;
 
 pub(crate) const IDENTIFIER_KINDS: &[&str] = &[

@@ -42,3 +42,22 @@ pub fn assert_calls(f: &ExtractedFunction, callees: &[&str]) {
 pub fn import_paths(file: &ExtractedFile) -> Vec<&str> {
     file.imports.iter().map(|i| i.path.as_str()).collect()
 }
+
+/// Declared type of a field/property, if captured: `field_of(&file,
+/// "UserService", "repo") == Some("UserRepository")`.
+#[allow(dead_code)]
+pub fn field_of<'a>(file: &'a ExtractedFile, owner: &str, name: &str) -> Option<&'a str> {
+    file.fields
+        .iter()
+        .find(|f| f.owner == owner && f.name == name)
+        .map(|f| f.type_name.as_str())
+}
+
+/// Declared/constructed type of a typed local or parameter, if captured.
+#[allow(dead_code)]
+pub fn local_of<'a>(f: &'a ExtractedFunction, name: &str) -> Option<&'a str> {
+    f.locals
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, t)| t.as_str())
+}

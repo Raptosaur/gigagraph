@@ -238,6 +238,53 @@ fn extracts_out_of_class_definitions_and_namespaces() {
 }
 
 #[test]
+fn extracts_cpp_type_information() {
+    let file = extract_fixture("cpp", "cpp/di.cpp");
+
+    // Value, pointer, and reference members all resolve to the bare type.
+    for member in ["plain_", "ptr_", "ref_"] {
+        assert_eq!(
+            field_of(&file, "Service", member),
+            Some("Store"),
+            "field {member}"
+        );
+    }
+    // Smart-pointer members capture the wrapped type — qualified
+    // (std::unique_ptr<Store>, std::shared_ptr<Store>) and bare
+    // (unique_ptr<Store> via `using`).
+    for member in ["owned_", "shared_", "bare_owned_"] {
+        assert_eq!(
+            field_of(&file, "Service", member),
+            Some("Store"),
+            "smart-pointer field {member}"
+        );
+    }
+    // Primitive-typed members are not captured (int is a primitive_type node).
+    assert_eq!(field_of(&file, "Service", "count_"), None);
+
+    // Constructor params: value, pointer, const-reference, shared_ptr.
+    let ctor = func(&file, "Service");
+    for param in ["store", "pstore", "rstore", "sp"] {
+        assert_eq!(local_of(ctor, param), Some("Store"), "ctor param {param}");
+    }
+
+    // Locals: plain declaration, initialized declaration, and
+    // `auto u = Store();` construction. `auto v = make_store();` is filtered
+    // out by the uppercase-initial gate.
+    let run = func(&file, "run");
+    for local in ["s", "t", "u"] {
+        assert_eq!(local_of(run, local), Some("Store"), "local {local}");
+    }
+    assert_eq!(local_of(run, "v"), None);
+
+    // One hierarchy edge per base — access specifiers don't get in the way —
+    // and struct bases work the same as class bases.
+    assert!(file.hierarchy.contains(&("Service".into(), "Base".into())));
+    assert!(file.hierarchy.contains(&("Service".into(), "Iface".into())));
+    assert!(file.hierarchy.contains(&("SD".into(), "SB".into())));
+}
+
+#[test]
 fn header_class_with_inline_methods() {
     let file = extract_fixture("hpp", "cpp/shape.hpp");
     let names: Vec<&str> = file.functions.iter().map(|f| f.name.as_str()).collect();

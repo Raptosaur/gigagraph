@@ -30,6 +30,27 @@ use crate::types::{ImportStyle, Lang};
 //   `use_wildcard` (wraps the base path node), and `scoped_use_list`
 //   (`path` base + `use_list` of leaves: identifiers, scoped identifiers,
 //   as-clauses, wildcards).
+// - Type captures (verified via probe dump): `field_declaration` has
+//   `name:`/`type:` fields; `&T` / `&'static T` is `reference_type` with the
+//   inner `type_identifier` under its `type:` field (the lifetime is a
+//   non-field child, so one pattern covers both). `Arc<dyn Store>` is
+//   `generic_type` `type:` `Arc` + `type_arguments:` holding either a bare
+//   `type_identifier` (`Rc<Cache>`) or a `dynamic_type` whose `trait:` field
+//   is the `type_identifier` (`dyn Store`); for the deref-transparent
+//   wrappers Arc/Box/Rc we capture the INNER type — `Arc<dyn Store>` /
+//   `Box<dyn Store>` are the Rust DI idiom. `parameter` has `pattern:` +
+//   `type:` (same reference/generic shapes); `self_parameter` has no
+//   `pattern:` field so it never matches. `let_declaration` has `pattern:` +
+//   optional `type:` + `value:`; `DbStore::new()` is a `call_expression` over
+//   a `scoped_identifier` with `path:` `DbStore` / `name:` `new`, and
+//   `Arc::new(DbStore::new())` nests the same shape inside `arguments`, so a
+//   dedicated pattern unwraps it (and `#not-match?` keeps the plain `::new`
+//   pattern from recording `Arc` as the local's type). `impl Trait for Type`
+//   is `impl_item` with `trait:` + `type:` fields — the trait->impl hierarchy
+//   edge. Fields are declared on `struct_item` while methods live under
+//   `impl_item`; both are TYPE_KINDS entries resolving to the same type name,
+//   so the resolver's (containing_type, field) rung lines up (probe-verified:
+//   a struct field's nearest TYPE_KINDS ancestor is the struct).
 const QUERY: &str = r#"
 (function_item
   name: (identifier) @func.name
@@ -139,6 +160,88 @@ const QUERY: &str = r#"
     list: (use_list
       (use_as_clause
         alias: (identifier) @import.name)))) @import
+
+(field_declaration
+  name: (field_identifier) @field.name
+  type: (type_identifier) @field.type)
+
+(field_declaration
+  name: (field_identifier) @field.name
+  type: (reference_type type: (type_identifier) @field.type))
+
+((field_declaration
+  name: (field_identifier) @field.name
+  type: (generic_type
+    type: (type_identifier) @_wrap
+    type_arguments: (type_arguments (type_identifier) @field.type)))
+  (#match? @_wrap "^(Arc|Box|Rc)$"))
+
+((field_declaration
+  name: (field_identifier) @field.name
+  type: (generic_type
+    type: (type_identifier) @_wrap
+    type_arguments: (type_arguments
+      (dynamic_type trait: (type_identifier) @field.type))))
+  (#match? @_wrap "^(Arc|Box|Rc)$"))
+
+(parameter
+  pattern: (identifier) @local.name
+  type: (type_identifier) @local.type)
+
+(parameter
+  pattern: (identifier) @local.name
+  type: (reference_type type: (type_identifier) @local.type))
+
+((parameter
+  pattern: (identifier) @local.name
+  type: (generic_type
+    type: (type_identifier) @_wrap
+    type_arguments: (type_arguments (type_identifier) @local.type)))
+  (#match? @_wrap "^(Arc|Box|Rc)$"))
+
+((parameter
+  pattern: (identifier) @local.name
+  type: (generic_type
+    type: (type_identifier) @_wrap
+    type_arguments: (type_arguments
+      (dynamic_type trait: (type_identifier) @local.type))))
+  (#match? @_wrap "^(Arc|Box|Rc)$"))
+
+(let_declaration
+  pattern: (identifier) @local.name
+  type: (type_identifier) @local.type)
+
+(let_declaration
+  pattern: (identifier) @local.name
+  type: (reference_type type: (type_identifier) @local.type))
+
+((let_declaration
+  pattern: (identifier) @local.name
+  value: (call_expression
+    function: (scoped_identifier
+      path: (identifier) @local.type
+      name: (identifier) @_new)))
+  (#eq? @_new "new")
+  (#not-match? @local.type "^(Arc|Box|Rc)$"))
+
+((let_declaration
+  pattern: (identifier) @local.name
+  value: (call_expression
+    function: (scoped_identifier
+      path: (identifier) @_wrap
+      name: (identifier) @_wrapnew)
+    arguments: (arguments
+      (call_expression
+        function: (scoped_identifier
+          path: (identifier) @local.type
+          name: (identifier) @_new)))))
+  (#match? @_wrap "^(Arc|Box|Rc)$")
+  (#eq? @_wrapnew "new")
+  (#eq? @_new "new"))
+
+(impl_item
+  trait: (type_identifier) @hier.base
+  type: (type_identifier) @hier.type)
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &["identifier", "field_identifier", "type_identifier"];

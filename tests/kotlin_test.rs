@@ -241,6 +241,73 @@ fn extracts_kotlin_models() {
 }
 
 #[test]
+fn extracts_kotlin_di_types() {
+    let file = extract_fixture("kt", "kotlin/wiring.kt");
+
+    // Constructor properties (val/var class params) become typed fields.
+    assert_eq!(
+        field_of(&file, "OrderService", "store"),
+        Some("OrderStore")
+    );
+    // Nullable ctor property: `Tracer?` unwraps to the simple name.
+    assert_eq!(field_of(&file, "OrderService", "tracer"), Some("Tracer"));
+    // Qualified type keeps the last segment.
+    assert_eq!(field_of(&file, "OrderService", "clock"), Some("Clock"));
+    // Generic types are rejected wholesale (anchor fails on type_arguments).
+    assert_eq!(field_of(&file, "OrderService", "tags"), None);
+    // Plain (non-val) ctor params are NOT properties — the ["val" "var"]
+    // token gate keeps them out of the field list.
+    assert_eq!(field_of(&file, "OrderService", "logger"), None);
+    // Data-class-style param on another class.
+    assert_eq!(field_of(&file, "Order", "id"), Some("String"));
+
+    // Class-body properties: constructed initializer infers the type.
+    assert_eq!(field_of(&file, "OrderService", "audit"), Some("AuditTrail"));
+    // Explicitly typed property inside an object declaration; the owner is
+    // the object (TYPE_KINDS covers object_declaration).
+    assert_eq!(
+        field_of(&file, "InMemoryStore", "fallback"),
+        Some("AuditTrail")
+    );
+
+    // Method-body locals stay locals: `trail` must not leak into the field
+    // list (field patterns are constrained to class_body).
+    assert_eq!(field_of(&file, "OrderService", "trail"), None);
+    let place = func(&file, "place");
+    // Typed parameter, nullable parameter, constructed local.
+    assert_eq!(local_of(place, "order"), Some("Order"));
+    assert_eq!(local_of(place, "note"), Some("String"));
+    assert_eq!(local_of(place, "trail"), Some("AuditTrail"));
+
+    // Bare-receiver calls that the locals-then-fields lookup resolves.
+    let save_call = place.calls.iter().find(|c| c.name == "save").unwrap();
+    assert_eq!(save_call.receiver.as_deref(), Some("store"));
+    let record_calls: Vec<_> = place
+        .calls
+        .iter()
+        .filter(|c| c.name == "record")
+        .collect();
+    assert_eq!(record_calls.len(), 2);
+
+    // Hierarchy edges: superclass ctor call, plain interface, object
+    // implementing an interface, and `by`-delegation.
+    for edge in [
+        ("OrderService", "BaseUseCase"),
+        ("OrderService", "Auditable"),
+        ("JdbcOrderStore", "OrderStore"),
+        ("InMemoryStore", "OrderStore"),
+        ("DelegatingStore", "OrderStore"),
+    ] {
+        let edge = (edge.0.to_string(), edge.1.to_string());
+        assert!(
+            file.hierarchy.contains(&edge),
+            "missing hierarchy edge {edge:?}; got {:?}",
+            file.hierarchy
+        );
+    }
+}
+
+#[test]
 fn annotated_function_signature_skips_annotations() {
     let src = r#"
 class Probe {

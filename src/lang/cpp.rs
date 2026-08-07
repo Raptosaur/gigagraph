@@ -23,6 +23,32 @@ use crate::types::{ImportStyle, Lang};
 /// scope, i.e. the class, is the receiver), explicit template calls
 /// (`f<T>(x)`), and `new Foo(...)` treated as a constructor call. Includes
 /// are exactly C's.
+///
+/// DI type captures (shapes verified via `cargo run --example dump`):
+/// - Fields: `Store plain_;` has `declarator: (field_identifier)` directly;
+///   `Store* ptr_;` wraps it in `pointer_declarator` (field-named child) and
+///   `Store& ref_;` in `reference_declarator` (positional child, no field
+///   name). Smart-pointer members — the C++ DI idiom — capture the wrapped
+///   type: `std::unique_ptr<Store>` is `qualified_identifier > template_type >
+///   template_argument_list > type_descriptor`, bare `unique_ptr<Store>`
+///   (via `using`) starts at `template_type`; both are gated on
+///   unique_ptr/shared_ptr/weak_ptr so `vector<T>` members don't fake-narrow.
+/// - Params/locals: `parameter_declaration` mirrors the three field declarator
+///   shapes (plus the qualified smart-pointer form); `Store s;` and
+///   `Store t = ...;` are `declaration` with a plain/`init_declarator`
+///   declarator; `auto u = Store();` captures the callee identifier as the
+///   type, filtered to uppercase-initial so `auto v = make_store();` is not
+///   mistaken for a type. `auto p = std::make_unique<Store>()` is NOT
+///   captured (would need template-argument plumbing through the call).
+/// - Hierarchy: `class D : public B, public I` — `base_class_clause` holds
+///   `access_specifier` and `type_identifier` named children interleaved; the
+///   single-child pattern matches once per base. Same for `struct_specifier`.
+///
+/// KNOWN LIMIT: field-based narrowing only helps methods *defined in-class* —
+/// out-of-class definitions (`void Foo::bar()`) get the enclosing namespace,
+/// not the class, as `containing_type` (see above), so their self-qualified
+/// field lookups miss the owner. Also `this->field_` receivers are dropped by
+/// the resolver (bare-branch rejects `-`); plain `field_->m()` works.
 const QUERY: &str = r#"
 (function_definition
   declarator: (function_declarator
@@ -155,6 +181,85 @@ const QUERY: &str = r#"
 
 (preproc_include
   path: (system_lib_string) @import.path.system) @import
+
+(field_declaration
+  type: (type_identifier) @field.type
+  declarator: (field_identifier) @field.name)
+
+(field_declaration
+  type: (type_identifier) @field.type
+  declarator: (pointer_declarator
+    declarator: (field_identifier) @field.name))
+
+(field_declaration
+  type: (type_identifier) @field.type
+  declarator: (reference_declarator
+    (field_identifier) @field.name))
+
+((field_declaration
+   type: (qualified_identifier
+     name: (template_type
+       name: (type_identifier) @_smart
+       arguments: (template_argument_list
+         (type_descriptor type: (type_identifier) @field.type))))
+   declarator: (field_identifier) @field.name)
+  (#match? @_smart "^(unique_ptr|shared_ptr|weak_ptr)$"))
+
+((field_declaration
+   type: (template_type
+     name: (type_identifier) @_smart
+     arguments: (template_argument_list
+       (type_descriptor type: (type_identifier) @field.type)))
+   declarator: (field_identifier) @field.name)
+  (#match? @_smart "^(unique_ptr|shared_ptr|weak_ptr)$"))
+
+(parameter_declaration
+  type: (type_identifier) @local.type
+  declarator: (identifier) @local.name)
+
+(parameter_declaration
+  type: (type_identifier) @local.type
+  declarator: (pointer_declarator
+    declarator: (identifier) @local.name))
+
+(parameter_declaration
+  type: (type_identifier) @local.type
+  declarator: (reference_declarator
+    (identifier) @local.name))
+
+((parameter_declaration
+   type: (qualified_identifier
+     name: (template_type
+       name: (type_identifier) @_smart
+       arguments: (template_argument_list
+         (type_descriptor type: (type_identifier) @local.type))))
+   declarator: (identifier) @local.name)
+  (#match? @_smart "^(unique_ptr|shared_ptr|weak_ptr)$"))
+
+(declaration
+  type: (type_identifier) @local.type
+  declarator: (identifier) @local.name)
+
+(declaration
+  type: (type_identifier) @local.type
+  declarator: (init_declarator
+    declarator: (identifier) @local.name))
+
+((declaration
+   type: (placeholder_type_specifier)
+   declarator: (init_declarator
+     declarator: (identifier) @local.name
+     value: (call_expression
+       function: (identifier) @local.type)))
+  (#match? @local.type "^[A-Z]"))
+
+(class_specifier
+  name: (type_identifier) @hier.type
+  (base_class_clause (type_identifier) @hier.base))
+
+(struct_specifier
+  name: (type_identifier) @hier.type
+  (base_class_clause (type_identifier) @hier.base))
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &[

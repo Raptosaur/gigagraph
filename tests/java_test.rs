@@ -286,3 +286,63 @@ fn extracts_java_records_and_single_segment_package() {
     // No imports in this file.
     assert!(file.imports.is_empty());
 }
+
+#[test]
+fn extracts_java_di_type_captures() {
+    let file = extract_fixture("java", "java/Wiring.java");
+
+    // Typed fields: plain final, @Autowired-annotated (annotation sits inside
+    // `modifiers`, same pattern), and generic (container simple name only).
+    assert_eq!(
+        field_of(&file, "SignupService", "store"),
+        Some("UserStore")
+    );
+    assert_eq!(field_of(&file, "SignupService", "mailer"), Some("Mailer"));
+    assert_eq!(field_of(&file, "SignupService", "pending"), Some("List"));
+    // Primitive fields (`int retries`) are not type-captured.
+    assert_eq!(field_of(&file, "SignupService", "retries"), None);
+
+    // Ctor-injected params become typed locals of the constructor.
+    let ctor = func(&file, "SignupService");
+    assert_eq!(ctor.containing_type.as_deref(), Some("SignupService"));
+    assert_eq!(local_of(ctor, "store"), Some("UserStore"));
+    assert_eq!(local_of(ctor, "mailer"), Some("Mailer"));
+
+    // Declared locals (`Greeter greeter = new Greeter()`) and `var` locals
+    // (declared type "var" is rejected; the `new Clock()` value supplies it).
+    let register = func(&file, "register");
+    assert_eq!(local_of(register, "greeter"), Some("Greeter"));
+    assert_eq!(local_of(register, "clock"), Some("Clock"));
+    // The method's own typed param is a local too.
+    assert_eq!(local_of(register, "user"), Some("String"));
+
+    // The receiver call the field type is meant to resolve.
+    assert_eq!(
+        register
+            .calls
+            .iter()
+            .find(|c| c.name == "save")
+            .expect("register should call save")
+            .receiver
+            .as_deref(),
+        Some("this.store")
+    );
+
+    // Hierarchy edges: class implements, class extends, interface extends,
+    // record implements. A multi-entry `implements` list yields one edge per
+    // base.
+    for edge in [
+        ("DbUserStore", "UserStore"),
+        ("SignupService", "BaseService"),
+        ("SignupService", "Lifecycle"),
+        ("SignupService", "Auditable"),
+        ("Lifecycle", "AutoCloseable"),
+        ("AuditEvent", "Auditable"),
+    ] {
+        assert!(
+            file.hierarchy.contains(&(edge.0.into(), edge.1.into())),
+            "missing hierarchy edge {edge:?}; got {:?}",
+            file.hierarchy
+        );
+    }
+}

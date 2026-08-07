@@ -95,6 +95,28 @@ fn extracts_ruby_service() {
 }
 
 #[test]
+fn extracts_ruby_type_information() {
+    let file = extract_fixture("rb", "ruby/di.rb");
+
+    // `@store = DbStore.new` — the field key keeps the `@` sigil, matching
+    // the receiver text of later `@store.persist` calls.
+    assert_eq!(field_of(&file, "Service", "@store"), Some("DbStore"));
+
+    // `x = DbStore.new` becomes a typed local of the enclosing method.
+    assert_eq!(local_of(func(&file, "setup"), "x"), Some("DbStore"));
+
+    // `@store = store` in initialize is a plain param assignment — no
+    // construction, no annotation, so no field capture from it.
+    assert!(
+        func(&file, "initialize").locals.is_empty(),
+        "initialize should bind no typed locals"
+    );
+
+    // `class Service < Base` yields the inheritance edge.
+    assert!(file.hierarchy.contains(&("Service".into(), "Base".into())));
+}
+
+#[test]
 fn extracts_ruby_helper_module() {
     let file = extract_fixture("rb", "ruby/helper.rb");
     let names: Vec<&str> = file.functions.iter().map(|f| f.name.as_str()).collect();

@@ -12,10 +12,15 @@ use crate::types::{ImportStyle, Lang};
 //   node (no `$`) becomes the function name and the extractor probes
 //   `@func.body` for the `parameters` field.
 // - Receivers are captured faithfully: `$this->m()` yields recv text `$this`
-//   (note: the resolver's this/self check compares against literal
-//   "this"/"self", so `$this` will NOT match — handled outside this spec),
-//   `self::m()` / `static::m()` yield a `relative_scope` node whose text
-//   ("self"/"static") is captured as-is.
+//   (the resolver's self rung and receiver_binding both handle the `$this`
+//   spelling), `self::m()` / `static::m()` yield a `relative_scope` node
+//   whose text ("self"/"static") is captured as-is.
+// - Type captures (verified via probe dump): typed properties
+//   (`private UserRepository $repo`), promoted ctor params (also emitted as
+//   locals for ctor-body use), typed `simple_parameter`s, `$x = new T()`
+//   locals, untyped-property joins (`$this->repo = $repo` captures the param
+//   NAME in type position — graph build substitutes the param's type), and
+//   class_interface_clause / base_clause hierarchy edges.
 // - `new Foo(...)` / `new \A\B\Foo(...)` capture the class simple name as
 //   `@call.name` (last segment of a `qualified_name`). `new $class(...)` and
 //   anonymous classes are skipped (no clean name).
@@ -118,6 +123,41 @@ const QUERY: &str = r#"
 
 (namespace_definition
   name: (namespace_name) @package.name)
+
+(property_declaration
+  type: (named_type (name) @field.type)
+  (property_element name: (variable_name (name) @field.name)))
+
+(property_promotion_parameter
+  type: (named_type (name) @field.type)
+  name: (variable_name (name) @field.name))
+
+(property_promotion_parameter
+  type: (named_type (name) @local.type)
+  name: (variable_name (name) @local.name))
+
+(simple_parameter
+  type: (named_type (name) @local.type)
+  name: (variable_name (name) @local.name))
+
+(assignment_expression
+  left: (variable_name (name) @local.name)
+  right: (object_creation_expression (name) @local.type))
+
+(assignment_expression
+  left: (member_access_expression
+    object: (variable_name (name) @_thisvar)
+    name: (name) @field.name)
+  right: (variable_name (name) @field.type)
+  (#eq? @_thisvar "this"))
+
+(class_declaration
+  name: (name) @hier.type
+  (class_interface_clause (name) @hier.base))
+
+(class_declaration
+  name: (name) @hier.type
+  (base_clause (name) @hier.base))
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &["name", "variable_name"];

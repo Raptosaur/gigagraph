@@ -137,6 +137,50 @@ fn extracts_rust_functions() {
 }
 
 #[test]
+fn extracts_rust_di_types() {
+    let file = extract_fixture("rs", "rust/wiring.rs");
+
+    // Struct fields: plain, reference (&'static T), and the Arc/Box<dyn Trait>
+    // DI idiom (inner type captured, wrapper discarded).
+    assert_eq!(field_of(&file, "DbStore", "pool"), Some("ConnectionPool"));
+    assert_eq!(field_of(&file, "Service", "store"), Some("DbStore"));
+    assert_eq!(field_of(&file, "Service", "shared"), Some("Store"));
+    assert_eq!(field_of(&file, "Service", "fallback"), Some("Store"));
+    assert_eq!(field_of(&file, "Service", "config"), Some("Config"));
+    // Rc<T> with a plain (non-dyn) argument also unwraps.
+    assert_eq!(field_of(&file, "Service", "cache"), Some("Cache"));
+
+    // Typed params land as locals of their function; `&self` never does.
+    let ctor = func(&file, "with_store");
+    assert_eq!(local_of(ctor, "store"), Some("DbStore"));
+    assert_eq!(local_of(ctor, "shared"), Some("Store"));
+    assert_eq!(local_of(ctor, "config"), Some("Config"));
+    assert_eq!(local_of(ctor, "self"), None);
+
+    // Locals: `let x = T::new()`, annotated `let x: T`, `let x: &T`, and
+    // `let x = Arc::new(T::new())` (records the inner type, not Arc).
+    let run = func(&file, "run");
+    assert_eq!(local_of(run, "s"), Some("DbStore"));
+    assert_eq!(local_of(run, "annotated"), Some("DbStore"));
+    assert_eq!(local_of(run, "borrowed"), Some("Config"));
+    assert_eq!(local_of(run, "wrapped"), Some("DbStore"));
+
+    // `impl Store for DbStore` yields the trait->impl hierarchy edge.
+    assert!(
+        file.hierarchy
+            .contains(&("DbStore".into(), "Store".into())),
+        "missing DbStore->Store edge; got {:?}",
+        file.hierarchy
+    );
+    // Inherent impls (`impl Service`) contribute no edge.
+    assert!(file.hierarchy.iter().all(|(t, _)| t != "Service"));
+
+    // Receiver text of the self-field call is preserved for the resolver.
+    let save_call = run.calls.iter().find(|c| c.name == "save").unwrap();
+    assert_eq!(save_call.receiver.as_deref(), Some("self.store"));
+}
+
+#[test]
 fn extracts_rust_helpers() {
     let file = extract_fixture("rs", "rust/validators.rs");
     let names: Vec<&str> = file.functions.iter().map(|f| f.name.as_str()).collect();

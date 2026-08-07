@@ -213,7 +213,15 @@ answer in ~20 ms against the okhttp index, load included.
 
 ## Honesty about resolution
 
-Cross-file resolution is heuristic (no type inference). Method calls through
-values (`obj.save()`) resolve by method name + receiver hints and are labeled
-`confidence: "heuristic"`, with `ambiguous_with` listing rivals. Agents should
-treat `high` as trustworthy and `heuristic` as a strong lead.
+Cross-file resolution is heuristic (no full type inference), but it is
+**dependency-injection-aware**: declared field/property types, typed
+parameters, `x = new T()` locals, and `implements`/`extends` hierarchies are
+captured per language, so `this.userService.getUser()` narrows to
+`UserService`'s methods, and calls through an interface expand to its
+implementations (single implementor resolves cleanly; several are honest
+`heuristic` with `ambiguous_with` rivals; implementations outrank abstract
+signatures). Explicit container registrations (Laravel `$app->bind(A::class,
+B::class)`) name THE implementation and pre-empt the hierarchy fan-out.
+Remaining method calls through untyped values (`obj.save()`) resolve by
+method name + receiver hints and are labeled `confidence: "heuristic"`.
+Agents should treat `high` as trustworthy and `heuristic` as a strong lead.

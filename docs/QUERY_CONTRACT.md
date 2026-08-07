@@ -51,6 +51,26 @@ Notes:
 - A query referencing a node kind or field that doesn't exist in the grammar
   fails **at registry init** — `tests/registry_test.rs` catches this.
 
+## Type information (DI-aware resolution)
+
+Three optional capture families feed the receiver-type resolution rung in
+`src/graph.rs` (`this.userService.getUser()` narrows to `UserService`'s
+methods, expanded through interface→implementation edges). Call-side queries
+need **no changes** — `@call.recv` already carries the dotted receiver text.
+
+| Capture | Meaning |
+|---|---|
+| `@field.name` + `@field.type` | Typed field/property on a class-like type (same match). Owner = nearest `type_kinds` ancestor of the name node, unless `@field.owner` is captured in the same match (Go structs, where the owner is a sibling `type_spec`, not an ancestor). Includes constructor-parameter properties (TS `constructor(private x: T)`, PHP promoted props, Kotlin class params). |
+| `@local.name` + `@local.type` | Typed binding in a function body: parameters (`svc: UserService`), annotated locals (`let x: T`), and constructed locals (`x = new T()`, `let x = T::new()`). Attributed to the innermost containing function; toplevel bindings are dropped. |
+| `@hier.type` + `@hier.base` | One inheritance/implementation edge per match: declaring type → base class or interface. Inverted at graph build into `type_bindings` (base → derived) for interface→impl expansion. |
+
+Type nodes must be simple names: the extractor's `clean_type` rejects
+generics/unions/tuples wholesale and keeps only the last qualified segment
+(`cdk.App` → `App`, `App\Models\User` → `User`). Python `self.x = x` fields
+may capture the **parameter name** in type position; the graph build
+substitutes the `__init__` parameter's declared type (one-hop, like
+`substitute_consts`).
+
 ## LangSpec metadata
 
 - `identifier_kinds`: node kinds harvested as `id:<text>` features (semantic

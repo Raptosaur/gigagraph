@@ -226,6 +226,64 @@ fn extracts_python_util_shapes() {
     }
 }
 
+// Type-capture (DI) shapes, verified against a probe dump of
+// tree-sitter-python: `typed_parameter` wraps the annotation as
+// `type: (type (identifier))`; `typed_default_parameter` adds a `name:` field;
+// annotated assignments put the same `type:` field on `assignment`;
+// `class_definition` lists bases in a `superclasses:` argument_list.
+// Constructed types (`x = Klass()`, `self.x = Klass()`) are guarded by
+// `#match? "^[A-Z]"` — Python calls are case-blind, so without the guard every
+// lowercase `x = helper()` would be recorded as a "type". The `self.x = param`
+// join form stays unguarded: it deliberately captures the lowercase ctor
+// PARAM NAME in type position, and the graph build (not extraction)
+// substitutes the `__init__` parameter's declared type.
+#[test]
+fn extracts_python_type_information() {
+    let file = extract_fixture("py", "python/wiring.py");
+
+    // Typed ctor param -> local of __init__.
+    assert_eq!(local_of(func(&file, "__init__"), "store"), Some("OrderStore"));
+
+    // Typed param with default (`store: OrderStore = None`).
+    assert_eq!(
+        local_of(func(&file, "build_service"), "store"),
+        Some("OrderStore")
+    );
+
+    // Constructed local (`audit = AuditTrail()`) and annotated local
+    // (`tag: OrderTag = make_tag(order)`).
+    let place = func(&file, "place");
+    assert_eq!(local_of(place, "audit"), Some("AuditTrail"));
+    assert_eq!(local_of(place, "tag"), Some("OrderTag"));
+    // Case guard: the lowercase call `make_tag(...)` must not be recorded as
+    // a constructed type for `tag`.
+    assert!(
+        !place.locals.iter().any(|(_, t)| t == "make_tag"),
+        "lowercase call leaked into locals: {:?}",
+        place.locals
+    );
+
+    // Constructed field: `self.cache = CacheClient()`. Owner comes from the
+    // nearest class_definition ancestor (TYPE_KINDS).
+    assert_eq!(field_of(&file, "OrderService", "cache"), Some("CacheClient"));
+
+    // Join form: `self.store = store` captures the ctor PARAM NAME in type
+    // position at extraction level. The substitution to OrderStore happens at
+    // graph build, not here — assert the raw form.
+    assert_eq!(field_of(&file, "OrderService", "store"), Some("store"));
+    // Untyped param join extracts the same way; there is just no declared
+    // type for the graph build to substitute later.
+    assert_eq!(field_of(&file, "OrderService", "logger"), Some("logger"));
+
+    // Inheritance edge from the superclasses argument_list.
+    assert!(
+        file.hierarchy
+            .contains(&("OrderStore".into(), "BaseStore".into())),
+        "missing hierarchy edge; got {:?}",
+        file.hierarchy
+    );
+}
+
 #[test]
 fn docstrings_feed_doc_features() {
     let src = "def summarize(rows):\n    \"\"\"Aggregate rows into weekly buckets.\"\"\"\n    return rows\n";
