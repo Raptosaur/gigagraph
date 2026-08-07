@@ -171,7 +171,7 @@ impl LspProvider for TsServer {
                 break; // abandon the rest; partial answers still count
             }
             let abs = root.join(&q.file);
-            let abs_str = abs.to_string_lossy().to_string();
+            let abs_str = wire_path(&abs);
             if opened.insert(q.file.as_str()) {
                 // `open` has no response; project load happens lazily and the
                 // first definition request below absorbs the wait.
@@ -189,6 +189,20 @@ impl LspProvider for TsServer {
         }
         session.shutdown();
         Ok(answers)
+    }
+}
+
+/// Path as sent to tsserver/node: Windows verbatim prefixes (`\\?\C:\...`,
+/// from `canonicalize`) confuse node's path handling and tsserver's own
+/// normalization — strip them; keep native separators otherwise.
+fn wire_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.into_owned()
     }
 }
 
