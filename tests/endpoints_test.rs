@@ -924,6 +924,197 @@ fn detects_laravel8_route_shapes() {
 }
 
 #[test]
+fn detects_rails_nested_and_namespaced_routes() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    use gigagraph::types::Confidence;
+
+    // root -> GET /.
+    let root = find(ep, HttpMethod::Get, "/");
+    assert_eq!(root.framework, "rails");
+    assert_eq!(root.confidence, Confidence::High);
+
+    // only: [:index, :show] — no create/update/destroy/form routes.
+    find(ep, HttpMethod::Get, "/authors");
+    find(ep, HttpMethod::Get, "/authors/{*}");
+    assert!(
+        ep.endpoints.iter().all(|e| {
+            !(e.path_norm == "/authors" && e.method == HttpMethod::Post)
+                && e.path_norm != "/authors/new"
+                && e.path_norm != "/authors/{*}/edit"
+        }),
+        "only: [:index, :show] must suppress the other resource routes"
+    );
+
+    // member / collection blocks and `on: :member`.
+    find(ep, HttpMethod::Get, "/authors/{*}/badges");
+    find(ep, HttpMethod::Get, "/authors/featured");
+    find(ep, HttpMethod::Get, "/authors/{*}/preview");
+
+    // Nested resources under the parent id, only: [:create].
+    let books = find(ep, HttpMethod::Post, "/authors/{*}/books");
+    assert_eq!(books.confidence, Confidence::Heuristic);
+    assert!(
+        ep.endpoints
+            .iter()
+            .all(|e| !(e.path_norm == "/authors/{*}/books" && e.method == HttpMethod::Get)),
+        "nested only: [:create] must suppress index"
+    );
+
+    // namespace :admin prefixes resources and verb routes.
+    assert_eq!(find(ep, HttpMethod::Get, "/admin/tools").framework, "rails");
+    find(ep, HttpMethod::Get, "/admin/metrics");
+
+    // scope '/api' path prefix.
+    find(ep, HttpMethod::Get, "/api/uptime");
+
+    // match via: [:get, :post] -> one row per verb, no ANY row.
+    find(ep, HttpMethod::Get, "/archive/import");
+    find(ep, HttpMethod::Post, "/archive/import");
+    assert!(
+        ep.endpoints
+            .iter()
+            .all(|e| !(e.path_norm == "/archive/import" && e.method == HttpMethod::Any)),
+        "via: list must replace the ANY row"
+    );
+
+    // Sinatra namespace '/wiki' (sinatra-namespace, gollum shape).
+    let wiki = find(ep, HttpMethod::Get, "/wiki/pages");
+    assert_eq!(wiki.framework, "sinatra");
+    assert_eq!(wiki.confidence, Confidence::Heuristic);
+    find(ep, HttpMethod::Post, "/wiki/pages/{*}/rename");
+    // Un-namespaced sinatra routes keep their bare paths and High.
+    assert_eq!(find(ep, HttpMethod::Get, "/ping").confidence, Confidence::High);
+}
+
+#[test]
+fn detects_aspnet_controller_tokens_and_map_groups() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+    use gigagraph::types::Confidence;
+
+    // [Route("api/[controller]")] class prefix + token substitution
+    // (aspnetcore-realworld / eShopOnWeb shapes).
+    let list = find(ep, HttpMethod::Get, "/api/gadgetinventory");
+    assert_eq!(list.framework, "aspnet");
+    assert_eq!(list.confidence, Confidence::High);
+    assert_eq!(g.functions[list.handler.unwrap() as usize].name, "List");
+    let found = find(ep, HttpMethod::Get, "/api/gadgetinventory/{*}");
+    assert_eq!(g.functions[found.handler.unwrap() as usize].name, "Find");
+    find(ep, HttpMethod::Post, "/api/gadgetinventory/bulk");
+    // Method-level [Route] without a verb attribute -> ANY.
+    let export = find(ep, HttpMethod::Any, "/api/gadgetinventory/export");
+    assert_eq!(g.functions[export.handler.unwrap() as usize].name, "Export");
+
+    // [controller]/[action] template inherited from a method-less base
+    // controller (eShopOnWeb BaseApiController shape) — Heuristic.
+    let sizes = find(ep, HttpMethod::Get, "/api/wrench/sizes");
+    assert_eq!(sizes.confidence, Confidence::Heuristic);
+    assert_eq!(g.functions[sizes.handler.unwrap() as usize].name, "Sizes");
+
+    // Absolute method templates stay untouched and High.
+    assert_eq!(
+        find(ep, HttpMethod::Get, "/api/users/{*}").confidence,
+        Confidence::High
+    );
+
+    // Minimal APIs: var-bound MapGroup borrowed file-wide (Heuristic),
+    // slash-less patterns, chained MapGroup, unprefixed app.MapGet High.
+    let lite = find(ep, HttpMethod::Get, "/minapi/orders-lite");
+    assert_eq!(lite.framework, "aspnet");
+    assert_eq!(lite.confidence, Confidence::Heuristic);
+    find(ep, HttpMethod::Post, "/minapi/orders-lite");
+    find(ep, HttpMethod::Delete, "/minapi/orders-lite/{*}");
+    assert_eq!(
+        find(ep, HttpMethod::Get, "/healthz-lite").confidence,
+        Confidence::High
+    );
+    assert!(
+        ep.endpoints.iter().all(|e| e.path_norm != "/orders-lite"),
+        "grouped Map* calls must not emit unprefixed rows"
+    );
+}
+
+#[test]
+fn detects_rust_router_composition() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+    use gigagraph::types::Confidence;
+
+    // Chained multi-verb method router: each verb binds to ITS route call.
+    let post = find(ep, HttpMethod::Post, "/sprocketeers");
+    assert_eq!(post.framework, "axum");
+    assert_eq!(
+        g.functions[post.handler.unwrap() as usize].name,
+        "add_sprocketeer"
+    );
+    let get = find(ep, HttpMethod::Get, "/sprocketeers");
+    assert_eq!(
+        g.functions[get.handler.unwrap() as usize].name,
+        "list_sprocketeers"
+    );
+
+    // nest("/panel", panel_routes()) cross-function prefix, Heuristic.
+    let health = find(ep, HttpMethod::Get, "/panel/health");
+    assert_eq!(health.framework, "axum");
+    assert_eq!(health.confidence, Confidence::Heuristic);
+    assert_eq!(
+        g.functions[health.handler.unwrap() as usize].name,
+        "panel_health"
+    );
+    assert!(
+        ep.endpoints
+            .iter()
+            .all(|e| !(e.path_norm == "/health" && e.framework == "axum")),
+        "nested router must not keep its unprefixed row"
+    );
+
+    // merge(gauges_router()) keeps the path, resolves the handler, High.
+    let gauge = find(ep, HttpMethod::Delete, "/gauges/{*}");
+    assert_eq!(gauge.confidence, Confidence::High);
+    assert_eq!(g.functions[gauge.handler.unwrap() as usize].name, "drop_gauge");
+
+    // actix scope prefix joins a `.service(handler)`d attribute route.
+    let ledger = find(ep, HttpMethod::Get, "/portal/ledger-lines");
+    assert_eq!(ledger.framework, "actix");
+    assert_eq!(ledger.confidence, Confidence::Heuristic);
+    assert_eq!(
+        g.functions[ledger.handler.unwrap() as usize].name,
+        "ledger_lines"
+    );
+    assert!(
+        ep.endpoints.iter().all(|e| e.path_norm != "/ledger-lines"),
+        "scoped service must not keep its unprefixed row"
+    );
+
+    // web::resource(...).route(web::VERB().to(handler)) under a scope.
+    let crates = find(ep, HttpMethod::Get, "/api2/crates2");
+    assert_eq!(crates.framework, "actix");
+    assert_eq!(
+        g.functions[crates.handler.unwrap() as usize].name,
+        "list_crates2"
+    );
+    let add = find(ep, HttpMethod::Post, "/api2/crates2");
+    assert_eq!(g.functions[add.handler.unwrap() as usize].name, "add_crate2");
+
+    // Bare .route("/x", web::get().to(h)) stays unprefixed and High.
+    let ping = find(ep, HttpMethod::Get, "/direct-ping");
+    assert_eq!(ping.confidence, Confidence::High);
+    assert_eq!(
+        g.functions[ping.handler.unwrap() as usize].name,
+        "direct_ping"
+    );
+
+    // Unregistered attribute routes keep their bare paths and High.
+    assert_eq!(
+        find(ep, HttpMethod::Get, "/invoices/{*}").confidence,
+        Confidence::High
+    );
+}
+
+#[test]
 fn generic_php_tier_catches_unknown_routers() {
     let index = index();
     let ep = &index.graph.endpoints;

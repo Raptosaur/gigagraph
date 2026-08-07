@@ -62,6 +62,11 @@ use crate::types::{ImportStyle, Lang};
 //   DI detection sees exactly-two-simple-name registrations and nothing else.
 //   The typearg patterns overlap the plain generic ones on purpose — the
 //   extractor's call dedupe merges them and keeps the typearg list.
+// - Class-level attributes (`[Route("api/[controller]")]`) are captured WITH
+//   `@deco.type` (the class name), routing them to
+//   `ExtractedFile.type_decorations`; endpoint detection joins them onto
+//   method attribute routes, including `[controller]`/`[action]` token
+//   substitution and attribute inheritance from base controllers.
 const QUERY: &str = r#"
 (method_declaration
   name: (identifier) @func.name
@@ -81,6 +86,19 @@ const QUERY: &str = r#"
       name: (identifier) @deco.name) @deco)
   name: (identifier) @func.name
   parameters: (parameter_list) @func.params) @func.def
+
+(class_declaration
+  (attribute_list
+    (attribute
+      name: (identifier) @deco.name
+      (attribute_argument_list) @deco.args) @deco)
+  name: (identifier) @deco.type)
+
+(class_declaration
+  (attribute_list
+    (attribute
+      name: (identifier) @deco.name) @deco)
+  name: (identifier) @deco.type)
 
 (constructor_declaration
   name: (identifier) @func.name

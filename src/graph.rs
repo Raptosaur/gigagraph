@@ -91,6 +91,9 @@ impl GigaGraph {
         // detection gates on structural evidence (implements X) where import
         // evidence is absent (zero-`use` Silex providers).
         let mut file_hierarchy: Vec<Vec<(String, String)>> = Vec::new();
+        // Per-file class-level decorations (name -> attribute), aligned with
+        // file ids — ASP.NET `[Route]` class prefixes live here.
+        let mut type_decorations: Vec<Vec<(String, crate::extract::RawDecoration)>> = Vec::new();
 
         let declared_packages: FxHashSet<String> = inputs
             .iter()
@@ -159,6 +162,7 @@ impl GigaGraph {
                     .push(derived.clone());
             }
             file_hierarchy.push(input.extracted.hierarchy);
+            type_decorations.push(input.extracted.type_decorations);
             g.path_index.insert(input.path.clone(), file_id);
             g.files.push(FileInfo {
                 id: file_id,
@@ -401,6 +405,7 @@ impl GigaGraph {
             &g.functions,
             &raw_calls,
             &decorations,
+            &type_decorations,
             &g.name_index,
             &file_hierarchy,
             project_evidence,
