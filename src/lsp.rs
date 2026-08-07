@@ -218,14 +218,20 @@ fn definition_from_response(resp: &serde_json::Value, root: &Path) -> Option<Def
     // style symlinked roots (macOS temp dirs).
     let abs = PathBuf::from(file);
     let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // The server may answer in long form while the root canonicalized to a
+    // Windows verbatim path (or vice versa) — and the answer file need not
+    // exist locally, so canonicalizing the answer is a fallback, not the
+    // primary. Try the root in both spellings first.
+    let plain_root = PathBuf::from(wire_path(&canon_root));
     let rel = abs
         .strip_prefix(&canon_root)
+        .or_else(|_| abs.strip_prefix(&plain_root))
         .ok()
         .map(|p| p.to_path_buf())
         .or_else(|| {
-            abs.canonicalize()
-                .ok()?
-                .strip_prefix(&canon_root)
+            let c = abs.canonicalize().ok()?;
+            c.strip_prefix(&canon_root)
+                .or_else(|_| c.strip_prefix(&plain_root))
                 .ok()
                 .map(|p| p.to_path_buf())
         })?;
