@@ -1,0 +1,125 @@
+use super::LangSpec;
+use crate::types::{ImportStyle, Lang};
+
+// Written against tree-sitter-swift 0.7 (alex-pinkus grammar).
+//
+// Grammar notes (verified via `cargo run --example dump`):
+// - `struct` / `class` / `enum` / `actor` / `extension` are all
+//   `class_declaration`, distinguished by the `declaration_kind` field; the
+//   `name` field is a `type_identifier` (or `user_type` for extensions), so a
+//   single TYPE_KINDS entry covers them all, including methods declared in
+//   extensions.
+// - Function parameters are direct fieldless `parameter` children of
+//   `function_declaration` / `init_declaration`; there is NO parameter-list
+//   wrapper node, so `@func.params` cannot be captured and param counts are
+//   not available for Swift (they extract as 0).
+// - `call_expression` wraps the callee expression (bare `simple_identifier`
+//   or `navigation_expression`) plus a `call_suffix`. Subscript access
+//   (`storage[key]`) is ALSO a `call_expression`; it is excluded by requiring
+//   a literal `(` inside `value_arguments`. Trailing-closure-only calls
+//   (`items.map { .. }`) have a `lambda_literal` as the first named child of
+//   `call_suffix` and no `value_arguments`.
+// - `Foo(...)` initializer calls are plain `call_expression`s with a
+//   `simple_identifier` callee, so they come out as calls named `Foo`.
+// - `init` declarations carry the anonymous `init` token in the `name` field.
+// - In binary expressions the grammar hangs the `call_suffix` off the WHOLE
+//   expression (`title + String(x)` is a `call_expression` whose callee child
+//   is the `additive_expression` `title + String`); the real callee is that
+//   expression's `rhs`, covered by the wildcard `(_ rhs: ...)` patterns.
+// - Imports are `import_declaration` with a single `identifier` holding one
+//   `simple_identifier` per dotted component; the last component is the name
+//   bound in source.
+const QUERY: &str = r#"
+(function_declaration
+  name: (simple_identifier) @func.name) @func.def
+
+(protocol_function_declaration
+  name: (simple_identifier) @func.name) @func.def
+
+(init_declaration
+  name: "init" @func.name) @func.def
+
+(call_expression
+  (simple_identifier) @call.name
+  (call_suffix (value_arguments "(") @call.args)) @call
+
+(call_expression
+  (simple_identifier) @call.name
+  (call_suffix . (lambda_literal))) @call
+
+(call_expression
+  (navigation_expression
+    target: (_) @call.recv
+    suffix: (navigation_suffix
+      suffix: (simple_identifier) @call.name))
+  (call_suffix (value_arguments "(") @call.args)) @call
+
+(call_expression
+  (navigation_expression
+    target: (_) @call.recv
+    suffix: (navigation_suffix
+      suffix: (simple_identifier) @call.name))
+  (call_suffix . (lambda_literal))) @call
+
+(call_expression
+  (_ rhs: (simple_identifier) @call.name)
+  (call_suffix (value_arguments "(") @call.args)) @call
+
+(call_expression
+  (_ rhs: (navigation_expression
+    target: (_) @call.recv
+    suffix: (navigation_suffix
+      suffix: (simple_identifier) @call.name)))
+  (call_suffix (value_arguments "(") @call.args)) @call
+
+(import_declaration
+  (identifier) @import.path) @import
+
+(import_declaration
+  (identifier (simple_identifier) @import.name .)) @import
+
+(function_declaration
+  (modifiers
+    (attribute
+      (user_type (type_identifier) @deco.name)) @deco)
+  name: (simple_identifier) @func.name) @func.def
+
+(control_transfer_statement (line_string_literal) @ret.str)
+"#;
+
+const IDENTIFIER_KINDS: &[&str] = &["simple_identifier", "type_identifier"];
+
+const TYPE_KINDS: &[(&str, &str)] = &[
+    ("class_declaration", "name"),
+    ("protocol_declaration", "name"),
+];
+
+const LOOP_KINDS: &[&str] = &["for_statement", "while_statement", "repeat_while_statement"];
+
+const BRANCH_KINDS: &[&str] = &[
+    "if_statement",
+    "switch_statement",
+    "guard_statement",
+    "ternary_expression",
+    "catch_block",
+];
+
+const BUILTIN_RECEIVERS: &[&str] = &["Swift"];
+
+pub fn spec() -> LangSpec {
+    LangSpec::new(
+        Lang::Swift,
+        tree_sitter_swift::LANGUAGE.into(),
+        &["swift"],
+        QUERY,
+        IDENTIFIER_KINDS,
+        STRING_KINDS,
+        TYPE_KINDS,
+        LOOP_KINDS,
+        BRANCH_KINDS,
+        ImportStyle::Module,
+        BUILTIN_RECEIVERS,
+    )
+}
+
+const STRING_KINDS: &[&str] = &["line_string_literal"];

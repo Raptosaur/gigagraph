@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gigagraph": {
+      "command": "./target/release/gigagraph",
+      "args": ["serve", "--root", "."]
+    }
+  }
+}

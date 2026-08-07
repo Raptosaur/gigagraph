@@ -1,0 +1,33 @@
+"""A registered user."""
+type User implements Node {
+  id: ID!
+  email: String!
+  posts: [Post!]!
+}
+
+type Post {
+  id: ID!
+  title: String!
+  author: User!
+}
+
+interface Node {
+  id: ID!
+}
+
+input PostInput {
+  title: String!
+  authorId: ID!
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+union SearchResult = User | Post
+
+type Query {
+  user(id: ID!): User
+  search(term: String!): [SearchResult!]
+}

@@ -1,0 +1,78 @@
+# Language extractor contract
+
+Each language lives in `src/lang/<language>.rs` and exposes `pub fn spec() -> LangSpec`.
+The generic extractor (`src/extract.rs`) consumes a single tree-sitter query per
+language via **standard capture names**. No per-language Rust code is needed —
+only the query string and the metadata lists on `LangSpec`.
+
+## Capture names
+
+| Capture | Meaning |
+|---|---|
+| `@func.def` | Whole function/method definition node. Its range becomes the function span; call sites inside it get attributed to it. |
+| `@func.name` | Name node (same match as `@func.def`, required). |
+| `@func.params` | Parameter-list node. Param count = named children (comments excluded). |
+| `@func.body` | Optional: a value node (e.g. arrow function) the extractor probes for a `parameters`/`parameter` field when `@func.params` can't be captured directly. |
+| `@call` | Whole call node. |
+| `@call.name` | Callee simple-name node (same match, required). |
+| `@call.recv` | Optional receiver node (`obj` in `obj.m()`). Discarded if text contains `(`/newline or exceeds 48 chars. |
+| `@call.args` | Optional argument-list node. Arg count = named children. |
+| `@import` | Whole import/include node. Multiple query patterns may capture the same `@import` node; their `path`/`name` captures are merged by node identity. |
+| `@import.path` | Module path / header node. Surrounding quotes/angles are stripped. |
+| `@import.path.system` | Same, but marks a system include (C `<...>`). |
+| `@import.name` | Local name(s) bound by the import (aliases, named imports). Repeatable. |
+| `@package.name` | Declared package/module name node (Java/Kotlin `package` decl). First match wins. |
+| `@deco` | Whole decorator/annotation/attribute node (`@app.route(...)`, `@GetMapping(...)`, `#[Route(...)]`). Deduped by byte range. |
+| `@deco.name` | Decoration name node (same match, required). Dotted text like `app.route` is fine. |
+| `@deco.args` | Decoration argument-list node; harvested into `ArgLit`s like call args. |
+| `@deco.type` | Decorated type's name node for class-level decorations; routed to `ExtractedFile.type_decorations` instead of a function. |
+
+Decoration→function association: a `@func.def` captured in the same match wins
+(Java/C#/PHP annotations nest inside the definition node — write the pattern
+that way); otherwise the nearest function starting after the decoration ends
+(Python decorators). Decorations feed endpoint detection (`src/endpoints.rs`),
+which holds all framework interpretation — queries stay framework-agnostic.
+
+## Argument literals
+
+`LangSpec.string_kinds` lists the grammar's string-literal node kinds. The
+extractor walks every `@call.args` / `@deco.args` node and distills up to 8
+`ArgLit`s per call: string literals (quotes stripped) and identifier-ish args,
+with kwarg/object keys captured one level down (`methods=["POST"]`,
+`{ method: "PUT" }`). Single-child wrapper nodes are unwrapped automatically.
+No query changes are needed for this — only `string_kinds` metadata.
+
+Notes:
+- Patterns match **anywhere** in the tree (exported/nested/annotated wrappers
+  don't need their own patterns).
+- Duplicate `@func.def` matches on the same byte range are deduped; write
+  overlapping patterns freely (e.g. C pointer-declarator nesting levels).
+- `#eq?` / `#match?` predicates work (the extractor passes source bytes).
+- A query referencing a node kind or field that doesn't exist in the grammar
+  fails **at registry init** — `tests/registry_test.rs` catches this.
+
+## LangSpec metadata
+
+- `identifier_kinds`: node kinds harvested as `id:<text>` features (semantic
+  similarity vectors).
+- `type_kinds`: `(node_kind, name_field)` pairs; nearest ancestor of a
+  `@func.def` matching one becomes `containing_type` (methods know their
+  class/struct/object).
+- `loop_kinds` / `branch_kinds`: control-flow feature counting.
+- `import_style`: `PathLike` (JS/C), `DottedPackage` (Java/Kotlin), `Module`
+  (Swift) — drives external-package classification in `src/graph.rs`.
+- `builtin_receivers`: receivers treated as stdlib globals (`console`,
+  `System`); calls through them resolve to `builtin:<recv>`.
+
+## Workflow for adding/fixing a language
+
+1. Inspect real node kinds: `cargo run --example dump -- tests/fixtures/probe/probe.kt`
+   (write any probe file you need).
+2. Edit the query in `src/lang/<language>.rs`.
+3. `cargo test --test registry_test` — query compiles.
+4. `cargo test --test <language>_test` — fixtures extract correctly.
+
+`tests/typescript_test.rs` + `tests/fixtures/typescript/` is the reference for
+what a language test should assert: function forms (plain/method/nested/etc.),
+`containing_type`, param counts, call attribution incl. receivers, imports with
+bound names, toplevel call capture, and a control-flow feature.
