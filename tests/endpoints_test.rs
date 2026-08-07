@@ -516,3 +516,41 @@ fn detects_legacy_php_frameworks() {
         "OldShopController::OldShopController::showCart"
     );
 }
+
+#[test]
+fn detects_silex_routes() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+    use gigagraph::types::Confidence;
+
+    // Verb calls on $app with Silex import evidence.
+    let list = find(ep, HttpMethod::Get, "/gnomes");
+    assert_eq!(list.framework, "silex");
+    assert_eq!(list.confidence, Confidence::High);
+    // 'GnomeController::listGnomes' string handler resolves cross-file.
+    assert_eq!(
+        g.functions[list.handler.unwrap() as usize].name,
+        "listGnomes"
+    );
+    let create = find(ep, HttpMethod::Post, "/gnomes");
+    assert_eq!(
+        g.functions[create.handler.unwrap() as usize].name,
+        "createGnome"
+    );
+
+    // Closure handler: endpoint exists, handler unresolved.
+    let update = find(ep, HttpMethod::Put, "/gnomes/{*}");
+    assert_eq!(update.framework, "silex");
+    assert!(update.handler.is_none());
+
+    // $app->match(...) maps to ANY.
+    find(ep, HttpMethod::Any, "/gnomes/ping");
+
+    // Controller collection routes pick up the $app->mount prefix and are
+    // honest Heuristic (non-$app receiver + joined prefix).
+    let hats = find(ep, HttpMethod::Get, "/workshop/hats");
+    assert_eq!(hats.framework, "silex");
+    assert_eq!(hats.confidence, Confidence::Heuristic);
+    find(ep, HttpMethod::Delete, "/workshop/hats/{*}");
+}

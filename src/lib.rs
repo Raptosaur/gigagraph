@@ -3,6 +3,7 @@ pub mod bridge;
 pub mod endpoints;
 pub mod extract;
 pub mod graph;
+pub mod iac;
 pub mod impact;
 pub mod indexer;
 pub mod lang;

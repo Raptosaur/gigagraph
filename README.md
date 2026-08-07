@@ -156,7 +156,7 @@ tool calls) — see `docs/HOOKS.md`.
 | `call_path` | Shortest call chain between two functions (BFS). |
 | `file_overview` | One file's imports (classified) + functions. |
 | `list_packages` | External packages ranked by call-site count. |
-| `list_endpoints` | Published API surface: REST routes plus SOAP/XML-RPC/JSON-RPC operations and gRPC services (`kind` filter). |
+| `list_endpoints` | Published API surface: REST routes, SOAP/XML-RPC/JSON-RPC operations, gRPC services, GraphQL/AppSync resolvers, and IaC-declared routes (`kind` filter). |
 | `find_endpoint_callers` | Who calls `POST /api/users/:id`? Endpoints + their in-repo HTTP callers. |
 | `get_endpoint` | One endpoint's full card: handler, matched clients, confidence. |
 | `list_client_calls` | Outbound HTTP/RPC calls, with `unmatched: true` filter. |

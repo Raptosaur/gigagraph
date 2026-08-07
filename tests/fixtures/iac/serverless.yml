@@ -1,0 +1,28 @@
+service: iac-demo
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+
+functions:
+  createUser:
+    handler: src/handlers/users.create
+    events:
+      - http:
+          path: users
+          method: post
+  report:
+    handler: src/handlers/report.lambda_handler
+    runtime: python3.12
+    events:
+      - httpApi: 'GET /reports'
+  site:
+    handler: src/handlers/users.create
+    url: true
+
+appSync:
+  name: demo-api
+  resolvers:
+    Query.getReport:
+      dataSource: reports
+      kind: UNIT

@@ -24,6 +24,7 @@ pub enum Lang {
     Graphql,
     Yaml,
     ObjC,
+    Terraform,
 }
 
 impl Lang {
@@ -49,6 +50,7 @@ impl Lang {
             Lang::Graphql => "graphql",
             Lang::Yaml => "yaml",
             Lang::ObjC => "objc",
+            Lang::Terraform => "terraform",
         }
     }
 
@@ -74,6 +76,7 @@ impl Lang {
             "graphql" | "gql" => Some(Lang::Graphql),
             "yaml" | "yml" | "openapi" => Some(Lang::Yaml),
             "objc" | "objectivec" | "objective-c" => Some(Lang::ObjC),
+            "terraform" | "tf" | "hcl" => Some(Lang::Terraform),
             _ => None,
         }
     }

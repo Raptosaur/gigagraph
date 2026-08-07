@@ -16,6 +16,11 @@ use std::time::Instant;
 const MAX_FILE_BYTES: u64 = 2_000_000;
 const CACHE_DIR: &str = ".gigagraph";
 
+/// Extensions with no LangSpec that are still collected, for IaC endpoint
+/// scanning. Must go through `collect_files` (not a side channel) so that
+/// `tree_fingerprint` invalidates the index when a .tf changes.
+const IAC_EXTS: &[&str] = &["tf"];
+
 /// Directories skipped even when not gitignored.
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
@@ -108,7 +113,8 @@ fn collect_files(root: &Path) -> Vec<(String, PathBuf)> {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             continue;
         };
-        if lang::spec_for_ext(&ext.to_ascii_lowercase()).is_none() {
+        let ext = ext.to_ascii_lowercase();
+        if lang::spec_for_ext(&ext).is_none() && !IAC_EXTS.contains(&ext.as_str()) {
             continue;
         }
         let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -173,6 +179,7 @@ pub fn build_index(root: &Path, force: bool) -> Result<Index> {
         hash: u64,
         extracted: ExtractedFile,
         reused: bool,
+        iac: Vec<crate::iac::IacFinding>,
     }
 
     let processed: Vec<Processed> = files
@@ -181,6 +188,10 @@ pub fn build_index(root: &Path, force: bool) -> Result<Index> {
             let bytes = std::fs::read(abs).ok()?;
             let source = String::from_utf8_lossy(&bytes);
             let hash = hash_bytes(source.as_bytes());
+            // IaC findings are re-scanned every build (never cached): the
+            // text is already in hand for hashing, and caching them would
+            // break the bincode cache format for no savings.
+            let iac = crate::iac::scan(rel, &source);
             if let Some(entry) = old_cache.entries.get(rel) {
                 if entry.hash == hash {
                     return Some(Processed {
@@ -188,17 +199,31 @@ pub fn build_index(root: &Path, force: bool) -> Result<Index> {
                         hash,
                         extracted: entry.extracted.clone(),
                         reused: true,
+                        iac,
                     });
                 }
             }
             let ext = abs.extension()?.to_str()?.to_ascii_lowercase();
-            let spec = lang::spec_for_ext(&ext)?;
-            let extracted = extract::extract(spec, &source)?;
+            let extracted = match lang::spec_for_ext(&ext) {
+                Some(spec) => extract::extract(spec, &source)?,
+                // IaC-only files (.tf) have no LangSpec; an empty extraction
+                // still yields a FileInfo so IaC endpoints get a valid
+                // file_id (api.rs indexes g.files[e.file_id] unguarded).
+                None => ExtractedFile {
+                    language: crate::types::Lang::Terraform,
+                    package: None,
+                    imports: Vec::new(),
+                    functions: Vec::new(),
+                    type_decorations: Vec::new(),
+                    consts: Vec::new(),
+                },
+            };
             Some(Processed {
                 rel: rel.clone(),
                 hash,
                 extracted,
                 reused: false,
+                iac,
             })
         })
         .collect();
@@ -221,6 +246,12 @@ pub fn build_index(root: &Path, force: bool) -> Result<Index> {
             .collect(),
     };
 
+    let iac_files: Vec<(String, Vec<crate::iac::IacFinding>)> = processed
+        .iter()
+        .filter(|p| !p.iac.is_empty())
+        .map(|p| (p.rel.clone(), p.iac.clone()))
+        .collect();
+
     let inputs: Vec<FileInput> = processed
         .into_iter()
         .map(|p| FileInput {
@@ -231,7 +262,9 @@ pub fn build_index(root: &Path, force: bool) -> Result<Index> {
         .collect();
 
     let root_str = root.to_string_lossy().to_string();
-    let (graph, features) = GigaGraph::build(root_str, inputs);
+    let (mut graph, features) = GigaGraph::build(root_str, inputs);
+    crate::iac::attach(&mut graph, &iac_files);
+    let graph = graph;
     let vectors = VectorIndex::build(&features);
 
     let mut stats = IndexStats {

@@ -570,7 +570,7 @@ impl AppState {
             .and_then(Value::as_str)
             .map(|k| {
                 endpoints::ApiKind::from_name(k)
-                    .ok_or_else(|| anyhow!("unknown kind: {k} (http/soap/xml-rpc/json-rpc/grpc)"))
+                    .ok_or_else(|| anyhow!("unknown kind: {k} (http/soap/xml-rpc/json-rpc/grpc/graphql)"))
             })
             .transpose()?;
         let index = self.ensure_index()?;

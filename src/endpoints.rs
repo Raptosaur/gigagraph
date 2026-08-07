@@ -27,6 +27,9 @@ pub enum ApiKind {
     XmlRpc,
     JsonRpc,
     Grpc,
+    /// GraphQL operations (AppSync resolvers, schema fields). Correlates by
+    /// operation-name equality like the RPC kinds, not by path shape.
+    Graphql,
 }
 
 impl ApiKind {
@@ -37,6 +40,7 @@ impl ApiKind {
             ApiKind::XmlRpc => "xml-rpc",
             ApiKind::JsonRpc => "json-rpc",
             ApiKind::Grpc => "grpc",
+            ApiKind::Graphql => "graphql",
         }
     }
 
@@ -47,6 +51,7 @@ impl ApiKind {
             "xml-rpc" | "xmlrpc" => ApiKind::XmlRpc,
             "json-rpc" | "jsonrpc" => ApiKind::JsonRpc,
             "grpc" => ApiKind::Grpc,
+            "graphql" | "gql" => ApiKind::Graphql,
             _ => return None,
         })
     }
@@ -175,7 +180,21 @@ struct FileCtx {
     /// Ident at the URL position has no definition to look up, and the call
     /// is skipped exactly as before.
     php_consts: FxHashMap<(u32, String), String>,
+    /// file id -> the file's single CDK Lambda declaration whose handler
+    /// resolved to an indexed function. `Some(fn)` only when the file
+    /// declares EXACTLY ONE lambda and it resolved; `None` records "lambdas
+    /// exist here but the binding is ambiguous or unresolved". Real dataflow
+    /// (`const fn = new Function(...)` then `LambdaIntegration(fn)`) is
+    /// invisible in the harvested literals, so `detect_cdk` borrows this
+    /// file-scope binding for its routes — always Heuristic, because
+    /// single-lambda-per-file is an assumption, not knowledge.
+    cdk_lambda: FxHashMap<u32, Option<u32>>,
 }
+
+/// CDK import evidence: v2 monopackage + v1 scoped packages (JS/TS) and the
+/// Python module (`from aws_cdk import ...` surfaces path "aws_cdk").
+const CDK_EV_JS: &[&str] = &["aws-cdk-lib", "@aws-cdk/"];
+const CDK_EV_PY: &[&str] = &["aws_cdk"];
 
 /// Record a mount prefix, degrading to `None` when the same key is mounted
 /// at two different prefixes (ambiguous joins are worse than no join).
@@ -225,6 +244,9 @@ pub fn detect(
 
     // ---- Pre-pass: file-level context ----
     let mut ctx = FileCtx::default();
+    // file id -> one entry per CDK Lambda declaration seen (resolved or not);
+    // folded into `ctx.cdk_lambda` after the loop.
+    let mut cdk_decls: FxHashMap<u32, Vec<Option<u32>>> = FxHashMap::default();
     for func in functions {
         let fid = func.file_id;
         let file = &files[fid as usize];
@@ -270,6 +292,16 @@ pub fn detect(
                 // (`serve-static` etc.) resolves to no file and is ignored.
                 // Local non-router idents mounted at a path can register a
                 // receiver prefix that never matches an endpoint — harmless.
+                if has(fid, CDK_EV_JS) {
+                    collect_cdk_lambdas(
+                        file,
+                        files,
+                        calls,
+                        functions,
+                        name_index,
+                        cdk_decls.entry(fid).or_default(),
+                    );
+                }
                 if has(fid, &["express", "@koa/router", "koa-router"]) {
                     for call in calls {
                         if call.name != "use" {
@@ -342,9 +374,54 @@ pub fn detect(
                         }
                     }
                 }
+                // Silex `$app->mount('/prefix', $collection)`: reuse the JS
+                // mount_recv machinery, keyed by receiver spelling. Arg-lit
+                // idents drop the `$` (unlike receivers), so it is re-added.
+                // Known gap: collection routes declared in a different
+                // function (provider classes) key on a different local and
+                // stay unprefixed.
+                if has(fid, &["silex"]) {
+                    for call in calls {
+                        if call.name != "mount" || call.receiver.as_deref() != Some("$app") {
+                            continue;
+                        }
+                        let Some(prefix) = first_path_lit(call) else {
+                            continue;
+                        };
+                        let Some(ident) = call
+                            .arg_lits
+                            .iter()
+                            .find(|l| l.kind == LitKind::Ident && l.key.is_none())
+                        else {
+                            continue;
+                        };
+                        let recv = if ident.text.starts_with('$') {
+                            ident.text.clone()
+                        } else {
+                            format!("${}", ident.text)
+                        };
+                        upsert_mount(&mut ctx.mount_recv, (fid, recv), prefix);
+                    }
+                }
+            }
+            Lang::Python if has(fid, CDK_EV_PY) => {
+                collect_cdk_lambdas(
+                    file,
+                    files,
+                    calls,
+                    functions,
+                    name_index,
+                    cdk_decls.entry(fid).or_default(),
+                );
             }
             _ => {}
         }
+    }
+    for (fid, decls) in cdk_decls {
+        // Single-lambda-per-file assumption: only an unambiguous, resolved
+        // declaration becomes a borrowable binding.
+        ctx.cdk_lambda
+            .insert(fid, if decls.len() == 1 { decls[0] } else { None });
     }
 
     for func in functions {
@@ -895,6 +972,10 @@ fn detect_server(
                     });
                 }
             }
+            // AWS CDK stacks (TypeScript flavor).
+            if has(fid, CDK_EV_JS) {
+                detect_cdk(func, calls, ctx, idx);
+            }
             if !has(
                 fid,
                 &[
@@ -970,6 +1051,10 @@ fn detect_server(
             }
         }
         Lang::Python => {
+            // AWS CDK stacks (Python flavor).
+            if has(fid, CDK_EV_PY) {
+                detect_cdk(func, calls, ctx, idx);
+            }
             // Django URLconf: gated on the `urls.py` naming convention.
             if file.path.ends_with("urls.py") {
                 let django = has(fid, &["django"]);
@@ -1218,10 +1303,12 @@ fn detect_server(
                     }
                 }
             }
+            let silex = has(fid, &["silex"]);
             // Slim (classic PHP micro-framework): $app->get('/x', ...).
             // Slim's own `$app->group('/p', ...)` prefixes are not joined
             // (different chain shape from Laravel's, no fixture demand yet).
-            if has(fid, &["slim"]) {
+            // Silex shares the call shape exactly, so its evidence wins.
+            if has(fid, &["slim"]) && !silex {
                 for call in calls {
                     if call.receiver.as_deref() != Some("$app") {
                         continue;
@@ -1245,6 +1332,58 @@ fn detect_server(
                         call,
                         None,
                         Confidence::High,
+                    );
+                }
+            }
+            // Silex (legacy Symfony micro-framework): $app->get('/x', h) with
+            // string handlers ('Ctrl::method') and mounted controller
+            // collections ($controllers->get(...) after $app->mount). Any
+            // `$`-receiver is accepted because collections are plain locals;
+            // non-$app receivers are honest Heuristic ($this excluded — that
+            // shape is method calls, not routing).
+            if silex {
+                let mount_for = |call: &RawCall| -> Option<String> {
+                    call.receiver
+                        .as_deref()
+                        .and_then(|r| ctx.mount_recv.get(&(fid, r.to_string())))
+                        .cloned()
+                        .flatten()
+                };
+                for call in calls {
+                    let Some(recv) = call.receiver.as_deref() else {
+                        continue;
+                    };
+                    if !recv.starts_with('$') || recv == "$this" {
+                        continue;
+                    }
+                    let Some(method) = HttpMethod::from_name(&call.name) else {
+                        continue;
+                    };
+                    let Some(path) = first_path_lit(call) else {
+                        continue;
+                    };
+                    let base_conf = if recv == "$app" {
+                        Confidence::High
+                    } else {
+                        Confidence::Heuristic
+                    };
+                    let (path, conf) = match mount_for(call) {
+                        Some(mp) => (join_prefix(&mp, &path), Confidence::Heuristic),
+                        None => (path, base_conf),
+                    };
+                    let Some(norm) = normalize_path(&path) else {
+                        continue;
+                    };
+                    push_endpoint(
+                        idx,
+                        method,
+                        path,
+                        norm,
+                        "silex",
+                        func,
+                        call,
+                        class_static_string_handler(call, functions, name_index),
+                        conf,
                     );
                 }
             }
@@ -1813,6 +1952,354 @@ fn php_const_path(call: &RawCall, fid: u32, ctx: &FileCtx) -> Option<String> {
     })
 }
 
+/// AWS CDK app code (TypeScript and Python): API Gateway REST routes
+/// (`addResource`/`addMethod`, `resourceForPath`, `addProxy`,
+/// `LambdaRestApi`), HTTP API v2 `addRoutes`, Lambda function URLs, and
+/// AppSync resolvers (pushed as `ApiKind::Graphql` ops so they correlate by
+/// operation name). Framework "cdk" / "cdk-appsync".
+///
+/// Extraction constraints this is designed around (all verified empirically):
+/// TS `new ns.Ctor(...)` new-expressions are not captured at all and bare
+/// `new Ctor(...)` ones carry no arguments, so on the TS side construction
+/// props (Lambda `handler:`, `NodejsFunction` `entry:`, `new
+/// appsync.Resolver` fields) are invisible — detection leans on the METHOD
+/// calls (`addMethod`, `addRoutes`, `createResolver`, `Code.fromAsset`),
+/// which arrive complete. TS object-literal fields surface as
+/// Ident-key/Str-value pairs (`str_lit_by_key` handles them) but array
+/// members inside those objects do NOT surface, so `methods: [HttpMethod.GET]`
+/// yields nothing and TS `addRoutes` rows fall back to ANY. Python calls
+/// arrive complete with kwargs, including `methods=[HttpMethod.GET]` idents.
+fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut EndpointIndex) {
+    let fid = func.file_id;
+    let file_lambda = ctx.cdk_lambda.get(&fid).copied().flatten();
+    // Borrowing the file's single resolved lambda as a route's handler is
+    // the honest fallback for invisible dataflow; it always caps the row at
+    // Heuristic (see `FileCtx::cdk_lambda`).
+    let bind = |base: Confidence| -> (Option<u32>, Confidence) {
+        match file_lambda {
+            Some(h) => (Some(h), Confidence::Heuristic),
+            None => (None, base),
+        }
+    };
+    // addResource chains carry no dataflow either: when every addResource in
+    // this function has a distinct receiver and a distinct segment they form
+    // at most one linear chain, and the byte-ordered join of the segments
+    // declared BEFORE an addMethod is that method's path. Anything else
+    // (branching trees, reused receivers, receiver-less calls) degrades to
+    // /{*} rather than fabricating a path.
+    let mut resources: Vec<(u32, Option<&str>, String)> = calls
+        .iter()
+        .filter(|c| matches!(c.name.as_str(), "addResource" | "add_resource"))
+        .filter_map(|c| first_str_lit(c).map(|s| (c.start_byte, c.receiver.as_deref(), s)))
+        .collect();
+    resources.sort_by_key(|r| r.0);
+    let linear = !resources.is_empty()
+        && resources
+            .iter()
+            .enumerate()
+            .all(|(i, (_, recv, seg))| match recv {
+                Some(r) => !resources[..i]
+                    .iter()
+                    .any(|(_, r2, s2)| *r2 == Some(*r) || s2 == seg),
+                None => false,
+            });
+    let for_paths: Vec<(u32, u32, String)> = calls
+        .iter()
+        .filter(|c| matches!(c.name.as_str(), "resourceForPath" | "resource_for_path"))
+        .filter_map(|c| first_str_lit(c).map(|p| (c.start_byte, c.end_byte, p)))
+        .collect();
+
+    for call in calls {
+        match call.name.as_str() {
+            "addMethod" | "add_method" => {
+                let Some(method) = first_str_lit(call).and_then(|v| HttpMethod::from_name(&v))
+                else {
+                    continue;
+                };
+                // Chained `resourceForPath('/x').addMethod(...)`: the inner
+                // call shares the chain's start byte (same shape Laravel
+                // prefix->group containment relies on) — exact path.
+                let chained = for_paths
+                    .iter()
+                    .find(|(s, e, _)| *s == call.start_byte && *e < call.end_byte)
+                    .map(|(_, _, p)| p.clone());
+                let (path, base_conf) = if let Some(p) = chained {
+                    (ensure_slash(&p), Confidence::High)
+                } else if resources.is_empty() && for_paths.len() == 1 {
+                    // Sole resourceForPath stored in a variable: the only
+                    // plausible base, but the binding is assumed.
+                    (ensure_slash(&for_paths[0].2), Confidence::Heuristic)
+                } else if resources.is_empty() && for_paths.is_empty() {
+                    if call.receiver.as_deref().is_some_and(|r| r.ends_with("root")) {
+                        // api.root.addMethod(...): the root itself.
+                        ("/".to_string(), Confidence::High)
+                    } else {
+                        ("/{*}".to_string(), Confidence::Heuristic)
+                    }
+                } else if linear {
+                    let joined = resources
+                        .iter()
+                        .filter(|(s, _, _)| *s < call.start_byte)
+                        .fold(String::new(), |acc, (_, _, seg)| join_prefix(&acc, seg));
+                    if joined.is_empty() {
+                        ("/{*}".to_string(), Confidence::Heuristic)
+                    } else {
+                        (joined, Confidence::Heuristic)
+                    }
+                } else {
+                    ("/{*}".to_string(), Confidence::Heuristic)
+                };
+                let Some(norm) = normalize_path(&path) else {
+                    continue;
+                };
+                let (handler, conf) = bind(base_conf);
+                push_endpoint(idx, method, path, norm, "cdk", func, call, handler, conf);
+            }
+            // addProxy() -> ANY /{proxy+}; greedy by definition.
+            "addProxy" | "add_proxy" => {
+                let (handler, _) = bind(Confidence::Heuristic);
+                push_endpoint(
+                    idx,
+                    HttpMethod::Any,
+                    "/{proxy+}".to_string(),
+                    "/{*}".to_string(),
+                    "cdk",
+                    func,
+                    call,
+                    handler,
+                    Confidence::Heuristic,
+                );
+            }
+            // LambdaRestApi proxies EVERY method+path to one lambda. Python
+            // constructions arrive complete; on the TS side only the bare
+            // `new LambdaRestApi(...)` named-import form surfaces (name-only),
+            // the `new apigateway.LambdaRestApi(...)` form not at all.
+            "LambdaRestApi" => {
+                let (handler, conf) = bind(Confidence::High);
+                push_endpoint(
+                    idx,
+                    HttpMethod::Any,
+                    "/{proxy+}".to_string(),
+                    "/{*}".to_string(),
+                    "cdk",
+                    func,
+                    call,
+                    handler,
+                    conf,
+                );
+            }
+            // HTTP API v2: addRoutes({ path, methods, integration }).
+            "addRoutes" | "add_routes" => {
+                let Some(path) = str_lit_by_key(call, &["path"]) else {
+                    continue;
+                };
+                let Some(norm) = normalize_path(&ensure_slash(&path)) else {
+                    continue;
+                };
+                // Python kwarg: methods=[HttpMethod.GET, ...] arrives as
+                // `methods`-keyed Idents. TS array members are unharvested
+                // (see fn doc), so TS rows honestly widen to ANY.
+                let listed: Vec<HttpMethod> = call
+                    .arg_lits
+                    .iter()
+                    .filter(|l| l.key.as_deref() == Some("methods") && l.kind == LitKind::Ident)
+                    .filter_map(|l| {
+                        l.text.rsplit('.').next().and_then(HttpMethod::from_name)
+                    })
+                    .collect();
+                let (handler, conf) = bind(Confidence::High);
+                for m in if listed.is_empty() {
+                    vec![HttpMethod::Any]
+                } else {
+                    listed
+                } {
+                    push_endpoint(
+                        idx,
+                        m,
+                        ensure_slash(&path),
+                        norm.clone(),
+                        "cdk",
+                        func,
+                        call,
+                        handler,
+                        conf,
+                    );
+                }
+            }
+            // Lambda function URL: one HTTPS entry point, any method/path.
+            "addFunctionUrl" | "add_function_url" => {
+                let (handler, _) = bind(Confidence::Heuristic);
+                push_endpoint(
+                    idx,
+                    HttpMethod::Any,
+                    "/{*}".to_string(),
+                    "/{*}".to_string(),
+                    "cdk",
+                    func,
+                    call,
+                    handler,
+                    Confidence::Heuristic,
+                );
+            }
+            // AppSync resolvers: ds.createResolver('id', { typeName,
+            // fieldName }) / options-only arity / Python create_resolver
+            // kwargs / Python `appsync.Resolver(...)` constructions (the TS
+            // `new appsync.Resolver` form never surfaces — see fn doc). The
+            // op is "Type.field", correlating by name on the RPC branch.
+            "createResolver" | "create_resolver" | "Resolver" => {
+                let t = str_lit_by_key(call, &["typeName", "type_name"]);
+                let f = str_lit_by_key(call, &["fieldName", "field_name"]);
+                if let (Some(t), Some(f)) = (t, f) {
+                    let (handler, conf) = bind(Confidence::High);
+                    push_rpc_op(
+                        idx,
+                        ApiKind::Graphql,
+                        format!("{t}.{f}"),
+                        "cdk-appsync",
+                        fid,
+                        call.line,
+                        handler,
+                        conf,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Pre-pass: harvest one file-slice's CDK Lambda declarations and try to
+/// resolve each to an indexed handler function. Python constructions arrive
+/// with their kwargs, so `handler="app.lambda_handler"` +
+/// `Code.from_asset("src")` resolve exactly. TS constructions are invisible
+/// (see `detect_cdk`'s doc), so the declaration marker is the
+/// `Code.fromAsset(...)` call and the handler file falls back to Lambda's
+/// `index.handler` default convention — inherently Heuristic, which the
+/// borrow in `detect_cdk` enforces anyway.
+fn collect_cdk_lambdas(
+    file: &FileInfo,
+    files: &[FileInfo],
+    calls: &[RawCall],
+    functions: &[FunctionInfo],
+    name_index: &FxHashMap<String, Vec<u32>>,
+    out: &mut Vec<Option<u32>>,
+) {
+    let dir = file.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    match file.language {
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+            for call in calls {
+                // lambda.Code.fromAsset('dir') — receiver keeps the `.Code`
+                // tail, distinguishing it from other fromAsset-ish APIs.
+                // DockerImageFunction uses fromImageAsset and is skipped (no
+                // source handler to resolve). NodejsFunction/PythonFunction
+                // `entry:` props are TS-invisible: documented gap.
+                if call.name != "fromAsset"
+                    || !call
+                        .receiver
+                        .as_deref()
+                        .is_some_and(|r| r == "Code" || r.ends_with(".Code"))
+                {
+                    continue;
+                }
+                let resolved = first_str_lit(call).and_then(|asset| {
+                    ["ts", "tsx", "js", "mjs", "cjs"]
+                        .iter()
+                        .find_map(|ext| cdk_find_file(files, dir, &format!("{asset}/index.{ext}")))
+                        .and_then(|t| cdk_fn_in_file(functions, name_index, t, "handler"))
+                });
+                out.push(resolved);
+            }
+        }
+        Lang::Python => {
+            for call in calls {
+                match call.name.as_str() {
+                    // _lambda.Function(..., handler="app.lambda_handler",
+                    // code=_lambda.Code.from_asset("src")): the asset dir is
+                    // available both as the byte-contained from_asset call and
+                    // as a `code`-keyed Str harvested one level down.
+                    "Function" => {
+                        let Some(handler) = str_lit_by_key(call, &["handler"]) else {
+                            continue; // not a Lambda construction
+                        };
+                        let asset = calls
+                            .iter()
+                            .find(|c| {
+                                c.name == "from_asset"
+                                    && c.start_byte >= call.start_byte
+                                    && c.end_byte <= call.end_byte
+                            })
+                            .and_then(first_str_lit)
+                            .or_else(|| str_lit_by_key(call, &["code"]));
+                        let resolved = asset.and_then(|asset| {
+                            let (stem, export) = handler.rsplit_once('.')?;
+                            let t = cdk_find_file(files, dir, &format!("{asset}/{stem}.py"))?;
+                            cdk_fn_in_file(functions, name_index, t, export)
+                        });
+                        out.push(resolved);
+                    }
+                    // PythonFunction(entry=dir, index="app.py",
+                    // handler="fn") with documented CDK defaults.
+                    "PythonFunction" => {
+                        let resolved = str_lit_by_key(call, &["entry"]).and_then(|entry| {
+                            let index = str_lit_by_key(call, &["index"])
+                                .unwrap_or_else(|| "index.py".to_string());
+                            let export = str_lit_by_key(call, &["handler"])
+                                .unwrap_or_else(|| "handler".to_string());
+                            let t = cdk_find_file(files, dir, &format!("{entry}/{index}"))?;
+                            cdk_fn_in_file(functions, name_index, t, &export)
+                        });
+                        out.push(resolved);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Resolve a CDK asset-relative source path against the indexed file set.
+/// Asset dirs are relative to the CDK app root — usually the CDK file's own
+/// directory or the repo root — so try both (exact), then fall back to a
+/// unique path-suffix match.
+fn cdk_find_file(files: &[FileInfo], cdk_dir: &str, rel: &str) -> Option<u32> {
+    let joined = if cdk_dir.is_empty() {
+        rel.to_string()
+    } else {
+        format!("{cdk_dir}/{rel}")
+    };
+    for cand in [joined.as_str(), rel] {
+        if let Some(f) = files.iter().find(|f| f.path == cand) {
+            return Some(f.id);
+        }
+    }
+    let sfx = format!("/{rel}");
+    let hits: Vec<u32> = files
+        .iter()
+        .filter(|f| f.path.ends_with(&sfx))
+        .map(|f| f.id)
+        .collect();
+    (hits.len() == 1).then(|| hits[0])
+}
+
+/// Unique non-toplevel function named `name` inside `file_id`.
+fn cdk_fn_in_file(
+    functions: &[FunctionInfo],
+    name_index: &FxHashMap<String, Vec<u32>>,
+    file_id: u32,
+    name: &str,
+) -> Option<u32> {
+    let hits: Vec<u32> = name_index
+        .get(name)?
+        .iter()
+        .copied()
+        .filter(|&id| {
+            functions[id as usize].file_id == file_id && !functions[id as usize].is_toplevel
+        })
+        .collect();
+    (hits.len() == 1).then(|| hits[0])
+}
+
 #[allow(clippy::too_many_arguments)]
 fn detect_client(
     func: &FunctionInfo,
@@ -2183,6 +2670,33 @@ fn laravel_string_handler(
     (hits.len() == 1).then(|| hits[0])
 }
 
+/// Silex/Symfony callable strings: `'MyController::indexAction'` — resolve
+/// the method against functions whose containing type matches. Cross-file
+/// like `laravel_string_handler`; the class is reduced to its simple name
+/// because `containing_type` never carries a namespace.
+fn class_static_string_handler(
+    call: &RawCall,
+    functions: &[FunctionInfo],
+    name_index: &FxHashMap<String, Vec<u32>>,
+) -> Option<u32> {
+    let lit = call
+        .arg_lits
+        .iter()
+        .find(|l| l.kind == LitKind::Str && l.key.is_none() && l.text.contains("::"))?;
+    let (ctrl, method) = lit.text.rsplit_once("::")?;
+    let ctrl = ctrl.rsplit('\\').next().unwrap_or(ctrl);
+    if ctrl.is_empty() || method.is_empty() || ctrl.contains('/') {
+        return None;
+    }
+    let hits: Vec<u32> = name_index
+        .get(method)?
+        .iter()
+        .copied()
+        .filter(|&id| functions[id as usize].containing_type.as_deref() == Some(ctrl))
+        .collect();
+    (hits.len() == 1).then(|| hits[0])
+}
+
 fn handler_from_ident(
     call: &RawCall,
     func: &FunctionInfo,
@@ -2363,6 +2877,13 @@ fn unify(a: &[&str], b: &[&str]) -> bool {
 /// either side, a Heuristic endpoint, or a Heuristic client detection caps
 /// at Heuristic. Suffix matches need >= 2 concrete segments on the endpoint
 /// side to avoid `/{*}`-tail collisions.
+/// Re-run correlation after endpoints have been appended post-detect() —
+/// IaC-declared routes attach in the indexer, after the graph is built, and
+/// would otherwise be invisible to matches/blast_radius.
+pub fn recorrelate(idx: &mut EndpointIndex) {
+    idx.matches = correlate(&idx.endpoints, &idx.client_calls);
+}
+
 fn correlate(endpoints: &[Endpoint], clients: &[ClientCall]) -> Vec<(u32, u32, Confidence)> {
     let mut out = Vec::new();
     for c in clients {
