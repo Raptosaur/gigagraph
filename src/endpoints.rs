@@ -2483,12 +2483,63 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
             None => (None, base),
         }
     };
-    // addResource chains carry no dataflow either: when every addResource in
-    // this function has a distinct receiver and a distinct segment they form
-    // at most one linear chain, and the byte-ordered join of the segments
-    // declared BEFORE an addMethod is that method's path. Anything else
-    // (branching trees, reused receivers, receiver-less calls) degrades to
-    // /{*} rather than fabricating a path.
+    // Resource paths ARE trackable dataflow now: `assigned_to` names the
+    // variable a `const items = api.root.addResource('items')` lands in, and
+    // receivers name the variable later `items.addResource('{id}')` /
+    // `items.addMethod(...)` calls go through. A byte-ordered walk therefore
+    // rebuilds the resource tree exactly for the dominant real-world shape
+    // (variables + root-anchored chains). `resolved` keeps every resolved
+    // addResource/resourceForPath span so chained `.addMethod(...)` (same
+    // chain-start byte) binds to its accumulated path. Anything that escapes
+    // the walk (resources passed between functions, dynamic segments) falls
+    // back to the old linear-chain heuristic, then to /{*}.
+    let root_ish = |r: &str| r == "root" || r.ends_with(".root");
+    let mut bound: FxHashMap<String, String> = FxHashMap::default();
+    let mut resolved: Vec<(u32, u32, String)> = Vec::new();
+    {
+        let mut order: Vec<&RawCall> = calls
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.name.as_str(),
+                    "addResource" | "add_resource" | "resourceForPath" | "resource_for_path"
+                )
+            })
+            .collect();
+        order.sort_by_key(|c| (c.start_byte, c.end_byte));
+        for c in order {
+            let Some(seg) = first_str_lit(c) else {
+                continue;
+            };
+            let path = match c.name.as_str() {
+                "resourceForPath" | "resource_for_path" => Some(ensure_slash(&seg)),
+                _ => {
+                    // Chain tails (`root.addResource('a').addResource('b')`)
+                    // arrive receiver-less but share the chain's start byte
+                    // with their (already resolved) predecessor.
+                    let base = match c.receiver.as_deref() {
+                        Some(r) if root_ish(r) => Some(String::new()),
+                        Some(r) => bound.get(r).cloned(),
+                        None => resolved
+                            .iter()
+                            .filter(|(s, e, _)| *s == c.start_byte && *e < c.end_byte)
+                            .max_by_key(|(_, e, _)| *e)
+                            .map(|(_, _, p)| p.clone()),
+                    };
+                    base.map(|b| join_prefix(&b, &seg))
+                }
+            };
+            if let Some(path) = path {
+                resolved.push((c.start_byte, c.end_byte, path.clone()));
+                if let Some(v) = &c.assigned_to {
+                    bound.insert(v.clone(), path);
+                }
+            }
+        }
+    }
+    // Legacy fallback for unresolved receivers: distinct receivers + distinct
+    // segments form at most one linear chain; the byte-ordered join of the
+    // segments declared BEFORE an addMethod approximates its path.
     let mut resources: Vec<(u32, Option<&str>, String)> = calls
         .iter()
         .filter(|c| matches!(c.name.as_str(), "addResource" | "add_resource"))
@@ -2510,6 +2561,28 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
         .filter(|c| matches!(c.name.as_str(), "resourceForPath" | "resource_for_path"))
         .filter_map(|c| first_str_lit(c).map(|p| (c.start_byte, c.end_byte, p)))
         .collect();
+    // `proxy: false` LambdaRestApi stacks add explicit resources/methods ON
+    // THE API VARIABLE; the boolean itself is unharvestable (not a string),
+    // so a resource-ish call whose receiver chain starts at the API's
+    // assigned variable is the honest signal to suppress the proxy-all row.
+    // An unassigned LambdaRestApi (nothing to hang routes on) always keeps
+    // its row.
+    let explicit_routes_on = |var: &str| {
+        calls.iter().any(|c| {
+            matches!(
+                c.name.as_str(),
+                "addResource"
+                    | "add_resource"
+                    | "addMethod"
+                    | "add_method"
+                    | "resourceForPath"
+                    | "resource_for_path"
+            ) && c
+                .receiver
+                .as_deref()
+                .is_some_and(|r| r == var || r.starts_with(&format!("{var}.")))
+        })
+    };
 
     for call in calls {
         match call.name.as_str() {
@@ -2518,14 +2591,25 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                 else {
                     continue;
                 };
-                // Chained `resourceForPath('/x').addMethod(...)`: the inner
-                // call shares the chain's start byte (same shape Laravel
-                // prefix->group containment relies on) — exact path.
-                let chained = for_paths
+                // Resolution ladder: (1) chained `X.addResource('s')
+                // .addMethod(...)` / `resourceForPath('/x').addMethod(...)`
+                // — the inner call shares the chain's start byte and its
+                // accumulated path is exact; (2) receiver is the API root;
+                // (3) receiver is a tracked resource variable; then the
+                // legacy fallbacks.
+                let chained = resolved
                     .iter()
-                    .find(|(s, e, _)| *s == call.start_byte && *e < call.end_byte)
+                    .filter(|(s, e, _)| *s == call.start_byte && *e < call.end_byte)
+                    .max_by_key(|(_, e, _)| *e)
                     .map(|(_, _, p)| p.clone());
-                let (path, base_conf) = if let Some(p) = chained {
+                let tracked = call.receiver.as_deref().and_then(|r| {
+                    if root_ish(r) {
+                        Some("/".to_string())
+                    } else {
+                        bound.get(r).cloned()
+                    }
+                });
+                let (path, base_conf) = if let Some(p) = chained.or(tracked) {
                     (ensure_slash(&p), Confidence::High)
                 } else if resources.is_empty() && for_paths.len() == 1 {
                     // Sole resourceForPath stored in a variable: the only
@@ -2557,14 +2641,30 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                 let (handler, conf) = bind(base_conf);
                 push_endpoint(idx, method, path, norm, "cdk", func, call, handler, conf);
             }
-            // addProxy() -> ANY /{proxy+}; greedy by definition.
+            // addProxy() -> ANY {base}/{proxy+}; greedy by definition. RDS
+            // `instance.addProxy('id', {...})` shares the name — its
+            // positional id string is the discriminator (API GW addProxy
+            // takes only an options object).
             "addProxy" | "add_proxy" => {
+                if first_str_lit(call).is_some() {
+                    continue; // rds.DatabaseInstance.addProxy — not a route
+                }
+                let base = call
+                    .receiver
+                    .as_deref()
+                    .filter(|r| !root_ish(r))
+                    .and_then(|r| bound.get(r).cloned())
+                    .unwrap_or_default();
+                let path = join_prefix(&base, "{proxy+}");
+                let Some(norm) = normalize_path(&path) else {
+                    continue;
+                };
                 let (handler, _) = bind(Confidence::Heuristic);
                 push_endpoint(
                     idx,
                     HttpMethod::Any,
-                    "/{proxy+}".to_string(),
-                    "/{*}".to_string(),
+                    path,
+                    norm,
                     "cdk",
                     func,
                     call,
@@ -2576,8 +2676,17 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
             // Python constructions and TS new-expressions (bare and
             // `new apigateway.LambdaRestApi(...)` member form) surface; the
             // `handler:` prop is an ident (dataflow), so the handler is the
-            // borrowed file-scope lambda either way.
+            // borrowed file-scope lambda either way. `proxy: false` stacks
+            // (explicit addResource/addMethod in the same function) suppress
+            // the proxy-all row — the explicit routes carry the truth.
             "LambdaRestApi" => {
+                if call
+                    .assigned_to
+                    .as_deref()
+                    .is_some_and(&explicit_routes_on)
+                {
+                    continue;
+                }
                 let (handler, conf) = bind(Confidence::High);
                 push_endpoint(
                     idx,
@@ -2590,6 +2699,127 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                     handler,
                     conf,
                 );
+            }
+            // StepFunctionsRestApi: ANY on the API root proxying to the
+            // state machine (plus whatever explicit resources follow, which
+            // the addResource/addMethod arms emit on their own).
+            "StepFunctionsRestApi" => {
+                let (handler, _) = bind(Confidence::Heuristic);
+                push_endpoint(
+                    idx,
+                    HttpMethod::Any,
+                    "/".to_string(),
+                    "/".to_string(),
+                    "cdk",
+                    func,
+                    call,
+                    handler,
+                    Confidence::Heuristic,
+                );
+            }
+            // HTTP API v2 with a default catch-all integration:
+            // `new HttpApi(this, 'x', { defaultIntegration: ... })` -> the
+            // $default route (ANY, every path). The prop value is a
+            // construction (not harvestable), but the KEY ident surfacing is
+            // proof enough. Python kwarg spelling included.
+            "HttpApi" => {
+                let has_default = call.arg_lits.iter().any(|l| {
+                    l.kind == LitKind::Ident
+                        && matches!(l.text.as_str(), "defaultIntegration" | "default_integration")
+                });
+                if !has_default {
+                    continue;
+                }
+                let (handler, conf) = bind(Confidence::High);
+                push_endpoint(
+                    idx,
+                    HttpMethod::Any,
+                    "$default".to_string(),
+                    "/{*}".to_string(),
+                    "cdk",
+                    func,
+                    call,
+                    handler,
+                    conf,
+                );
+            }
+            // WebSocket API v2 L2: route options passed at construction
+            // ($connect / $disconnect / $default) and `addRoute('key', ...)`
+            // custom routes. Route keys are operation names, not HTTP paths;
+            // the norm keeps them literal so rows stay distinct.
+            "WebSocketApi" => {
+                for (prop, key) in [
+                    ("connectRouteOptions", "$connect"),
+                    ("disconnectRouteOptions", "$disconnect"),
+                    ("defaultRouteOptions", "$default"),
+                    ("connect_route_options", "$connect"),
+                    ("disconnect_route_options", "$disconnect"),
+                    ("default_route_options", "$default"),
+                ] {
+                    if call.arg_lits.iter().any(|l| {
+                        l.kind == LitKind::Ident
+                            && l.key.is_none()
+                            && l.text == prop
+                            || l.key.as_deref() == Some(prop)
+                    }) {
+                        let (handler, _) = bind(Confidence::High);
+                        push_endpoint(
+                            idx,
+                            HttpMethod::Any,
+                            key.to_string(),
+                            format!("/{}", key.to_ascii_lowercase()),
+                            "cdk-websocket",
+                            func,
+                            call,
+                            handler,
+                            Confidence::High,
+                        );
+                    }
+                }
+            }
+            "addRoute" | "add_route" => {
+                let Some(key) = first_str_lit(call) else {
+                    continue;
+                };
+                let (handler, conf) = bind(Confidence::High);
+                let norm = format!("/{}", key.to_ascii_lowercase());
+                push_endpoint(
+                    idx,
+                    HttpMethod::Any,
+                    key,
+                    norm,
+                    "cdk-websocket",
+                    func,
+                    call,
+                    handler,
+                    conf,
+                );
+            }
+            // HttpRoute L2 route keys: `HttpRouteKey.with('/books',
+            // HttpMethod.GET)` — the path and method ride on the `with` call
+            // itself, receiver-gated on the HttpRouteKey class.
+            "with" => {
+                if !call
+                    .receiver
+                    .as_deref()
+                    .is_some_and(|r| r.ends_with("HttpRouteKey"))
+                {
+                    continue;
+                }
+                let Some(path) = first_path_lit(call) else {
+                    continue;
+                };
+                let Some(norm) = normalize_path(&path) else {
+                    continue;
+                };
+                let method = call
+                    .arg_lits
+                    .iter()
+                    .filter(|l| l.kind == LitKind::Ident)
+                    .find_map(|l| l.text.rsplit('.').next().and_then(HttpMethod::from_name))
+                    .unwrap_or(HttpMethod::Any);
+                let (handler, conf) = bind(Confidence::High);
+                push_endpoint(idx, method, path, norm, "cdk", func, call, handler, conf);
             }
             // HTTP API v2: addRoutes({ path, methods, integration }).
             "addRoutes" | "add_routes" => {
@@ -2677,22 +2907,27 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                     continue;
                 };
                 let rk = rk.trim().to_string();
-                let (method, path) = if rk == "$default" {
-                    (HttpMethod::Any, "$default".to_string())
-                } else {
-                    let Some((m, p)) = rk.split_once(' ') else {
-                        continue;
-                    };
-                    let Some(method) = HttpMethod::from_name(m) else {
-                        continue;
-                    };
-                    (method, ensure_slash(p.trim()))
-                };
-                let Some(norm) = normalize_path(&path) else {
-                    continue;
+                // Spaceless route keys are WebSocket routes ($connect /
+                // $disconnect / $default / custom actions): operation names,
+                // kept literal in the norm like the L2 WebSocketApi rows.
+                let (method, path, norm, fw) = match rk.split_once(' ') {
+                    None => {
+                        let norm = format!("/{}", rk.to_ascii_lowercase());
+                        (HttpMethod::Any, rk, norm, "cdk-websocket")
+                    }
+                    Some((m, p)) => {
+                        let Some(method) = HttpMethod::from_name(m) else {
+                            continue;
+                        };
+                        let path = ensure_slash(p.trim());
+                        let Some(norm) = normalize_path(&path) else {
+                            continue;
+                        };
+                        (method, path, norm, "cdk")
+                    }
                 };
                 let (handler, conf) = bind(Confidence::High);
-                push_endpoint(idx, method, path, norm, "cdk", func, call, handler, conf);
+                push_endpoint(idx, method, path, norm, fw, func, call, handler, conf);
             }
             // AppSync resolvers: ds.createResolver('id', { typeName,
             // fieldName }) / options-only arity / Python create_resolver
