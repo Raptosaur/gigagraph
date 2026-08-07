@@ -299,6 +299,64 @@ fn terraform_legacy_forms() {
 }
 
 #[test]
+fn sam_httpapi_definition_body() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // Duplicate `CodeUri:` key in Properties (real aws-samples template
+    // shape): a strict parse rejects the whole file; the lenient retry must
+    // keep every route. Handler resolves through the surviving CodeUri.
+    let dup: Vec<_> = g
+        .endpoints
+        .endpoints
+        .iter()
+        .filter(|e| e.framework == "sam" && e.method.as_str() == "GET" && e.path_norm == "/dup")
+        .collect();
+    assert_eq!(
+        dup.len(),
+        1,
+        "event route restated in the HttpApi DefinitionBody must not double-count"
+    );
+    assert_eq!(g.files[dup[0].file_id as usize].path, "sam_httpapi.yaml");
+    assert_eq!(
+        handler_loc(g, dup[0]),
+        Some(("src/handlers/items.js".into(), "handler".into()))
+    );
+
+    // AWS::Serverless::HttpApi DefinitionBody route proxying an external
+    // upstream: a real route of the deployed API, handler honestly None.
+    let jokes = ep(g, "sam", "GET", "/jokes");
+    assert_eq!(g.files[jokes.file_id as usize].path, "sam_httpapi.yaml");
+    assert_eq!(jokes.handler, None);
+    assert_eq!(jokes.confidence, Confidence::High);
+}
+
+#[test]
+fn terraform_quoted_rest_chain() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // HCL1-quoted "${...}" resource_id/parent_id strings: the root method
+    // lands on "/", the greedy proxy chain assembles through the quoted
+    // parent links — both High, both linked to the lambda integration.
+    let root = ep(g, "terraform", "ANY", "/");
+    assert_eq!(g.files[root.file_id as usize].path, "legacy.tf");
+    assert_eq!(root.confidence, Confidence::High);
+    assert_eq!(
+        handler_loc(g, root),
+        Some(("src/handlers/orders.js".into(), "handler".into()))
+    );
+
+    let proxy = ep(g, "terraform", "ANY", "/legacyapi/{*}");
+    assert_eq!(proxy.path_raw, "/legacyapi/{proxy+}");
+    assert_eq!(proxy.confidence, Confidence::High);
+    assert_eq!(
+        handler_loc(g, proxy),
+        Some(("src/handlers/orders.js".into(), "handler".into()))
+    );
+}
+
+#[test]
 fn serverless_variable_resolution() {
     let idx = index();
     let g = &idx.graph;

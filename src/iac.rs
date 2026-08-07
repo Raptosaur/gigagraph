@@ -145,7 +145,7 @@ pub fn scan(rel_path: &str, source: &str) -> Vec<IacFinding> {
 /// which the source detectors already cover. `when@<env>` wrappers are
 /// walked through.
 fn scan_symfony_routes(source: &str) -> Vec<IacFinding> {
-    let Ok(doc) = serde_norway::from_str::<Y>(source) else {
+    let Some(doc) = parse_yaml(source) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -206,6 +206,88 @@ fn scan_symfony_routes(source: &str) -> Vec<IacFinding> {
 }
 
 // -------------------------------------------------------------- YAML utils
+
+/// Parse YAML; on failure, retry once with exact-duplicate mapping keys
+/// stripped (last occurrence wins, as CloudFormation and PyYAML both
+/// resolve them). Real templates in the wild carry stray duplicate keys —
+/// e.g. `CodeUri:` pasted twice — and serde rejects the whole document,
+/// which would silently drop every route in the file.
+fn parse_yaml(source: &str) -> Option<Y> {
+    if let Ok(doc) = serde_norway::from_str::<Y>(source) {
+        return Some(doc);
+    }
+    let stripped = strip_duplicate_keys(source)?;
+    serde_norway::from_str::<Y>(&stripped).ok()
+}
+
+/// Remove all but the last occurrence of a repeated key within one YAML
+/// mapping block (each earlier occurrence removed with its nested block).
+/// Returns None when nothing was removed (retrying the parse is pointless).
+fn strip_duplicate_keys(source: &str) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut dead = vec![false; lines.len()];
+    // Scope stack: (indent, key -> declaring line).
+    let mut scopes: Vec<(usize, FxHashMap<String, usize>)> = Vec::new();
+    let mut removed = false;
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim_start();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let indent = l.len() - t.len();
+        if t.starts_with('-') {
+            // A new sequence item ends any mapping nested in the previous
+            // item; keys inside items are not tracked (indent > item dash).
+            scopes.retain(|(si, _)| *si <= indent);
+            continue;
+        }
+        // `key:` / `key: value`; `Fn::GetAtt: x` keys split at the value
+        // colon, not the first (good enough: this path only runs on
+        // documents serde already rejected).
+        let Some(colon) = t.find(": ").or_else(|| t.ends_with(':').then(|| t.len() - 1)) else {
+            continue;
+        };
+        let key = t[..colon].trim();
+        if key.is_empty() || key.contains(['"', '\'', '{', '[', ' ']) {
+            continue;
+        }
+        while scopes.last().is_some_and(|(si, _)| *si > indent) {
+            scopes.pop();
+        }
+        if scopes.last().is_none_or(|(si, _)| *si < indent) {
+            scopes.push((indent, FxHashMap::default()));
+        }
+        let map = &mut scopes.last_mut().unwrap().1;
+        if let Some(&prev) = map.get(key) {
+            // Kill the earlier key line plus its nested block.
+            dead[prev] = true;
+            for (j, dl) in lines.iter().enumerate().skip(prev + 1) {
+                let dt = dl.trim_start();
+                if dt.is_empty() || dt.starts_with('#') {
+                    dead[j] = true;
+                    continue;
+                }
+                if dl.len() - dt.len() <= indent {
+                    break;
+                }
+                dead[j] = true;
+            }
+            removed = true;
+        }
+        map.insert(key.to_string(), i);
+    }
+    if !removed {
+        return None;
+    }
+    let mut out = String::with_capacity(source.len());
+    for (i, l) in lines.iter().enumerate() {
+        if !dead[i] {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    Some(out)
+}
 
 fn untag(v: &Y) -> &Y {
     match v {
@@ -540,7 +622,7 @@ fn has_inline_code(res: &CfnRes) -> bool {
 }
 
 fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
-    let Ok(doc) = serde_norway::from_str::<Y>(source) else {
+    let Some(doc) = parse_yaml(source) else {
         return Vec::new();
     };
     let Some(res_map) = get(&doc, "Resources").and_then(as_map) else {
@@ -583,6 +665,10 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
     // Lambda-shaped resources bound to some route; the rest become
     // `lambda:` entry-point findings at the end.
     let mut routed: FxHashSet<String> = FxHashSet::default();
+    // (method, path) rows already emitted from function events: an explicit
+    // Api/HttpApi DefinitionBody usually restates exactly these routes, and
+    // restating them would double-count every endpoint in the template.
+    let mut event_routes: FxHashSet<(&'static str, String)> = FxHashSet::default();
 
     // SAM function HTTP events.
     for (name, res) in &catalog {
@@ -617,6 +703,7 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
                     _ if ev_type == "HttpApi" => (HttpMethod::Any, "$default".to_string()),
                     _ => continue,
                 };
+                event_routes.insert((m.as_str(), p.clone()));
                 out.push(IacFinding {
                     kind: ApiKind::Http,
                     method: m,
@@ -636,14 +723,17 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
         }
     }
 
-    // AWS::Serverless::Api with an inline swagger/OpenAPI DefinitionBody:
-    // paths/methods are real routes (common in older SAM apps predating
-    // implicit events); the x-amazon-apigateway-integration uri can name a
-    // same-template lambda. `x-amazon-apigateway-any-method` is the swagger
-    // spelling of ANY; non-method keys (parameters, summary, ...) fall out
-    // of the HttpMethod parse.
+    // AWS::Serverless::Api / AWS::Serverless::HttpApi with an inline
+    // swagger/OpenAPI DefinitionBody: paths/methods are real routes (common
+    // in older SAM apps predating implicit events, and in HttpApi templates
+    // routing to non-lambda targets); the x-amazon-apigateway-integration
+    // uri can name a same-template lambda. `x-amazon-apigateway-any-method`
+    // is the swagger spelling of ANY; non-method keys (parameters, summary,
+    // ...) fall out of the HttpMethod parse. Routes already declared by a
+    // function event are skipped — SAM HttpApi bodies restate event routes
+    // verbatim, and emitting both would double-count the whole API.
     for res in catalog.values() {
-        if res.rtype != "AWS::Serverless::Api" {
+        if !matches!(res.rtype, "AWS::Serverless::Api" | "AWS::Serverless::HttpApi") {
             continue;
         }
         let Some(paths) = res
@@ -667,6 +757,9 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
                         None => continue,
                     }
                 };
+                if event_routes.contains(&(method.as_str(), path.clone())) {
+                    continue;
+                }
                 let lambda = get(op, "x-amazon-apigateway-integration")
                     .and_then(|i| get(i, "uri").or_else(|| get(i, "Uri")))
                     .and_then(logical_target);
@@ -1078,7 +1171,7 @@ fn sls_functions(
 }
 
 fn scan_serverless(dir: &str, source: &str) -> Vec<IacFinding> {
-    let Ok(doc) = serde_norway::from_str::<Y>(source) else {
+    let Some(doc) = parse_yaml(source) else {
         return Vec::new();
     };
     // Corroborate: a serverless.yml has top-level `service` + `provider`.
@@ -1193,7 +1286,7 @@ fn scan_serverless(dir: &str, source: &str) -> Vec<IacFinding> {
 /// a serverless.yml `${file(...)}` include claims this file, so a stray
 /// lookalike contributes nothing.
 fn scan_sls_fragment(dir: &str, source: &str) -> Vec<IacFinding> {
-    let Ok(doc) = serde_norway::from_str::<Y>(source) else {
+    let Some(doc) = parse_yaml(source) else {
         return Vec::new();
     };
     let Some(m) = as_map(&doc) else {
@@ -1297,6 +1390,18 @@ fn tf_parent(e: &hcl::Expression) -> Parent {
         }
         if segs.len() >= 2 && segs[0] == "aws_api_gateway_resource" {
             return Parent::Res(segs[1].to_string());
+        }
+    }
+    // HCL1-flavored quoted interpolation:
+    // `"${aws_api_gateway_rest_api.this.root_resource_id}"`.
+    if let Some(s) = expr_string(e) {
+        if let Some(name) = tpl_ref(&s, "aws_api_gateway_rest_api") {
+            if s.contains(&format!("aws_api_gateway_rest_api.{name}.root_resource_id")) {
+                return Parent::Root;
+            }
+        }
+        if let Some(name) = tpl_ref(&s, "aws_api_gateway_resource") {
+            return Parent::Res(name);
         }
     }
     Parent::Unknown
