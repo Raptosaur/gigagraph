@@ -639,7 +639,19 @@ pub fn detect(
                         if call.name != "include" {
                             continue;
                         }
+                        // Module-string includes only: `include(router.urls)`
+                        // and inline lists carry an Ident (and their tuple
+                        // namespace is a bare word) — a real URLconf module
+                        // is dotted ('app.urls').
+                        if call
+                            .arg_lits
+                            .iter()
+                            .any(|l| l.kind == LitKind::Ident && l.key.is_none())
+                        {
+                            continue;
+                        }
                         let Some(target) = first_str_lit(call)
+                            .filter(|m| m.contains('.'))
                             .and_then(|module| resolve_py_module(&module, files))
                             .filter(|t| *t != fid)
                         else {
