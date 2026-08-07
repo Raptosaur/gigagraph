@@ -101,7 +101,10 @@ fn fiber_groups_including_chained_use() {
     let users = find(ep, HttpMethod::Get, "/api/v1/users");
     assert_eq!(users.framework, "fiber");
     assert_eq!(users.confidence, Confidence::High);
-    assert_eq!(g.functions[users.handler.unwrap() as usize].name, "listUsers");
+    assert_eq!(
+        g.functions[users.handler.unwrap() as usize].name,
+        "listUsers"
+    );
 
     // Slash-less Group path ("ping") is normalized into the prefix.
     find(ep, HttpMethod::Get, "/ping/pong");

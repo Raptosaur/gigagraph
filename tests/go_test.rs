@@ -21,7 +21,10 @@ fn extracts_go_functions_and_methods() {
     // A method's receiver type is a sibling field of the declaration (not an
     // ancestor node), captured explicitly as `@func.recv_type`; plain
     // functions have no containing type.
-    assert_eq!(func(&file, "Run").containing_type.as_deref(), Some("Server"));
+    assert_eq!(
+        func(&file, "Run").containing_type.as_deref(),
+        Some("Server")
+    );
     assert_eq!(func(&file, "NewServer").containing_type, None);
 
     // Param counts (receiver is not a parameter).

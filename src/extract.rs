@@ -509,7 +509,9 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
                 .map(|a| harvest_arg_lits(spec, a, source))
                 .unwrap_or_default(),
             type_args: c.type_args.clone(),
-            bound_to: c.bind.and_then(|b| sanitize_receiver(&node_text(b, source))),
+            bound_to: c
+                .bind
+                .and_then(|b| sanitize_receiver(&node_text(b, source))),
         };
         // Walk backwards from the last function starting at/before `pos`;
         // the first one whose range contains the call is the innermost.
