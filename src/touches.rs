@@ -60,10 +60,13 @@ fn lock_path(root: &Path) -> PathBuf {
 /// repo-relative, forward-slash path. Absolute paths outside the repo are
 /// kept absolute rather than rejected — better a lossy record than none.
 fn normalize_rel(root: &Path, raw: &str) -> String {
-    let trimmed = raw.trim().replace('\\', "/");
-    let p = PathBuf::from(&trimmed);
+    let trimmed = raw.trim();
+    let p = PathBuf::from(trimmed);
     if !p.is_absolute() {
-        return trimmed.trim_start_matches("./").to_string();
+        return trimmed
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_string();
     }
     // Canonicalize when possible so symlinked prefixes (/var -> /private/var)
     // still strip; fall back to the lexical path for files that are gone.
