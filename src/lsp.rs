@@ -131,11 +131,18 @@ impl TsServer {
 }
 
 fn find_node() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["node.exe", "node.cmd", "node"]
+    } else {
+        &["node"]
+    };
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        let cand = dir.join("node");
-        if cand.is_file() {
-            return Some(cand);
+        for name in names {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
         }
     }
     None
