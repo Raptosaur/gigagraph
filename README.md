@@ -218,17 +218,30 @@ tree-sitter query following the capture contract, plus fixtures.
 
 ## Benchmarks
 
-Apple M1 (8 cores), release build, cold = empty cache:
+Apple M1 (8 cores), release build (v0.5.x + similarity/LSP layers).
+Cold = empty cache, full parse; warm = extraction cache hot, graph +
+endpoints + vectors + embeddings rebuilt (`gigagraph index` CLI, process
+start included). An MCP server with an unchanged tree skips rebuilding
+entirely — the stat-only fingerprint probe is the whole cost.
 
-| Repo | Files | Functions | Call sites | Cold index | Warm index |
+| Repo | Files | Functions | Call sites | Cold | Warm |
 |---|---|---|---|---|---|
-| vuejs/core (TS) | 527 | 5,315 | 56,474 | 392 ms | 213 ms |
-| square/okhttp (Kotlin/Java) | 668 | 7,581 | 56,678 | 439 ms | — |
-| BurntSushi/ripgrep (Rust) | 113 | 3,012 | 17,132 | 534 ms | — |
-| pallets/flask (Python) | 83 | 1,512 | 3,895 | 395 ms | — |
+| vuejs/core (TS) | 529 | 5,328 | 56,476 | 1.40 s | 1.14 s |
+| square/okhttp (Kotlin/Java) | 677 | 7,693 | 56,927 | 1.37 s | 1.18 s |
+| BurntSushi/ripgrep (Rust) | 118 | 3,026 | 17,132 | 1.08 s | 1.01 s |
+| pallets/flask (Python) | 85 | 1,515 | 3,897 | 0.99 s | 0.97 s |
+| cdk-patterns/serverless (CDK/IaC) | 502 | 846 | 5,439 | 1.08 s | 1.04 s |
 
-Queries (`search_functions`, `get_callers`, `find_similar`, `call_path`)
-answer in ~20 ms against the okhttp index, load included.
+Times grew over the early structural-only prototype: the same pass now
+also detects endpoints (source + IaC), captures DI type information,
+computes transitive effect features, and embeds every function with the
+built-in static model — the embedding cost itself is negligible.
+
+Queries against a live server (`serve` mode, okhttp index in memory,
+staleness probe included): `search_functions` 26 ms, `get_callers`
+22 ms, `find_similar` 24 ms, `blast_radius` 18 ms. One-shot CLI queries
+pay index load on top (~1 s total). Binary is ~45 MB including the
+embedding table.
 
 ## Honesty about resolution
 
