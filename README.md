@@ -207,7 +207,7 @@ src/
   verbs.rs     identifier word-splitting + verb-synonym bucketing
   embed.rs     compiled-in distilled static embeddings (src/embed/, ~2.2 MB)
   indexer.rs   parallel walk (gitignore-aware) -> cached extract -> graph -> vectors
-  lsp.rs       optional LSP enrichment of uncertain edges (tsserver pilot)
+  lsp.rs       optional LSP enrichment of uncertain edges (tsserver, pyright)
   mcp.rs       stdio JSON-RPC MCP server
   api.rs       tool implementations
 ```
@@ -258,15 +258,25 @@ Remaining method calls through untyped values (`obj.save()`) resolve by
 method name + receiver hints and are labeled `confidence: "heuristic"`.
 Agents should treat `high` as trustworthy and `heuristic` as a strong lead.
 
-### LSP enrichment (TypeScript pilot)
+### LSP enrichment
 
 When a real language server is available, gigagraph asks it to settle exactly
-the call sites the static resolver was unsure about. Pilot: TypeScript, via
-the `tsserver` that ships inside the project's own `node_modules` — detected
-automatically when `tsconfig.json` (or `jsconfig.json`) sits at the root,
-`node_modules/typescript/lib/tsserver.js` exists, and `node` is on PATH. No
-configuration; any missing piece means the pass silently never runs and the
-static graph is served as-is.
+the call sites the static resolver was unsure about. Providers, detected
+automatically and run side by side in one pass (each within the shared
+budget):
+
+- **TypeScript** — via the `tsserver` that ships inside the project's own
+  `node_modules` (its native protocol, not LSP): needs `tsconfig.json` (or
+  `jsconfig.json`) at the root, `node_modules/typescript/lib/tsserver.js`,
+  and `node` on PATH.
+- **Python** — via pyright, spoken over actual LSP (JSON-RPC 2.0,
+  Content-Length framed both ways): needs any one of a project-local npm
+  install (`node_modules/pyright/langserver.index.js`, plus `node`), a
+  `pyright-langserver` inside a local `.venv`/`venv` (`pip install pyright`
+  ships one), or `pyright-langserver` on PATH.
+
+No configuration; any missing piece means that provider silently never runs
+and the static graph is served as-is.
 
 After each index build, a background pass (never blocking indexing or
 queries, ≤30 s, ≤2000 sites, ambiguous sites first) sends `definition`
@@ -282,8 +292,10 @@ restart does not redo the work.
 
 Honest limits: the server only answers where the type system does —
 untyped JS (e.g. mongoose models without typings) mostly yields no
-definition, and those edges keep their static `heuristic` label. String-based
-correlation (endpoints, DI containers, CDK, RN bridge) stays fully static.
-The `LspProvider` trait is designed for more servers (pyright next);
+definition, and those edges keep their static `heuristic` label; pyright
+answers on unannotated Python only as far as its inference reaches, and
+definitions it places out of tree (site-packages, typeshed stubs) settle
+nothing. String-based correlation (endpoints, DI containers, CDK, RN bridge)
+stays fully static. The `LspProvider` trait is designed for more servers;
 TypeScript 7's native compiler no longer ships `tsserver.js` and is currently
 skipped by detection.

@@ -30,7 +30,14 @@ use crate::types::{ImportStyle, Lang};
 //   `.`/`-`/`:`/`[`/`$`, not `@`), so key and lookup stay consistent.
 //   `@store = store` (plain param assignment in initialize) is NOT captured —
 //   there is no declared param type to join against. `class Service < Base`
-//   yields one hierarchy edge via the `superclass` field.
+//   yields one hierarchy edge via the `superclass` field. A SCOPED
+//   superclass (`class API < Grape::API`) is a `scope_resolution`, not a
+//   `constant`, so it needs its own pattern — capturing the SCOPE constant
+//   ("Grape"), because the extractor's clean_type would reduce the full
+//   node to its last segment ("API"), which carries no framework signal;
+//   endpoints.rs gates Grape detection on the resulting "implements:grape"
+//   evidence. `class Twitter::API < ...` names are scope_resolutions too,
+//   hence the alternation on @hier.type.
 const QUERY: &str = r#"
 (method
   name: (identifier) @func.name) @func.def
@@ -77,6 +84,10 @@ const QUERY: &str = r#"
 (class
   name: (constant) @hier.type
   superclass: (superclass (constant) @hier.base))
+
+(class
+  name: [(constant) (scope_resolution)] @hier.type
+  superclass: (superclass (scope_resolution scope: (constant) @hier.base)))
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &["identifier", "constant"];

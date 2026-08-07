@@ -135,3 +135,100 @@ fn nest_global_prefix() {
     let create = find(&idx, HttpMethod::Post, "/gapi/cats", "cats.controller.ts");
     assert_eq!(handler_name(&idx, create), "create");
 }
+
+#[test]
+fn fastify_multi_method_route_array() {
+    let idx = index();
+
+    // route({ method: ['GET', 'POST'], url: '/bulk' }): the multi-member
+    // method array arrives `method`-keyed (harvester depth-3 array reach)
+    // -> one row per verb, composed under the /v2 register prefix.
+    let get = find(&idx, HttpMethod::Get, "/v2/bulk", "users.routes.js");
+    assert_eq!(get.framework, "fastify");
+    assert_eq!(get.confidence, Confidence::Heuristic);
+    find(&idx, HttpMethod::Post, "/v2/bulk", "users.routes.js");
+    assert!(
+        !idx.graph
+            .endpoints
+            .endpoints
+            .iter()
+            .any(|e| e.method == HttpMethod::Any && e.path_norm == "/v2/bulk"),
+        "multi-method array must not degrade to ANY"
+    );
+}
+
+#[test]
+fn nest_multi_path_controller_and_uri_version() {
+    let idx = index();
+
+    // @Controller(['bulk', 'batch']): one route set per prefix.
+    let jobs = find(&idx, HttpMethod::Get, "/gapi/bulk/jobs", "dual.controller.ts");
+    assert_eq!(jobs.framework, "nestjs");
+    assert_eq!(handler_name(&idx, jobs), "jobs");
+    find(&idx, HttpMethod::Get, "/gapi/batch/jobs", "dual.controller.ts");
+
+    // @Version('1') + enableVersioning({type: URI}) in main.ts: the /v1
+    // segment joins right after the global prefix, on BOTH controller
+    // prefixes; cross-file assumption -> Heuristic.
+    let status = find(
+        &idx,
+        HttpMethod::Get,
+        "/gapi/v1/bulk/status",
+        "dual.controller.ts",
+    );
+    assert_eq!(status.confidence, Confidence::Heuristic);
+    assert_eq!(handler_name(&idx, status), "status");
+    find(
+        &idx,
+        HttpMethod::Get,
+        "/gapi/v1/batch/status",
+        "dual.controller.ts",
+    );
+
+    // Undecorated methods must NOT pick up the version prefix (and the
+    // versioned method must not keep an unversioned row).
+    let ep = &idx.graph.endpoints;
+    assert!(
+        !ep.endpoints
+            .iter()
+            .any(|e| e.path_norm == "/gapi/v1/bulk/jobs" || e.path_norm == "/gapi/bulk/status"),
+        "version prefix must apply to exactly the @Version'd methods"
+    );
+}
+
+#[test]
+fn nest_router_module_prefixes() {
+    let idx = index();
+
+    // RouterModule.register([{path: 'admin', module: AdminModule}]) in
+    // app.module.ts: AdminModule resolves through the import to
+    // admin.module.ts, whose @Module({controllers: [AdminController,
+    // AuditController]}) maps both controllers under /admin. Name-keyed
+    // cross-file joins -> Heuristic.
+    let stats = find(
+        &idx,
+        HttpMethod::Get,
+        "/gapi/admin/dash/stats",
+        "admin.controller.ts",
+    );
+    assert_eq!(stats.framework, "nestjs");
+    assert_eq!(stats.confidence, Confidence::Heuristic);
+    assert_eq!(handler_name(&idx, stats), "stats");
+    let log = find(
+        &idx,
+        HttpMethod::Get,
+        "/gapi/admin/audit/log",
+        "audit.controller.ts",
+    );
+    assert_eq!(handler_name(&idx, log), "log");
+
+    // Controllers registered directly on AppModule (cats) keep their
+    // module-prefix-free paths — nest_global_prefix asserts those rows.
+    let ep = &idx.graph.endpoints;
+    assert!(
+        !ep.endpoints
+            .iter()
+            .any(|e| e.path_norm.starts_with("/gapi/admin/cats")),
+        "unregistered controllers must not inherit the module prefix"
+    );
+}

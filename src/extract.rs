@@ -703,7 +703,13 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
     })
 }
 
-const MAX_ARG_LITS: usize = 8;
+// 8 held for a long time; the harvester's depth-3 array reach (multi-member
+// keyed array values: `method: ['GET', 'POST']`, `methods: [HttpMethod...]`)
+// adds one lit PER MEMBER, so prop-heavy route objects (fastify route with
+// schema/preHandler/handler around the method array) could evict real signal
+// at 8. 10 keeps the noise bound while letting a 3-4 verb array through
+// alongside the usual keys.
+const MAX_ARG_LITS: usize = 10;
 const MAX_LIT_LEN: usize = 200;
 const MAX_TYPE_ENTRIES: usize = 400;
 const MAX_TYPE_NAME_LEN: usize = 64;
@@ -728,7 +734,9 @@ fn clean_type(s: &str) -> Option<String> {
 
 /// Distill string literals and identifier-ish arguments from a call's
 /// argument-list node. Depth 1: direct children. Depth 2: kwarg / object-field
-/// / array values, tagged with their key where one exists.
+/// / array values, tagged with their key where one exists. Plus one targeted
+/// depth-3 reach: a multi-member ARRAY value of an object member emits each
+/// member keyed by the member's key (see the branch below).
 fn harvest_arg_lits(spec: &LangSpec, args: Node, source: &str) -> Vec<ArgLit> {
     let mut out = Vec::new();
     let mut cursor = args.walk();
@@ -782,6 +790,28 @@ fn harvest_arg_lits(spec: &LangSpec, args: Node, source: &str) -> Vec<ArgLit> {
                 });
             } else {
                 // Depth 2 proper: object/dict/array values under the pair.
+                // A pair-like gc (JS/TS object member inside an unkeyed
+                // object argument) carries its own key as its first named
+                // child; remember it so a multi-member ARRAY value can tag
+                // its members below.
+                let gc_pair_key: Option<String> = if key_text.is_none()
+                    && (gc.kind().contains("pair")
+                        || gc.kind().contains("argument")
+                        || gc.kind().contains("field")
+                        || gc.kind().contains("element_init"))
+                {
+                    let mut ck = gc.walk();
+                    let parts: Vec<Node> =
+                        gc.children(&mut ck).filter(|c| c.is_named()).collect();
+                    (parts.len() >= 2)
+                        .then(|| {
+                            let t = node_text(parts[0], source);
+                            (t.len() <= 64 && !t.contains('\n')).then(|| strip_quotes(&t))
+                        })
+                        .flatten()
+                } else {
+                    None
+                };
                 let mut c3 = gc.walk();
                 for ggc in gc.children(&mut c3).filter(|c| c.is_named()) {
                     if out.len() >= MAX_ARG_LITS {
@@ -818,6 +848,33 @@ fn harvest_arg_lits(spec: &LangSpec, args: Node, source: &str) -> Vec<ArgLit> {
                             kind,
                             text,
                         });
+                    } else if let Some(k) = &gc_pair_key {
+                        // Multi-member ARRAY value of an object member:
+                        // `methods: [HttpMethod.GET, HttpMethod.POST]` — the
+                        // members sit one level below the walk. Emit each
+                        // Ident/Str member KEYED by the pair's key, all at
+                        // the argument's index, so consumers can re-pair
+                        // them (`fastify.route({method: [...]})`, TS CDK
+                        // `addRoutes` methods arrays, `@Module` controllers
+                        // lists). Single-member arrays never reach here:
+                        // classify_lit unwraps them to a bare unkeyed lit,
+                        // the historical shape.
+                        if ggc.kind().contains("array") || ggc.kind() == "list" {
+                            let mut c4 = ggc.walk();
+                            for m in ggc.children(&mut c4).filter(|c| c.is_named()) {
+                                if out.len() >= MAX_ARG_LITS {
+                                    break;
+                                }
+                                if let Some((kind, text)) = classify_lit(spec, m, source) {
+                                    out.push(ArgLit {
+                                        index,
+                                        key: Some(k.clone()),
+                                        kind,
+                                        text,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }

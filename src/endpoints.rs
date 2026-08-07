@@ -212,8 +212,11 @@ const SILEX_EV: &[&str] = &["silex", "controllerprovider"];
 struct FileCtx {
     /// file id -> baseURL literal from an `axios.create({ baseURL: ... })`.
     axios_base: FxHashMap<u32, String>,
-    /// (file id, class name) -> path prefix from NestJS `@Controller("x")`.
-    controller_prefix: FxHashMap<(u32, String), String>,
+    /// (file id, class name) -> path prefix(es) from NestJS
+    /// `@Controller("x")` — one entry per prefix for the multi-path array
+    /// form `@Controller(['a', 'b'])` (one route set per prefix). Also
+    /// reused for Symfony class-docblock prefixes (always single there).
+    controller_prefix: FxHashMap<(u32, String), Vec<String>>,
     /// (file id, class name) -> class-level Spring `@RequestMapping` prefix.
     /// Both Java and Kotlin queries let the class annotation ride along to
     /// the class's first method (see `src/lang/java.rs` and the matching
@@ -266,6 +269,21 @@ struct FileCtx {
     /// prefix joined onto every nestjs route. Outer `None` = never seen;
     /// `Some(None)` = conflicting prefixes across files (no join).
     nest_prefix: Option<Option<String>>,
+    /// NestJS `app.enableVersioning(...)` seen with URI versioning (the
+    /// default type when none is given). Makes `@Version('1')` method
+    /// decorators join a `/v1` segment right after the global prefix.
+    /// Header/media-type/custom versioning leaves this false — those
+    /// versions are invisible in the URL, so the paths stay unversioned.
+    nest_uri_versioning: bool,
+    /// NestJS controller class name -> module-level route prefix from
+    /// `RouterModule.register([{path: 'admin', module: AdminModule}])`:
+    /// the register() call's file imports the module class (-> the module's
+    /// defining file), whose `@Module({controllers: [...]})` decoration
+    /// names the controller classes. Name-keyed project-wide, so joins are
+    /// Heuristic; `None` = one controller registered under conflicting
+    /// prefixes. Nested `children:` route trees sit below the harvester's
+    /// reach and are not composed (documented gap).
+    nest_module_prefix: FxHashMap<String, Option<String>>,
     /// ASP.NET class name -> class-level `[Route(...)]` template, from
     /// `type_decorations`. Keyed by bare class name project-wide because
     /// attribute routing inherits across files (`Controller : BaseApi`).
@@ -487,6 +505,13 @@ pub fn detect(
     // `None` anywhere = conflicting facts, no join.
     let mut py_own: FxHashMap<u32, Option<String>> = FxHashMap::default();
     let mut py_edges: FxHashMap<u32, Option<(u32, String, bool)>> = FxHashMap::default();
+    // NestJS RouterModule scratch, joined into `ctx.nest_module_prefix`
+    // after the loop (the register() call and the module's @Module
+    // decoration live in different files with no ordering guarantee).
+    // `nest_router_reg`: (registering file, module class name, path prefix).
+    // `nest_module_ctrls`: file -> controller classes its @Module declares.
+    let mut nest_router_reg: Vec<(u32, String, String)> = Vec::new();
+    let mut nest_module_ctrls: FxHashMap<u32, Vec<String>> = FxHashMap::default();
     for f in files {
         if f.language == Lang::Python {
             if let Some(edges) = file_hierarchy.get(f.id as usize) {
@@ -528,10 +553,46 @@ pub fn detect(
                     if let Some(t) = &func.containing_type {
                         for d in &decorations[func.id as usize] {
                             if d.name == "Controller" {
-                                let prefix = first_deco_str(d).unwrap_or_default();
+                                // Three arg shapes: `@Controller('cats')`
+                                // (one unkeyed Str), `@Controller(['a','b'])`
+                                // (array members surface as unkeyed Strs at
+                                // depth 2 -> one route set per prefix), and
+                                // the options object `@Controller({path:
+                                // 'cats', ...})` whose `path` Ident marks
+                                // that only the Str following it is a prefix
+                                // (other Str values — host, version — must
+                                // not become prefixes).
+                                let obj_form = d.arg_lits.iter().any(|l| {
+                                    l.kind == LitKind::Ident
+                                        && l.key.is_none()
+                                        && l.text == "path"
+                                });
+                                let prefixes: Vec<String> = if obj_form {
+                                    d.arg_lits
+                                        .windows(2)
+                                        .find(|w| {
+                                            w[0].kind == LitKind::Ident
+                                                && w[0].text == "path"
+                                                && w[1].kind == LitKind::Str
+                                                && w[1].key.is_none()
+                                        })
+                                        .map(|w| vec![w[1].text.clone()])
+                                        .unwrap_or_default()
+                                } else {
+                                    d.arg_lits
+                                        .iter()
+                                        .filter(|l| l.kind == LitKind::Str && l.key.is_none())
+                                        .map(|l| l.text.clone())
+                                        .collect()
+                                };
+                                let prefixes = if prefixes.is_empty() {
+                                    vec![String::new()]
+                                } else {
+                                    prefixes
+                                };
                                 ctx.controller_prefix
                                     .entry((fid, t.clone()))
-                                    .or_insert(prefix);
+                                    .or_insert(prefixes);
                             }
                         }
                     }
@@ -634,9 +695,59 @@ pub fn detect(
                 }
                 // NestJS `app.setGlobalPrefix('api')` (main.ts): a global URI
                 // prefix every controller route joins. Cross-file by nature,
-                // so it lives on the ctx, not a per-file map.
+                // so it lives on the ctx, not a per-file map. Same pass:
+                // `app.enableVersioning(...)`, RouterModule registrations
+                // and `@Module({controllers})` lists (scratch, joined after
+                // the loop).
                 if has(fid, &["@nestjs"]) {
                     for call in calls {
+                        // `enableVersioning()` defaults to URI versioning;
+                        // an explicit `type: VersioningType.X` surfaces as a
+                        // member-expression Ident. Only URI versioning puts
+                        // the version in the path — HEADER / MEDIA_TYPE /
+                        // CUSTOM versions are invisible in the URL, so they
+                        // must NOT create /v1 prefixes.
+                        if call.name == "enableVersioning" {
+                            let non_uri = call.arg_lits.iter().any(|l| {
+                                l.kind == LitKind::Ident
+                                    && l.text.starts_with("VersioningType.")
+                                    && l.text != "VersioningType.URI"
+                            });
+                            if !non_uri {
+                                ctx.nest_uri_versioning = true;
+                            }
+                            continue;
+                        }
+                        // `RouterModule.register([{path, module}, ...])`:
+                        // the route objects' top-level pairs surface as
+                        // keyed lits in declaration order — re-pair each
+                        // `module`-keyed Ident with the last `path`-keyed
+                        // Str before it. Nested `children:` trees sit below
+                        // the harvester's reach (documented gap: their
+                        // sub-prefixes never compose).
+                        if call.name == "register"
+                            && call.receiver.as_deref().is_some_and(|r| {
+                                r == "RouterModule" || r.ends_with(".RouterModule")
+                            })
+                        {
+                            let mut path: Option<&str> = None;
+                            for l in &call.arg_lits {
+                                match (l.key.as_deref(), l.kind) {
+                                    (Some("path"), LitKind::Str) => path = Some(&l.text),
+                                    (Some("module"), LitKind::Ident) => {
+                                        if let Some(p) = path.take() {
+                                            nest_router_reg.push((
+                                                fid,
+                                                l.text.clone(),
+                                                p.to_string(),
+                                            ));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            continue;
+                        }
                         if call.name != "setGlobalPrefix" {
                             continue;
                         }
@@ -649,6 +760,43 @@ pub fn detect(
                                 ctx.nest_prefix = Some(None);
                             }
                             _ => {}
+                        }
+                    }
+                    // `@Module({controllers: [A, B]})` controller lists. The
+                    // decoration rides along to the class's first method —
+                    // or, for the usual method-less module class, lands on
+                    // the file's synthetic toplevel function. Multi-member
+                    // arrays arrive `controllers`-keyed; a single-member
+                    // array unwraps to an unkeyed Ident right after the
+                    // `controllers` key ident.
+                    for d in &decorations[func.id as usize] {
+                        if d.name != "Module" {
+                            continue;
+                        }
+                        let ctrls = nest_module_ctrls.entry(fid).or_default();
+                        for l in d
+                            .arg_lits
+                            .iter()
+                            .filter(|l| l.kind == LitKind::Ident)
+                            .filter(|l| l.key.as_deref() == Some("controllers"))
+                        {
+                            ctrls.push(l.text.clone());
+                        }
+                        if let Some(pos) = d.arg_lits.iter().position(|l| {
+                            l.kind == LitKind::Ident && l.key.is_none() && l.text == "controllers"
+                        }) && let Some(next) = d.arg_lits.get(pos + 1)
+                        {
+                            // PascalCase guard: an empty `controllers: []`
+                            // array leaves the NEXT PROP KEY (lowercase)
+                            // adjacent to the ident — that must not pass as
+                            // a controller class.
+                            if next.kind == LitKind::Ident
+                                && next.key.is_none()
+                                && next.index == d.arg_lits[pos].index
+                                && next.text.starts_with(char::is_uppercase)
+                            {
+                                ctrls.push(next.text.clone());
+                            }
                         }
                     }
                 }
@@ -719,7 +867,7 @@ pub fn detect(
                             if let Some(prefix) = php_class_docblock_route(d) {
                                 ctx.controller_prefix
                                     .entry((fid, t.clone()))
-                                    .or_insert(prefix);
+                                    .or_insert(vec![prefix]);
                             }
                         }
                     }
@@ -1236,6 +1384,26 @@ pub fn detect(
         // declaration becomes a borrowable binding.
         ctx.cdk_lambda
             .insert(fid, if decls.len() == 1 { decls[0] } else { None });
+    }
+    // NestJS RouterModule join: resolve each registered module class through
+    // the registering file's imports to the module's defining file, then map
+    // that module's declared controllers to the route prefix. Both hops are
+    // real edges (import binding + @Module list) but the final map is keyed
+    // by bare class name project-wide, so consumers stay Heuristic. A module
+    // class whose import doesn't resolve (barrel re-exports, path aliases)
+    // simply contributes nothing — routes keep their unprefixed rows.
+    for (fid, module_class, prefix) in nest_router_reg {
+        let Some(target) = files[fid as usize]
+            .imports
+            .iter()
+            .find(|i| i.names.iter().any(|n| n == &module_class))
+            .and_then(|i| i.resolved_file)
+        else {
+            continue;
+        };
+        for ctrl in nest_module_ctrls.get(&target).into_iter().flatten() {
+            upsert_mount(&mut ctx.nest_module_prefix, ctrl.clone(), prefix.clone());
+        }
     }
     // Fold Python prefix facts into per-file composed mounts.
     let mut py_keys: Vec<u32> = py_own.keys().chain(py_edges.keys()).copied().collect();
@@ -1842,42 +2010,97 @@ fn detect_server(
         Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
             // NestJS: `@Get(':id')` method decorators + `@Controller` prefix.
             if has(fid, &["@nestjs"]) {
+                // URI versioning: `@Version('1')` on the method joins a /v1
+                // segment right after the global prefix — but only when
+                // `app.enableVersioning` ran with the URI type (pre-pass;
+                // header/media-type versions are invisible in the URL and
+                // add nothing). Multi-version arrays (`@Version(['1','2'])`)
+                // arrive as multiple unkeyed Strs -> one route set per
+                // version; `@Version(VERSION_NEUTRAL)` is an Ident and adds
+                // nothing. `defaultVersion`-only routes (no decorator) stay
+                // unversioned — the option value is out of reach. Known
+                // limit: a CLASS-level @Version rides along to the class's
+                // first method only.
+                let versions: Vec<Option<String>> = if ctx.nest_uri_versioning {
+                    let vs: Vec<String> = decos
+                        .iter()
+                        .filter(|d| d.name == "Version")
+                        .flat_map(|d| d.arg_lits.iter())
+                        .filter(|l| l.kind == LitKind::Str && l.key.is_none())
+                        .map(|l| format!("v{}", l.text))
+                        .collect();
+                    if vs.is_empty() {
+                        vec![None]
+                    } else {
+                        vs.into_iter().map(Some).collect()
+                    }
+                } else {
+                    vec![None]
+                };
+                // RouterModule prefix mapped to this controller CLASS
+                // (name-keyed across files) -> Heuristic.
+                let module_prefix = func
+                    .containing_type
+                    .as_ref()
+                    .and_then(|t| ctx.nest_module_prefix.get(t.as_str()))
+                    .cloned()
+                    .flatten();
                 for d in decos {
                     let Some(method) = HttpMethod::from_name(&d.name) else {
                         continue;
                     };
                     let sub = first_deco_str(d).unwrap_or_default();
-                    let prefix = func
+                    let prefixes = func
                         .containing_type
                         .as_ref()
                         .and_then(|t| ctx.controller_prefix.get(&(fid, t.clone())));
                     // Without a recovered @Controller prefix the emitted path
-                    // may be missing its leading segment -> Heuristic.
-                    let (path, conf) = match prefix {
-                        Some(p) => (join_prefix(p, &sub), Confidence::High),
-                        None => (ensure_slash(&sub), Confidence::Heuristic),
+                    // may be missing its leading segment -> Heuristic. A
+                    // multi-path `@Controller(['a','b'])` emits one route
+                    // set per prefix.
+                    let bases: Vec<(String, Confidence)> = match prefixes {
+                        Some(ps) => ps
+                            .iter()
+                            .map(|p| (join_prefix(p, &sub), Confidence::High))
+                            .collect(),
+                        None => vec![(ensure_slash(&sub), Confidence::Heuristic)],
                     };
-                    // Global `app.setGlobalPrefix('api')` join (cross-file
-                    // assumption; `exclude:` options invisible) -> Heuristic.
-                    let (path, conf) = match ctx.nest_prefix.clone().flatten() {
-                        Some(gp) => (join_prefix(&gp, &path), Confidence::Heuristic),
-                        None => (path, conf),
-                    };
-                    let Some(norm) = normalize_path(&path) else {
-                        continue;
-                    };
-                    idx.endpoints.push(Endpoint {
-                        id: idx.endpoints.len() as u32,
-                        kind: ApiKind::Http,
-                        method,
-                        path_raw: path,
-                        path_norm: norm,
-                        framework: "nestjs".into(),
-                        file_id: fid,
-                        line: d.line,
-                        handler: Some(func.id),
-                        confidence: conf,
-                    });
+                    for (path, conf) in bases {
+                        let (path, conf) = match &module_prefix {
+                            Some(mp) => (join_prefix(mp, &path), Confidence::Heuristic),
+                            None => (path, conf),
+                        };
+                        for v in &versions {
+                            let (path, conf) = match v {
+                                Some(v) => (join_prefix(v, &path), Confidence::Heuristic),
+                                None => (path.clone(), conf),
+                            };
+                            // Global `app.setGlobalPrefix('api')` join
+                            // (cross-file assumption; `exclude:` options
+                            // invisible) -> Heuristic. Full composed order:
+                            // globalPrefix / vN / modulePrefix /
+                            // controllerPrefix / method-path.
+                            let (path, conf) = match ctx.nest_prefix.clone().flatten() {
+                                Some(gp) => (join_prefix(&gp, &path), Confidence::Heuristic),
+                                None => (path, conf),
+                            };
+                            let Some(norm) = normalize_path(&path) else {
+                                continue;
+                            };
+                            idx.endpoints.push(Endpoint {
+                                id: idx.endpoints.len() as u32,
+                                kind: ApiKind::Http,
+                                method,
+                                path_raw: path,
+                                path_norm: norm,
+                                framework: "nestjs".into(),
+                                file_id: fid,
+                                line: d.line,
+                                handler: Some(func.id),
+                                confidence: conf,
+                            });
+                        }
+                    }
                 }
             }
             // AWS CDK stacks (TypeScript flavor).
@@ -1961,17 +2184,44 @@ fn detect_server(
                     continue;
                 };
                 if call.name == "route" || call.name == "match" {
-                    // fastify.route({ method: "PUT", url: "/x" })
-                    let m = str_lit_by_key(call, &["method"])
-                        .and_then(|m| HttpMethod::from_name(&m))
-                        .unwrap_or(HttpMethod::Any);
+                    // fastify.route({ method: "PUT", url: "/x" }). A
+                    // multi-method array (`method: ['GET', 'POST']`) arrives
+                    // as `method`-keyed Strs (the harvester's depth-3 array
+                    // reach) -> one row per verb; a single string (or a
+                    // single-member array, unwrapped to the same shape)
+                    // keeps the one-row path.
+                    let mut methods: Vec<HttpMethod> = call
+                        .arg_lits
+                        .iter()
+                        .filter(|l| {
+                            l.key.as_deref() == Some("method") && l.kind == LitKind::Str
+                        })
+                        .filter_map(|l| HttpMethod::from_name(&l.text))
+                        .collect();
+                    if methods.is_empty() {
+                        methods = vec![str_lit_by_key(call, &["method"])
+                            .and_then(|m| HttpMethod::from_name(&m))
+                            .unwrap_or(HttpMethod::Any)];
+                    }
                     if let Some(path) = str_lit_by_key(call, &["url", "path"]) {
                         let (path, conf) = match mount_for(call.receiver.as_deref()) {
                             Some(mp) => (join_prefix(&mp, &path), Confidence::Heuristic),
                             None => (path, Confidence::High),
                         };
                         if let Some(norm) = normalize_path(&path) {
-                            push_endpoint(idx, m, path, norm, fw, func, call, None, conf);
+                            for m in methods {
+                                push_endpoint(
+                                    idx,
+                                    m,
+                                    path.clone(),
+                                    norm.clone(),
+                                    fw,
+                                    func,
+                                    call,
+                                    None,
+                                    conf,
+                                );
+                            }
                         }
                     }
                     continue;
@@ -2772,7 +3022,8 @@ fn detect_server(
                 let class_prefix = func
                     .containing_type
                     .as_ref()
-                    .and_then(|t| ctx.controller_prefix.get(&(fid, t.clone())));
+                    .and_then(|t| ctx.controller_prefix.get(&(fid, t.clone())))
+                    .and_then(|ps| ps.first());
                 for d in decos {
                     if d.name != "Route" {
                         continue;
@@ -3281,6 +3532,20 @@ fn detect_server(
         Lang::Ruby => {
             let sinatra = has(fid, &["sinatra"]);
             let rails_routes = file.path.ends_with("config/routes.rb");
+            // Grape (`class API < Grape::API`, block DSL). Evidence: the
+            // `require 'grape'` import or the scoped-superclass hierarchy
+            // edge ("implements:grape" — see src/lang/ruby.rs; Bundler apps
+            // rarely require the gem per file). Class-body calls all land on
+            // the file's synthetic toplevel function, so detection runs
+            // there only — verbs inside `helpers do ... def x` bodies
+            // belong to other functions and cannot leak routes.
+            let grape = !sinatra && !rails_routes && has(fid, &["grape"]);
+            if grape {
+                if func.is_toplevel {
+                    detect_grape(func, calls, idx);
+                }
+                return;
+            }
             if !sinatra && !rails_routes {
                 return;
             }
@@ -4023,12 +4288,13 @@ fn php_const_path(call: &RawCall, fid: u32, ctx: &FileCtx) -> Option<String> {
 /// METHOD calls (`addMethod`, `addRoutes`, `createResolver`,
 /// `Code.fromAsset`). TS object-literal fields surface as
 /// Ident-key/Str-value pairs (`str_lit_by_key` re-pairs them). Array members
-/// inside those objects sit one level too deep for the harvester UNLESS the
-/// array has exactly one element (single-child wrappers are unwrapped), so
-/// `methods: [HttpMethod.GET]` surfaces as an Ident right after the
-/// `methods` key ident while `methods: [GET, POST]` yields nothing and the
-/// TS `addRoutes` row honestly widens to ANY. Python calls arrive complete
-/// with kwargs, including full `methods=[HttpMethod.GET, ...]` ident lists.
+/// inside those objects surface in one of two shapes: a single-member array
+/// is unwrapped by the harvester (`methods: [HttpMethod.GET]` -> an unkeyed
+/// Ident right after the `methods` key ident), while a multi-member array
+/// emits each member as a `methods`-keyed Ident (the harvester's targeted
+/// depth-3 reach), so TS `addRoutes` rows are per-verb either way. Python
+/// calls arrive complete with kwargs, including full
+/// `methods=[HttpMethod.GET, ...]` ident lists.
 fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut EndpointIndex) {
     let fid = func.file_id;
     let file_lambda = ctx.cdk_lambda.get(&fid).copied().flatten();
@@ -4413,12 +4679,14 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                 let Some(norm) = normalize_path(&ensure_slash(&path)) else {
                     continue;
                 };
-                // Python kwarg: methods=[HttpMethod.GET, ...] arrives as
-                // `methods`-keyed Idents. TS: only a single-member array
-                // survives harvesting, unwrapped to an unkeyed Ident right
-                // after the `methods` key ident (see fn doc) — consume that
-                // run until a non-verb ident (the next prop key) stops it.
-                // Multi-member TS arrays yield nothing -> honest ANY.
+                // Python kwarg methods=[HttpMethod.GET, ...] AND TS
+                // multi-member `methods:` arrays both arrive as
+                // `methods`-keyed Idents. A TS single-member array is
+                // instead unwrapped to an unkeyed Ident right after the
+                // `methods` key ident (see fn doc) — consume that run until
+                // a non-verb ident (the next prop key) stops it. Only a
+                // truly absent/unharvestable methods list widens to the
+                // honest ANY.
                 let mut listed: Vec<HttpMethod> = call
                     .arg_lits
                     .iter()
@@ -5238,6 +5506,114 @@ enum RubyCtnKind {
 
 /// First unkeyed symbol-or-string argument as a path segment (`:admin` ->
 /// "admin", `'/api/v2'` -> "api/v2").
+/// Grape block DSL (shapes from the Grape README): `prefix :api` +
+/// `version 'v1', using: :path` class directives, `resource :orders do
+/// ... end` / `namespace` / `group` / `segment` nesting plus `route_param
+/// :id` param segments (byte containment, like the Rails/Sinatra machinery),
+/// and bare verb calls — `get ':id' do`, path-less `post do`. Composed order:
+/// /prefix/version/nesting/segment. Everything is Heuristic: the DSL calls
+/// are class-scoped but arrive un-scoped on the toplevel function (a
+/// single-API-per-file assumption), and `version`/`prefix` apply file-wide.
+/// Documented gaps: `mount OtherAPI => '/path'` composition across classes,
+/// `route :any`, and regex/requirements route options are not modeled;
+/// `version ..., using: :header/:param/:accept_version_header` correctly
+/// adds NO path segment (the default and `using: :path` do). A symbol route
+/// arg (`get :status`) is indistinguishable from a `':id'` param string in
+/// the harvest and is treated as a param segment — strings dominate real
+/// Grape code.
+fn detect_grape(func: &FunctionInfo, calls: &[RawCall], idx: &mut EndpointIndex) {
+    let api_prefix: Option<String> = calls
+        .iter()
+        .find(|c| c.receiver.is_none() && c.name == "prefix")
+        .and_then(rb_symbol_arg);
+    let versions: Vec<String> = calls
+        .iter()
+        .filter(|c| c.receiver.is_none() && c.name == "version")
+        .filter(|c| {
+            !c.arg_lits.iter().any(|l| {
+                rb_key(l).as_deref() == Some("using") && l.text.trim_start_matches(':') != "path"
+            })
+        })
+        .flat_map(|c| c.arg_lits.iter())
+        .filter(|l| l.kind == LitKind::Str && l.key.is_none())
+        .map(|l| l.text.trim_start_matches(':').to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let ctns: Vec<(u32, u32, String)> = calls
+        .iter()
+        .filter(|c| c.receiver.is_none())
+        .filter_map(|c| {
+            let seg = match c.name.as_str() {
+                "resource" | "resources" | "namespace" | "group" | "segment" => rb_symbol_arg(c)?,
+                "route_param" => format!(":{}", rb_symbol_arg(c)?),
+                _ => return None,
+            };
+            Some((c.start_byte, c.end_byte, seg))
+        })
+        .collect();
+    for call in calls {
+        if call.receiver.is_some() {
+            continue;
+        }
+        let Some(method) = HttpMethod::from_name(&call.name) else {
+            continue;
+        };
+        if method == HttpMethod::Any {
+            continue;
+        }
+        let seg: Option<String> = call
+            .arg_lits
+            .iter()
+            .find(|l| l.kind == LitKind::Str && l.key.is_none())
+            .map(|l| l.text.clone())
+            .filter(|s| !s.is_empty() && !s.contains([' ', '#']));
+        // A path-less verb (`post do ... end`, arg_count 0) routes at the
+        // container prefix; a verb call with args but no string is NOT a
+        // route (some helper named like a verb).
+        if call.arg_count > 0 && seg.is_none() {
+            continue;
+        }
+        let mut chain: Vec<&(u32, u32, String)> = ctns
+            .iter()
+            .filter(|c| c.0 < call.start_byte && c.1 >= call.end_byte)
+            .collect();
+        chain.sort_by_key(|c| c.0); // outermost first
+        let nest = chain
+            .iter()
+            .fold(String::new(), |acc, c| join_prefix(&acc, &c.2));
+        // `version 'v1', 'v2'` serves every version -> one route set each.
+        let vers: Vec<Option<&str>> = if versions.is_empty() {
+            vec![None]
+        } else {
+            versions.iter().map(|v| Some(v.as_str())).collect()
+        };
+        for v in vers {
+            let mut path = api_prefix.clone().map(|p| ensure_slash(&p)).unwrap_or_default();
+            if let Some(v) = v {
+                path = join_prefix(&path, v);
+            }
+            path = join_prefix(&path, &nest);
+            if let Some(s) = &seg {
+                path = join_prefix(&path, s);
+            }
+            let Some(norm) = normalize_path(&path) else {
+                continue;
+            };
+            push_endpoint(
+                idx,
+                method,
+                path,
+                norm,
+                "grape",
+                func,
+                call,
+                None,
+                Confidence::Heuristic,
+            );
+        }
+    }
+}
+
 fn rb_symbol_arg(call: &RawCall) -> Option<String> {
     call.arg_lits
         .iter()

@@ -95,12 +95,22 @@ fn detects_ts_cdk_stack() {
     assert_eq!(books.confidence, Confidence::Heuristic);
     assert_eq!(handler_name(&idx, books), "handler");
 
-    // HTTP API v2 addRoutes: TS MULTI-member methods arrays are not
-    // harvested, so methods degrade honestly to ANY (path stays literal).
-    // Single-member arrays do surface — see detects_ts_v2_constructs.
-    let orders = find(&idx, HttpMethod::Any, "/orders", "stack.ts");
+    // HTTP API v2 addRoutes: TS MULTI-member methods arrays arrive as
+    // `methods`-keyed Idents (harvester depth-3 array reach) -> one row per
+    // verb, exactly like the Python kwarg form. Single-member arrays keep
+    // their unwrapped shape — see detects_ts_v2_constructs.
+    let orders = find(&idx, HttpMethod::Get, "/orders", "stack.ts");
     assert_eq!(orders.framework, "cdk");
     assert_eq!(handler_name(&idx, orders), "handler");
+    find(&idx, HttpMethod::Post, "/orders", "stack.ts");
+    assert!(
+        !idx.graph.endpoints.endpoints.iter().any(|e| {
+            e.method == HttpMethod::Any
+                && e.path_norm == "/orders"
+                && idx.graph.files[e.file_id as usize].path.ends_with("stack.ts")
+        }),
+        "multi-member methods array must not also widen to ANY"
+    );
 
     // Lambda function URL: one HTTPS entry point, any method/path.
     let furl = find(&idx, HttpMethod::Any, "/{*}", "stack.ts");

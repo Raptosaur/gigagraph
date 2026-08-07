@@ -37,11 +37,15 @@ which holds all framework interpretation — queries stay framework-agnostic.
 ## Argument literals
 
 `LangSpec.string_kinds` lists the grammar's string-literal node kinds. The
-extractor walks every `@call.args` / `@deco.args` node and distills up to 8
+extractor walks every `@call.args` / `@deco.args` node and distills up to 10
 `ArgLit`s per call: string literals (quotes stripped) and identifier-ish args,
 with kwarg/object keys captured one level down (`methods=["POST"]`,
 `{ method: "PUT" }`). Single-child wrapper nodes are unwrapped automatically.
-No query changes are needed for this — only `string_kinds` metadata.
+One targeted depth-3 reach: a **multi-member array** value of an object member
+(`{ method: ['GET', 'POST'] }`) emits each Ident/Str member keyed by the
+member's key, all at the argument's index — while a single-member array keeps
+its historical unwrapped-unkeyed shape. No query changes are needed for any of
+this — only `string_kinds` metadata.
 
 **`@Module` deep harvest**: NestJS provider objects
 (`@Module({providers: [{provide: X, useClass: Y}]})`) sit at depth 3, below
@@ -49,7 +53,7 @@ the generic walk. For a decoration named exactly `Module`, the extractor runs
 a targeted secondary harvest of the `@deco.args` node: each provider object's
 `provide`/`useClass` values are appended as a synthetic keyed `ArgLit` pair
 sharing an `index` (the provider ordinal, how `src/graph.rs` pairs them back
-into `di_bindings`). These pairs are appended OUTSIDE the 8-lit cap so a long
+into `di_bindings`). These pairs are appended OUTSIDE the 10-lit cap so a long
 providers array cannot evict real signal; positional consumers ignore them
 (keys no detector matches). No query changes needed — it reuses `@deco.args`.
 

@@ -88,6 +88,141 @@ fn map_generation_is_deterministic() {
 }
 
 #[test]
+fn endpoint_nodes_and_client_edges_embedded() {
+    let index = fixture_index();
+    let html = viz::generate_html(&index);
+    let payload = extract_payload(&html);
+
+    let node_ids: std::collections::HashSet<u64> = payload["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_u64().unwrap())
+        .collect();
+
+    // Endpoint nodes: one row per detected endpoint (fixture is small, no cap).
+    let eps = payload["eps"].as_array().expect("eps array");
+    assert_eq!(eps.len(), index.graph.endpoints.endpoints.len());
+    assert!(!eps.is_empty(), "endpoints fixture must yield endpoint nodes");
+    let ep_ids: std::collections::HashSet<u64> = eps
+        .iter()
+        .map(|e| e["id"].as_u64().expect("endpoint id"))
+        .collect();
+    for e in eps {
+        for k in ["kind", "method", "path", "framework", "conf", "file"] {
+            assert!(e[k].is_string(), "endpoint field {k} is a string");
+        }
+        assert!(e["line"].is_u64());
+        assert!(e["sv"].is_u64());
+        assert!(e["m"].is_u64());
+        for k in ["x", "y", "z"] {
+            let v = e[k].as_f64().unwrap_or_else(|| panic!("{k} is a number"));
+            assert!(v.is_finite(), "endpoint {k} finite");
+        }
+        assert!(matches!(e["conf"].as_str(), Some("high" | "heuristic")));
+        // Resolved handlers must point at function nodes present in the map.
+        if let Some(h) = e["h"].as_u64() {
+            assert!(node_ids.contains(&h), "handler id in node set");
+        }
+    }
+    // At least one endpoint has its handler wired to a map node.
+    assert!(
+        eps.iter().any(|e| e["h"].is_u64()),
+        "at least one endpoint has a resolved handler"
+    );
+
+    // Client-call -> endpoint match rows.
+    let cc = payload["cc"].as_array().expect("cc array");
+    assert!(!cc.is_empty(), "correlated client calls must be embedded");
+    assert_eq!(cc.len() as u64, payload["meta"]["matches"].as_u64().unwrap());
+    for f in cc {
+        assert!(
+            ep_ids.contains(&f["to"].as_u64().expect("to id")),
+            "cc target is an embedded endpoint"
+        );
+        assert!(f["fsv"].is_u64());
+        assert!(matches!(f["conf"].as_str(), Some("high" | "heuristic")));
+        for k in ["kind", "method", "url", "lib", "file"] {
+            assert!(f[k].is_string(), "cc field {k} is a string");
+        }
+        if let Some(from) = f["from"].as_u64() {
+            assert!(node_ids.contains(&from), "cc source is a map node");
+        }
+    }
+}
+
+#[test]
+fn single_service_fixture_defaults_to_api_panel() {
+    let index = fixture_index();
+    let payload = extract_payload(&viz::generate_html(&index));
+    let meta = &payload["meta"];
+    assert_eq!(meta["multi"].as_bool(), Some(false), "flat fixture is not a monorepo");
+    assert_eq!(meta["mode"].as_str(), Some("api"), "single-service opens on the API panel");
+    let services = meta["services"].as_array().expect("services array");
+    assert!(!services.is_empty());
+    for s in services {
+        assert!(s["name"].is_string());
+        for k in ["files", "functions", "endpoints"] {
+            assert!(s[k].is_u64(), "service stat {k}");
+        }
+    }
+}
+
+#[test]
+fn monorepo_fixture_groups_services_and_defaults_to_flow() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/monorepo");
+    let index = build_index(&root, true).expect("monorepo index build failed");
+    let html = viz::generate_html(&index);
+    // Determinism holds on the monorepo payload too.
+    assert_eq!(html, viz::generate_html(&index));
+    let payload = extract_payload(&html);
+    let meta = &payload["meta"];
+
+    let names: Vec<&str> = meta["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    for svc in ["web", "pysvc", "gosvc"] {
+        assert!(names.contains(&svc), "service group {svc} present; got {names:?}");
+    }
+    assert_eq!(meta["multi"].as_bool(), Some(true), ">=2 endpoint groups => multi-service");
+    assert_eq!(meta["mode"].as_str(), Some("flow"), "monorepo opens on the flow view");
+
+    // Endpoints exist in >= 2 distinct service groups.
+    let eps = payload["eps"].as_array().unwrap();
+    let ep_svcs: std::collections::HashSet<u64> =
+        eps.iter().map(|e| e["sv"].as_u64().unwrap()).collect();
+    assert!(ep_svcs.len() >= 2, "endpoints span services: {ep_svcs:?}");
+
+    // At least one correlated client call crosses a service boundary
+    // (web/src/client.ts -> pysvc + gosvc endpoints).
+    let ep_sv: std::collections::HashMap<u64, u64> = eps
+        .iter()
+        .map(|e| (e["id"].as_u64().unwrap(), e["sv"].as_u64().unwrap()))
+        .collect();
+    let cc = payload["cc"].as_array().unwrap();
+    assert!(!cc.is_empty(), "monorepo fixture has correlated client calls");
+    assert!(
+        cc.iter().any(|f| {
+            let to_sv = ep_sv[&f["to"].as_u64().unwrap()];
+            f["fsv"].as_u64().unwrap() != to_sv
+        }),
+        "at least one cross-service client->endpoint edge"
+    );
+}
+
+#[test]
+fn service_grouping_conventions() {
+    assert_eq!(viz::service_of("web/src/api.ts"), "web");
+    assert_eq!(viz::service_of("apps/web/src/api.ts"), "apps/web");
+    assert_eq!(viz::service_of("packages/ui/index.ts"), "packages/ui");
+    assert_eq!(viz::service_of("apps/readme.md"), "apps");
+    assert_eq!(viz::service_of("main.rs"), "(root)");
+}
+
+#[test]
 fn degenerate_tiny_project_has_no_nan() {
     let dir = std::env::temp_dir().join(format!("gigagraph-viz-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

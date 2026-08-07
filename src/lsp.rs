@@ -11,9 +11,13 @@
 //! No configuration. Detection failing at any point means the pass silently
 //! does nothing; every graph consumer sees the plain static result.
 //!
-//! Pilot provider: TypeScript via the project-local `tsserver` that ships in
-//! every TS project's own `node_modules` (never a global install). The
-//! `LspProvider` trait is deliberately small so pyright can slot in later.
+//! Providers: TypeScript via the project-local `tsserver` that ships in
+//! every TS project's own `node_modules` (never a global install; its native
+//! protocol, not LSP), and Python via pyright (real LSP) from a project-local
+//! npm install, a local venv, or PATH. All detected providers run in one
+//! pass, each routed its own languages' candidate sites, sharing one
+//! deadline. The `LspProvider` trait is deliberately small so more servers
+//! can slot in.
 
 use crate::graph::GigaGraph;
 use crate::indexer::{self, Index};
@@ -78,13 +82,16 @@ pub fn detect_providers(root: &Path) -> Vec<Box<dyn LspProvider>> {
     if let Some(ts) = TsServer::detect(root) {
         out.push(Box::new(ts));
     }
+    if let Some(py) = Pyright::detect(root) {
+        out.push(Box::new(py));
+    }
     out
 }
 
 /// Cheap probe used to decide whether spawning an enrichment thread is worth
 /// it at all.
 pub fn available(root: &Path) -> bool {
-    TsServer::detect(root).is_some()
+    TsServer::detect(root).is_some() || Pyright::detect(root).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -206,22 +213,15 @@ fn wire_path(p: &Path) -> String {
     }
 }
 
-/// First span of a successful `definition` response, mapped root-relative.
-fn definition_from_response(resp: &serde_json::Value, root: &Path) -> Option<DefAnswer> {
-    if resp.get("success").and_then(|v| v.as_bool()) != Some(true) {
-        return None;
-    }
-    let span = resp.get("body")?.as_array()?.first()?;
-    let file = span.get("file")?.as_str()?;
-    let line = span.get("start")?.get("line")?.as_u64()? as u32;
-    // Map back under root; canonicalize to survive /var vs /private/var
-    // style symlinked roots (macOS temp dirs).
-    let abs = PathBuf::from(file);
+/// Maps an absolute path a server answered with back to a root-relative
+/// forward-slash path. Canonicalizes to survive /var vs /private/var style
+/// symlinked roots (macOS temp dirs). The server may answer in long form
+/// while the root canonicalized to a Windows verbatim path (or vice versa) —
+/// and the answer file need not exist locally, so canonicalizing the answer
+/// is a fallback, not the primary. Tries the root in both spellings first.
+/// `None` = the definition lives outside the indexed tree.
+fn root_relative(abs: &Path, root: &Path) -> Option<String> {
     let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    // The server may answer in long form while the root canonicalized to a
-    // Windows verbatim path (or vice versa) — and the answer file need not
-    // exist locally, so canonicalizing the answer is a fallback, not the
-    // primary. Try the root in both spellings first.
     let plain_root = PathBuf::from(wire_path(&canon_root));
     let rel = abs
         .strip_prefix(&canon_root)
@@ -235,10 +235,19 @@ fn definition_from_response(resp: &serde_json::Value, root: &Path) -> Option<Def
                 .ok()
                 .map(|p| p.to_path_buf())
         })?;
-    Some(DefAnswer {
-        file: rel.to_string_lossy().replace('\\', "/"),
-        line,
-    })
+    Some(rel.to_string_lossy().replace('\\', "/"))
+}
+
+/// First span of a successful `definition` response, mapped root-relative.
+fn definition_from_response(resp: &serde_json::Value, root: &Path) -> Option<DefAnswer> {
+    if resp.get("success").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let span = resp.get("body")?.as_array()?.first()?;
+    let file = span.get("file")?.as_str()?;
+    let line = span.get("start")?.get("line")?.as_u64()? as u32;
+    let rel = root_relative(&PathBuf::from(file), root)?;
+    Some(DefAnswer { file: rel, line })
 }
 
 /// A live tsserver child. Requests go down stdin as newline-delimited JSON; a
@@ -365,6 +374,391 @@ fn read_framed_messages(stdout: impl Read, tx: mpsc::Sender<serde_json::Value>) 
                 return; // consumer gone
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pyright (Python, real LSP)
+// ---------------------------------------------------------------------------
+
+/// Pyright spoken over actual LSP: JSON-RPC 2.0 with Content-Length framing
+/// in BOTH directions (tsserver frames only its output). Lifecycle:
+/// initialize -> initialized -> didOpen per file -> textDocument/definition
+/// per site -> shutdown/exit. Positions on the wire are 0-based (ours are
+/// 1-based) and `character` is what the extractor recorded as a byte column —
+/// correct for ASCII, same accepted caveat as tsserver's `offset`.
+pub struct Pyright {
+    launch: PyrightLaunch,
+}
+
+enum PyrightLaunch {
+    /// `node node_modules/pyright/langserver.index.js --stdio` (npm install).
+    Node { node: PathBuf, script: PathBuf },
+    /// A `pyright-langserver` executable (pip install ships one): local venv
+    /// or PATH.
+    Binary(PathBuf),
+}
+
+impl Pyright {
+    /// Any of, most project-local first: `node_modules/pyright/
+    /// langserver.index.js` + node on PATH (npm install), `pyright-langserver`
+    /// inside a local venv (`.venv`/`venv`), or `pyright-langserver` on PATH.
+    /// Nothing found = no enrichment, silently. Node is needed only for the
+    /// npm variant.
+    pub fn detect(root: &Path) -> Option<Pyright> {
+        let script = root.join("node_modules/pyright/langserver.index.js");
+        if script.is_file() {
+            if let Some(node) = find_node() {
+                return Some(Pyright {
+                    launch: PyrightLaunch::Node { node, script },
+                });
+            }
+        }
+        let names: &[&str] = if cfg!(windows) {
+            &[
+                "pyright-langserver.exe",
+                "pyright-langserver.cmd",
+                "pyright-langserver",
+            ]
+        } else {
+            &["pyright-langserver"]
+        };
+        let venv_bin = if cfg!(windows) { "Scripts" } else { "bin" };
+        for venv in [".venv", "venv"] {
+            for name in names {
+                let cand = root.join(venv).join(venv_bin).join(name);
+                if cand.is_file() {
+                    return Some(Pyright {
+                        launch: PyrightLaunch::Binary(cand),
+                    });
+                }
+            }
+        }
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            for name in names {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    return Some(Pyright {
+                        launch: PyrightLaunch::Binary(cand),
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
+impl LspProvider for Pyright {
+    fn name(&self) -> &'static str {
+        "pyright"
+    }
+
+    fn handles(&self, lang: Lang) -> bool {
+        matches!(lang, Lang::Python)
+    }
+
+    fn resolve(
+        &mut self,
+        root: &Path,
+        queries: &[DefQuery],
+        deadline: Instant,
+    ) -> Result<Vec<Option<DefAnswer>>> {
+        let mut session = LspSession::spawn(&self.launch, root)?;
+        // Project analysis makes the initialize round-trip the slow part;
+        // it shares the batch deadline like every query after it.
+        session.initialize(root, deadline)?;
+        let mut answers: Vec<Option<DefAnswer>> = vec![None; queries.len()];
+        let mut opened: rustc_hash::FxHashSet<&str> = Default::default();
+        for (i, q) in queries.iter().enumerate() {
+            if Instant::now() >= deadline {
+                break; // abandon the rest; partial answers still count
+            }
+            let abs = root.join(&q.file);
+            let uri = path_to_uri(&abs);
+            if opened.insert(q.file.as_str()) {
+                let Ok(text) = std::fs::read_to_string(&abs) else {
+                    continue; // vanished since indexing; queries there fail soft
+                };
+                session.notify(
+                    "textDocument/didOpen",
+                    serde_json::json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": "python",
+                            "version": 1,
+                            "text": text,
+                        }
+                    }),
+                )?;
+            }
+            let id = session.request(
+                "textDocument/definition",
+                serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "position": {
+                        "line": q.line.saturating_sub(1),
+                        "character": q.col.saturating_sub(1),
+                    }
+                }),
+            )?;
+            let Some(resp) = session.wait_response(id, deadline) else {
+                // Server stopped answering — treat the whole rest as gone.
+                break;
+            };
+            answers[i] = resp
+                .get("result")
+                .and_then(|r| definition_from_lsp_result(r, root));
+        }
+        session.shutdown(deadline);
+        Ok(answers)
+    }
+}
+
+/// First location of a `textDocument/definition` result, mapped
+/// root-relative. LSP allows three shapes: `Location`, `Location[]`, and
+/// `LocationLink[]` (pyright sends links when the client advertises support;
+/// plain locations otherwise — handle all three regardless). Lines come back
+/// 0-based. Definitions outside the indexed tree (typeshed, site-packages)
+/// map to `None`.
+fn definition_from_lsp_result(result: &serde_json::Value, root: &Path) -> Option<DefAnswer> {
+    let first = match result {
+        serde_json::Value::Array(items) => items.first()?,
+        obj @ serde_json::Value::Object(_) => obj,
+        _ => return None,
+    };
+    let (uri, range) = if let Some(uri) = first.get("uri") {
+        (uri.as_str()?, first.get("range")?)
+    } else {
+        // LocationLink: targetSelectionRange points at the name token itself
+        // (best match for `function_at`'s exact-start-line rule).
+        (
+            first.get("targetUri")?.as_str()?,
+            first
+                .get("targetSelectionRange")
+                .or_else(|| first.get("targetRange"))?,
+        )
+    };
+    let line0 = range.get("start")?.get("line")?.as_u64()? as u32;
+    let path = uri_to_path(uri)?;
+    let rel = root_relative(&path, root)?;
+    Some(DefAnswer {
+        file: rel,
+        line: line0 + 1,
+    })
+}
+
+/// `file://` URI for an absolute path: verbatim prefix stripped (node and
+/// pyright both mishandle `\\?\`), backslashes normalized, everything outside
+/// the unreserved set percent-encoded. Windows drive paths become
+/// `file:///C:/...`.
+fn path_to_uri(p: &Path) -> String {
+    let s = wire_path(p).replace('\\', "/");
+    let mut out = String::from("file://");
+    if !s.starts_with('/') {
+        out.push('/'); // drive-letter form
+    }
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/'
+            | b':' => out.push(b as char),
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
+/// `file://` URI back to a path: authority (empty or `localhost`) dropped,
+/// percent-escapes decoded, Windows drive-letter form `/C:/...` de-slashed.
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let path_part = if rest.starts_with('/') {
+        rest
+    } else {
+        &rest[rest.find('/')?..]
+    };
+    let decoded = percent_decode(path_part);
+    let b = decoded.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        Some(PathBuf::from(&decoded[1..]))
+    } else {
+        Some(PathBuf::from(decoded))
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| (b as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A live LSP child (pyright). Messages go BOTH directions Content-Length
+/// framed; the tsserver reader thread is reused unchanged since the inbound
+/// framing is identical. The child is killed on drop, always.
+struct LspSession {
+    child: Child,
+    stdin: ChildStdin,
+    rx: mpsc::Receiver<serde_json::Value>,
+    next_id: u64,
+}
+
+impl LspSession {
+    fn spawn(launch: &PyrightLaunch, cwd: &Path) -> Result<LspSession> {
+        // De-verbatim everything that reaches the child, exactly like
+        // TsSession: node rejects \\?\ script paths and a verbatim cwd leaks
+        // into path answers.
+        let mut cmd = match launch {
+            PyrightLaunch::Node { node, script } => {
+                let mut c = Command::new(node);
+                c.arg(wire_path(script));
+                c
+            }
+            PyrightLaunch::Binary(bin) => Command::new(bin),
+        };
+        let mut child = cmd
+            .arg("--stdio")
+            .current_dir(wire_path(cwd))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn pyright langserver")?;
+        let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || read_framed_messages(stdout, tx));
+        Ok(LspSession {
+            child,
+            stdin,
+            rx,
+            next_id: 1,
+        })
+    }
+
+    fn send(&mut self, msg: &serde_json::Value) -> Result<()> {
+        let body = serde_json::to_vec(msg)?;
+        write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len())?;
+        self.stdin.write_all(&body)?;
+        self.stdin.flush()?;
+        Ok(())
+    }
+
+    fn request(&mut self, method: &str, params: serde_json::Value) -> Result<u64> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))?;
+        Ok(id)
+    }
+
+    fn notify(&mut self, method: &str, params: serde_json::Value) -> Result<()> {
+        self.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+    }
+
+    fn initialize(&mut self, root: &Path, deadline: Instant) -> Result<()> {
+        let id = self.request(
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_to_uri(root),
+                "capabilities": {},
+                "workspaceFolders": null,
+            }),
+        )?;
+        self.wait_response(id, deadline)
+            .ok_or_else(|| anyhow!("no initialize response before deadline"))?;
+        self.notify("initialized", serde_json::json!({}))?;
+        Ok(())
+    }
+
+    /// Pulls messages until the response matching `id` arrives or the
+    /// deadline passes. Notifications (startup progress, diagnostics, logs —
+    /// pyright is chatty while it analyzes the project) are skipped;
+    /// server->client REQUESTS get a minimal reply so the server never stalls
+    /// waiting on us (pyright asks for workspace/configuration).
+    fn wait_response(&mut self, id: u64, deadline: Instant) -> Option<serde_json::Value> {
+        loop {
+            let left = deadline.checked_duration_since(Instant::now())?;
+            let msg = self.rx.recv_timeout(left).ok()?;
+            match (msg.get("id"), msg.get("method").and_then(|m| m.as_str())) {
+                (Some(req_id), Some(method)) => {
+                    // Server->client request. Answer with the emptiest thing
+                    // that satisfies the shape; ids echo back verbatim (they
+                    // may be strings).
+                    let result = if method == "workspace/configuration" {
+                        let n = msg
+                            .pointer("/params/items")
+                            .and_then(|v| v.as_array())
+                            .map_or(0, |a| a.len());
+                        serde_json::Value::Array(vec![serde_json::Value::Null; n])
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": result,
+                    });
+                    let _ = self.send(&reply);
+                }
+                (Some(resp_id), None) => {
+                    if resp_id.as_u64() == Some(id) {
+                        return Some(msg);
+                    }
+                    // Stale response to an abandoned request: skip.
+                }
+                _ => {} // notification
+            }
+        }
+    }
+
+    fn shutdown(&mut self, deadline: Instant) {
+        // Polite LSP exit first (shutdown request, then exit notification),
+        // the Drop kill as the backstop.
+        if let Ok(id) = self.request("shutdown", serde_json::Value::Null) {
+            let grace = Instant::now() + Duration::from_millis(500);
+            let _ = self.wait_response(id, deadline.min(grace));
+        }
+        let _ = self.notify("exit", serde_json::Value::Null);
+        let waited = Instant::now();
+        while waited.elapsed() < Duration::from_millis(500) {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+impl Drop for LspSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

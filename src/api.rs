@@ -829,12 +829,23 @@ impl AppState {
             .iter()
             .filter(|f| !f.is_toplevel)
             .count();
+        let g = &index.graph;
+        let endpoints = g.endpoints.endpoints.len();
+        let matches = g.endpoints.matches.len();
+        let services: std::collections::BTreeSet<String> = g
+            .files
+            .iter()
+            .map(|f| crate::viz::service_of(&f.path))
+            .collect();
         crate::viz::write_html_for_index(index, &out)?;
         let abs = out.canonicalize().unwrap_or(out);
         Ok(json!({
             "path": abs.to_string_lossy(),
             "functions": shown,
-            "note": "Self-contained interactive 3D code map (no network needed). Tell the user to open this file in a browser."
+            "endpoints": endpoints,
+            "matched_client_calls": matches,
+            "services": services.len(),
+            "note": "Self-contained interactive code map (no network needed): 3D map with API endpoints + client-call flow arcs, plus an 'API surface' panel listing every endpoint per service. Tell the user to open this file in a browser."
         }))
     }
 

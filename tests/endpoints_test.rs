@@ -988,6 +988,39 @@ fn detects_rails_nested_and_namespaced_routes() {
 }
 
 #[test]
+fn detects_grape_dsl() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    use gigagraph::types::Confidence;
+
+    // grape_api.rb carries no `require 'grape'` — the evidence is the
+    // `< Grape::API` scoped-superclass hierarchy edge. Everything composes
+    // as /prefix/version/nesting/segment and stays Heuristic (class-scoped
+    // DSL read file-wide).
+    let show = find(ep, HttpMethod::Get, "/api/v1/orders/{*}");
+    assert_eq!(show.framework, "grape");
+    assert_eq!(show.confidence, Confidence::Heuristic);
+
+    // Path-less `post do ... end` routes at the resource root.
+    let create = find(ep, HttpMethod::Post, "/api/v1/orders");
+    assert_eq!(create.framework, "grape");
+
+    // route_param :id nesting adds a param segment.
+    find(ep, HttpMethod::Get, "/api/v1/orders/{*}/receipt");
+
+    // namespace :admin nesting.
+    let stats = find(ep, HttpMethod::Get, "/api/v1/admin/stats");
+    assert_eq!(stats.framework, "grape");
+
+    // Helper calls (`find_order(...)`, `desc '...'`) must not become routes:
+    // every grape row is one of the four above.
+    assert_eq!(
+        ep.endpoints.iter().filter(|e| e.framework == "grape").count(),
+        4
+    );
+}
+
+#[test]
 fn detects_aspnet_controller_tokens_and_map_groups() {
     let index = index();
     let ep = &index.graph.endpoints;
