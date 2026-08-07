@@ -141,6 +141,10 @@ pub fn tree_fingerprint(root: &Path) -> u64 {
     let mut files = collect_files(root);
     files.sort_by(|a, b| a.0.cmp(&b.0));
     let mut h = rustc_hash::FxHasher::default();
+    // Salt with the binary version: detection logic lives in this binary, so
+    // an upgrade must invalidate persisted indexes even when the tree is
+    // unchanged — otherwise new detectors silently serve stale results.
+    h.write(env!("CARGO_PKG_VERSION").as_bytes());
     for (rel, path) in files {
         h.write(rel.as_bytes());
         if let Ok(meta) = std::fs::metadata(&path) {
