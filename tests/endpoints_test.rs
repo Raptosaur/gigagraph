@@ -486,6 +486,109 @@ fn resolves_const_paths_and_kotlin_class_prefixes() {
 }
 
 #[test]
+fn detects_jaxrs_and_declarative_client_interfaces() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+    use gigagraph::types::Confidence;
+
+    // JAX-RS (Java, jakarta.ws.rs): class-level @Path("fleets") prefix +
+    // bare verb markers + method-level @Path composition. Prefix joins stay
+    // Heuristic (ride-along mis-key caveat, same as Spring).
+    let list = find(ep, HttpMethod::Get, "/fleets");
+    assert_eq!(list.framework, "jaxrs");
+    assert_eq!(list.confidence, Confidence::Heuristic);
+    assert_eq!(g.functions[list.handler.unwrap() as usize].name, "list");
+    let get = find(ep, HttpMethod::Get, "/fleets/{*}");
+    assert_eq!(g.functions[get.handler.unwrap() as usize].name, "get");
+    find(ep, HttpMethod::Post, "/fleets");
+    find(ep, HttpMethod::Delete, "/fleets/{*}");
+
+    // JAX-RS on Kotlin: marker annotations (@GET) are a distinct capture
+    // shape from @GetMapping("/x") — both must land.
+    let kt = find(ep, HttpMethod::Get, "/barrels");
+    assert_eq!(kt.framework, "jaxrs");
+    assert_eq!(g.functions[kt.handler.unwrap() as usize].name, "list");
+    find(ep, HttpMethod::Get, "/barrels/{*}");
+    find(ep, HttpMethod::Post, "/barrels");
+
+    // MicroProfile @RegisterRestClient interface (javax.ws.rs, marker form):
+    // mapped methods are OUTBOUND calls, never routes.
+    assert!(
+        ep.endpoints.iter().all(|e| !e.path_norm.starts_with("/depots")),
+        "rest-client interface methods must not become endpoints"
+    );
+    let depot = ep
+        .client_calls
+        .iter()
+        .find(|c| c.path_norm == "/depots/{*}")
+        .expect("rest-client interface method recorded as client call");
+    assert_eq!(depot.library, "rest-client");
+    assert_eq!(depot.method, HttpMethod::Get);
+    assert_eq!(g.functions[depot.caller as usize].name, "byId");
+
+    // OpenFeign @FeignClient interface with legacy-form @RequestMapping
+    // methods: same client routing, library "feign".
+    assert!(
+        ep.endpoints.iter().all(|e| !e.path_norm.starts_with("/cargo")),
+        "feign interface methods must not become endpoints"
+    );
+    let cargo = ep
+        .client_calls
+        .iter()
+        .find(|c| c.library == "feign" && c.method == HttpMethod::Put)
+        .expect("feign PUT recorded as client call");
+    assert_eq!(cargo.path_norm, "/cargo/{*}");
+    assert_eq!(g.functions[cargo.caller as usize].name, "updateCargo");
+    assert!(
+        ep.client_calls
+            .iter()
+            .any(|c| c.library == "feign" && c.method == HttpMethod::Get)
+    );
+}
+
+#[test]
+fn detects_spring_multi_path_annotations() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+
+    // @GetMapping({"/a", "/b"}): one route per array member, same handler.
+    let a = find(ep, HttpMethod::Get, "/gauges");
+    let b = find(ep, HttpMethod::Get, "/gauges.html");
+    assert_eq!(a.framework, "spring");
+    assert_eq!(a.handler, b.handler);
+    assert_eq!(g.functions[a.handler.unwrap() as usize].name, "gauges");
+
+    // Legacy form with value = {..} array + method attribute.
+    find(ep, HttpMethod::Get, "/meters");
+    find(ep, HttpMethod::Get, "/meters/all");
+}
+
+#[test]
+fn detects_ktor_slashless_and_pathless_verbs() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    use gigagraph::types::Confidence;
+
+    // Slashless route + verb segments compose like slashed ones.
+    let list = find(ep, HttpMethod::Get, "/crates/list");
+    assert_eq!(list.framework, "ktor");
+    assert_eq!(list.confidence, Confidence::Heuristic);
+    // Pathless verb (`post { }`) binds to the enclosing route's path.
+    find(ep, HttpMethod::Post, "/crates");
+    // Pathless verb under a nested slashless param route.
+    find(ep, HttpMethod::Get, "/crates/{*}");
+    // Wrapper lambdas between route levels stay transparent.
+    find(ep, HttpMethod::Get, "/vault/keys");
+    // Slashless verb with no enclosing route(...) span: not a route.
+    assert!(
+        ep.endpoints.iter().all(|e| e.path_norm != "/orphan"),
+        "bare slashless verb call outside route spans must be ignored"
+    );
+}
+
+#[test]
 fn detects_legacy_php_frameworks() {
     let index = index();
     let ep = &index.graph.endpoints;

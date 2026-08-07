@@ -14,4 +14,15 @@ public class UserController {
     public String create() {
         return "";
     }
+
+    // Multiple paths per annotation: one route per array member.
+    @GetMapping({ "/gauges", "/gauges.html" })
+    public String gauges() {
+        return "";
+    }
+
+    @RequestMapping(value = { "/meters", "/meters/all" }, method = RequestMethod.GET)
+    public String meters() {
+        return "";
+    }
 }
