@@ -6,8 +6,17 @@ use crate::types::{ImportStyle, Lang};
 // Notes:
 // - `method_declaration` covers receiver methods (`func (s *Server) Run()`).
 //   The receiver's type lives in the `receiver:` parameter list — a sibling
-//   field, not an ancestor node — so `TYPE_KINDS` cannot express it and
-//   methods get `containing_type: None`. Known limitation.
+//   field, not an ancestor node — so `TYPE_KINDS` cannot express it; a second
+//   method pattern captures it explicitly as `@func.recv_type` (merged into
+//   the same candidate), giving methods `containing_type: Some(recv type)`.
+//   Generic receivers (`func (s *Server[T])`) only match the plain pattern
+//   and keep `containing_type: None`.
+// - `@call.bind` patterns capture assignment targets of selector calls —
+//   `v1 := r.Group("/api")` binds "v1", `a.B = r.PathPrefix("/x").Subrouter()`
+//   binds "a.B" — via `short_var_declaration` / `assignment_statement`
+//   wrappers around the same `@call` node (the extractor merges by call byte
+//   range, keeping the first LHS for multi-assign `x, err := f()`). Fuels
+//   router-group prefix tracking in endpoints.rs.
 // - Func literals (`func() { ... }`) are not captured as `@func.def`; calls
 //   inside goroutine/defer closures therefore attribute to the enclosing
 //   named function, which is the behavior we want.
@@ -60,6 +69,16 @@ const QUERY: &str = r#"
   name: (field_identifier) @func.name
   parameters: (parameter_list) @func.params) @func.def
 
+(method_declaration
+  receiver: (parameter_list
+    (parameter_declaration
+      type: [
+        (type_identifier) @func.recv_type
+        (pointer_type (type_identifier) @func.recv_type)
+      ]))
+  name: (field_identifier) @func.name
+  parameters: (parameter_list) @func.params) @func.def
+
 (call_expression
   function: (identifier) @call.name
   arguments: (argument_list) @call.args) @call
@@ -69,6 +88,24 @@ const QUERY: &str = r#"
     operand: (_) @call.recv
     field: (field_identifier) @call.name)
   arguments: (argument_list) @call.args) @call
+
+(short_var_declaration
+  left: (expression_list [(identifier) (selector_expression)] @call.bind)
+  right: (expression_list
+    (call_expression
+      function: (selector_expression
+        operand: (_) @call.recv
+        field: (field_identifier) @call.name)
+      arguments: (argument_list) @call.args) @call))
+
+(assignment_statement
+  left: (expression_list [(identifier) (selector_expression)] @call.bind)
+  right: (expression_list
+    (call_expression
+      function: (selector_expression
+        operand: (_) @call.recv
+        field: (field_identifier) @call.name)
+      arguments: (argument_list) @call.args) @call))
 
 (import_spec
   path: (interpreted_string_literal) @import.path) @import

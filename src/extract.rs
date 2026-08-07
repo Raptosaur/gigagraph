@@ -30,6 +30,13 @@ pub struct RawCall {
     /// DI-binding detection in graph.rs.
     #[serde(default)]
     pub type_args: Vec<String>,
+    /// Name the call's result was assigned to (`v1 := r.Group("/api")` binds
+    /// "v1"; `a.B = r.PathPrefix("/x").Subrouter()` binds "a.B"), captured via
+    /// `@call.bind` where a language's query opts in (currently Go). Multi-
+    /// assign keeps the first LHS name (`x, err := f()` binds "x"). Fuels
+    /// router-group prefix tracking in endpoint detection.
+    #[serde(default)]
+    pub bound_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,11 +129,13 @@ struct Caps {
     func_name: Option<u32>,
     func_params: Option<u32>,
     func_body: Option<u32>,
+    func_recv_type: Option<u32>,
     call: Option<u32>,
     call_name: Option<u32>,
     call_recv: Option<u32>,
     call_args: Option<u32>,
     call_typearg: Option<u32>,
+    call_bind: Option<u32>,
     import: Option<u32>,
     import_path: Option<u32>,
     import_path_system: Option<u32>,
@@ -156,11 +165,13 @@ impl Caps {
             func_name: idx("func.name"),
             func_params: idx("func.params"),
             func_body: idx("func.body"),
+            func_recv_type: idx("func.recv_type"),
             call: idx("call"),
             call_name: idx("call.name"),
             call_recv: idx("call.recv"),
             call_args: idx("call.args"),
             call_typearg: idx("call.typearg"),
+            call_bind: idx("call.bind"),
             import: idx("import"),
             import_path: idx("import.path"),
             import_path_system: idx("import.path.system"),
@@ -209,6 +220,9 @@ struct FuncCand<'t> {
     name: String,
     params: Option<Node<'t>>,
     body: Option<Node<'t>>,
+    /// Explicit receiver/containing type captured as `@func.recv_type` (Go
+    /// method receivers — a sibling field the ancestor scan cannot reach).
+    recv_type: Option<Node<'t>>,
 }
 
 struct CallCand<'t> {
@@ -217,6 +231,7 @@ struct CallCand<'t> {
     recv: Option<Node<'t>>,
     args: Option<Node<'t>>,
     type_args: Vec<String>,
+    bind: Option<Node<'t>>,
 }
 
 pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
@@ -228,7 +243,7 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
     let caps = Caps::new(&spec.query);
 
     let mut funcs: Vec<FuncCand> = Vec::new();
-    let mut seen_funcs: FxHashSet<(u32, u32)> = FxHashSet::default();
+    let mut seen_funcs: FxHashMap<(u32, u32), usize> = FxHashMap::default();
     let mut decos: Vec<DecoCand> = Vec::new();
     let mut seen_decos: FxHashSet<(u32, u32)> = FxHashSet::default();
     let mut consts: Vec<(String, String)> = Vec::new();
@@ -253,14 +268,27 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
         };
 
         if let Some(def) = get(caps.func_def) {
-            if seen_funcs.insert((def.start_byte() as u32, def.end_byte() as u32)) {
-                if let Some(name_node) = get(caps.func_name) {
-                    funcs.push(FuncCand {
-                        def,
-                        name: node_text(name_node, source),
-                        params: get(caps.func_params),
-                        body: get(caps.func_body),
-                    });
+            let key = (def.start_byte() as u32, def.end_byte() as u32);
+            match seen_funcs.get(&key) {
+                Some(&slot) => {
+                    // Same definition matched by several patterns (e.g. Go
+                    // method with and without the receiver-type clause) —
+                    // keep the richer info.
+                    if funcs[slot].recv_type.is_none() {
+                        funcs[slot].recv_type = get(caps.func_recv_type);
+                    }
+                }
+                None => {
+                    if let Some(name_node) = get(caps.func_name) {
+                        seen_funcs.insert(key, funcs.len());
+                        funcs.push(FuncCand {
+                            def,
+                            name: node_text(name_node, source),
+                            params: get(caps.func_params),
+                            body: get(caps.func_body),
+                            recv_type: get(caps.func_recv_type),
+                        });
+                    }
                 }
             }
         }
@@ -273,6 +301,7 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
                     name_node.start_byte() as u32,
                 );
                 let recv = get(caps.call_recv);
+                let bind = get(caps.call_bind);
                 // `@call.typearg` is repeatable: collect ALL captures with
                 // that index in this match (not just the first, as `get`
                 // would). Quantified captures may also arrive split across
@@ -298,6 +327,10 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
                         if calls[slot].args.is_none() {
                             calls[slot].args = get(caps.call_args);
                         }
+                        // Multi-assign (`x, err := f()`): keep the first LHS.
+                        if calls[slot].bind.is_none() {
+                            calls[slot].bind = bind;
+                        }
                         // Extend, not replace: quantifier expansions of the
                         // same call can surface one type arg per match.
                         // (Literal duplicate type args collapse — acceptable,
@@ -316,6 +349,7 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
                             recv,
                             args: get(caps.call_args),
                             type_args,
+                            bind,
                         });
                     }
                 }
@@ -475,6 +509,7 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
                 .map(|a| harvest_arg_lits(spec, a, source))
                 .unwrap_or_default(),
             type_args: c.type_args.clone(),
+            bound_to: c.bind.and_then(|b| sanitize_receiver(&node_text(b, source))),
         };
         // Walk backwards from the last function starting at/before `pos`;
         // the first one whose range contains the call is the innermost.
@@ -943,7 +978,12 @@ fn build_function(spec: &LangSpec, f: &FuncCand, source: &str) -> ExtractedFunct
         start_byte: def.start_byte() as u32,
         end_byte: def.end_byte() as u32,
         signature,
-        containing_type: containing_type(spec, def, source),
+        // An explicit `@func.recv_type` capture (Go method receivers) beats
+        // the ancestor scan, which cannot reach sibling fields.
+        containing_type: f
+            .recv_type
+            .map(|n| node_text(n, source))
+            .or_else(|| containing_type(spec, def, source)),
         param_count,
         is_toplevel: false,
         is_exported: is_export_wrapped(def),
