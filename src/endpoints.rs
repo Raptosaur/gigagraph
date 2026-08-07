@@ -3743,7 +3743,21 @@ fn handler_from_ident(
             .collect();
         (hits.len() == 1).then(|| hits[0])
     };
-    for lit in call.arg_lits.iter().filter(|l| l.kind == LitKind::Ident) {
+    // The handler is by convention the LAST argument (`router.post('/x',
+    // validate(v), controller.create)`), so only idents at the highest
+    // argument index are candidates — resolving an earlier middleware ident
+    // instead would be confidently wrong.
+    let max_idx = call
+        .arg_lits
+        .iter()
+        .filter(|l| l.kind == LitKind::Ident && l.key.is_none())
+        .map(|l| l.index)
+        .max()?;
+    for lit in call
+        .arg_lits
+        .iter()
+        .filter(|l| l.kind == LitKind::Ident && l.key.is_none() && l.index == max_idx)
+    {
         let name = lit.text.rsplit(['.', ':']).next().unwrap_or(&lit.text);
         // Same-file first: `app.get("/x", listUsers)`.
         if let Some(id) = fn_in_file(func.file_id, name) {
