@@ -166,6 +166,48 @@ fn detects_py_cdk_stack() {
 }
 
 #[test]
+fn detects_v1_scoped_package_stack() {
+    let idx = index();
+
+    // v1 @aws-cdk/* scoped imports satisfy the same evidence gate; REST
+    // addResource chain shape is identical to v2.
+    let gizmos = find(&idx, HttpMethod::Get, "/gizmos", "v1app.ts");
+    assert_eq!(gizmos.framework, "cdk");
+    assert_eq!(handler_name(&idx, gizmos), "handler");
+
+    // @aws-cdk/aws-apigatewayv2 (+ -integrations alpha) addRoutes: same
+    // object shape; TS methods array unharvested -> ANY.
+    let orders = find(&idx, HttpMethod::Any, "/v1orders", "v1app.ts");
+    assert_eq!(orders.framework, "cdk");
+    assert_eq!(handler_name(&idx, orders), "handler");
+
+    // v1 AppSync: Schema.fromAsset must NOT be mistaken for a lambda
+    // declaration (it would poison the single-lambda binding), and the
+    // options-only createResolver arity (no id string) still yields the op.
+    let gql = find_rpc(&idx, ApiKind::Graphql, "/query.getgizmo");
+    assert_eq!(gql.framework, "cdk-appsync");
+    assert_eq!(handler_name(&idx, gql), "handler");
+}
+
+#[test]
+fn detects_python_l1_cfn_constructs() {
+    let idx = index();
+
+    // CfnRoute: literal route_key, kwargs visible in Python.
+    let route = find(&idx, HttpMethod::Get, "/legacyitems", "cfnl1.py");
+    assert_eq!(route.framework, "cdk");
+    assert_eq!(route.confidence, Confidence::Heuristic);
+    // CfnFunction handler stem resolved by path-suffix (src/app.py) and
+    // borrowed through the file-scope single-lambda binding.
+    assert_eq!(handler_name(&idx, route), "lambda_handler");
+
+    // CfnResolver: type_name/field_name kwargs -> Graphql op.
+    let gql = find_rpc(&idx, ApiKind::Graphql, "/query.legacypets");
+    assert_eq!(gql.framework, "cdk-appsync");
+    assert_eq!(handler_name(&idx, gql), "lambda_handler");
+}
+
+#[test]
 fn multi_lambda_file_gets_no_binding() {
     let idx = index();
 

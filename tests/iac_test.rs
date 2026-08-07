@@ -184,6 +184,120 @@ fn terraform_endpoints() {
 }
 
 #[test]
+fn sam_legacy_forms() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // Single-quoted Transform + Method: ANY event.
+    let any = ep(g, "sam", "ANY", "/legacy/items");
+    assert_eq!(g.files[any.file_id as usize].path, "sam_legacy.yaml");
+    assert_eq!(
+        handler_loc(g, any),
+        Some(("src/handlers/items.js".into(), "handler".into()))
+    );
+
+    // AWS::Serverless::Api DefinitionBody inline swagger: paths/methods walk,
+    // lambda through x-amazon-apigateway-integration's Fn::Sub uri.
+    let sw_get = ep(g, "sam", "GET", "/swagger/pets");
+    assert_eq!(
+        handler_loc(g, sw_get),
+        Some(("src/handlers/items.js".into(), "handler".into()))
+    );
+    let sw_post = ep(g, "sam", "POST", "/swagger/pets");
+    assert_eq!(
+        handler_loc(g, sw_post),
+        Some(("src/handlers/items.js".into(), "handler".into()))
+    );
+}
+
+#[test]
+fn cfn_long_form_intrinsics() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // ApiGatewayV2 route via long-form {Ref}/Fn::Join/Fn::Sub.
+    let del = ep(g, "cloudformation", "DELETE", "/archive/{*}");
+    assert_eq!(g.files[del.file_id as usize].path, "cfn_long.yaml");
+    assert_eq!(
+        handler_loc(g, del),
+        Some(("src/handlers/orders.js".into(), "handler".into()))
+    );
+
+    // REST chain via long-form Fn::GetAtt RootResourceId + {Ref} ResourceId;
+    // integration Uri as Fn::Join with a nested Fn::GetAtt part.
+    let get = ep(g, "cloudformation", "GET", "/archive");
+    assert_eq!(
+        handler_loc(g, get),
+        Some(("src/handlers/orders.js".into(), "handler".into()))
+    );
+}
+
+#[test]
+fn serverless_legacy_forms() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // v1 shorthand "GET legacy": no leading slash in the event string.
+    let legacy = ep(g, "serverless", "GET", "/legacy");
+    assert_eq!(
+        handler_loc(g, legacy),
+        Some(("src/handlers/users.js".into(), "create".into()))
+    );
+
+    // {proxy+} greedy segment folds to {*}; integration/request keys ignored.
+    let proxy = ep(g, "serverless", "ANY", "/assets/{*}");
+    assert_eq!(proxy.path_raw, "/assets/{proxy+}");
+
+    // httpApi '*' catch-all.
+    let star = g
+        .endpoints
+        .endpoints
+        .iter()
+        .find(|e| e.framework == "serverless" && e.path_raw == "$default")
+        .expect("httpApi '*' catch-all endpoint");
+    assert_eq!(star.path_norm, "/{*}");
+
+    // v1 `service: {name: ...}` object form still passes corroboration.
+    let old = ep(g, "serverless", "GET", "/old-users");
+    assert_eq!(g.files[old.file_id as usize].path, "legacy/serverless.yml");
+    assert_eq!(
+        handler_loc(g, old),
+        Some(("src/handlers/users.js".into(), "create".into()))
+    );
+}
+
+#[test]
+fn terraform_legacy_forms() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // HCL1-flavored quoted interpolations parse; route_key still extracts
+    // and the "${...}" traversal strings resolve through tpl_ref.
+    let old = ep(g, "terraform", "GET", "/old");
+    assert_eq!(g.files[old.file_id as usize].path, "legacy.tf");
+    assert_eq!(
+        handler_loc(g, old),
+        Some(("src/handlers/orders.js".into(), "handler".into()))
+    );
+
+    // Quick-create aws_apigatewayv2_api: inline route_key + target.
+    let quick = ep(g, "terraform", "POST", "/quick");
+    assert_eq!(
+        handler_loc(g, quick),
+        Some(("src/handlers/orders.js".into(), "handler".into()))
+    );
+
+    // Pre-4.x literal zip filename (no archive_file): base dir falls back to
+    // the .tf dir and the handler stem resolves by path suffix.
+    let zip = ep(g, "lambda", "ANY", "/lambda/legacy_zip");
+    assert_eq!(zip.path_raw, "lambda:legacy_zip");
+    assert_eq!(
+        handler_loc(g, zip),
+        Some(("src/handlers/report.py".into(), "lambda_handler".into()))
+    );
+}
+
+#[test]
 fn endpoint_ids_sequential() {
     let idx = index();
     for (i, e) in idx.graph.endpoints.endpoints.iter().enumerate() {

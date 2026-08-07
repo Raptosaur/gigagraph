@@ -1,0 +1,14 @@
+# Serverless Framework v1: object-form `service:` block and shorthand http
+# events without a leading slash.
+service:
+  name: legacy-svc
+
+provider:
+  name: aws
+  runtime: nodejs12.x
+
+functions:
+  oldList:
+    handler: ../src/handlers/users.create
+    events:
+      - http: GET old-users

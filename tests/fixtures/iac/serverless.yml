@@ -19,6 +19,28 @@ functions:
   site:
     handler: src/handlers/users.create
     url: true
+  # v1-era shorthand: no leading slash on the path.
+  legacyList:
+    handler: src/handlers/users.create
+    events:
+      - http: GET legacy
+  # v1 greedy proxy path + integration/request sub-keys (route-irrelevant).
+  assetsProxy:
+    handler: src/handlers/users.create
+    events:
+      - http:
+          path: /assets/{proxy+}
+          method: any
+          integration: lambda-proxy
+          request:
+            parameters:
+              paths:
+                proxy: true
+  # Older httpApi catch-all spelling.
+  catchAll:
+    handler: src/handlers/users.create
+    events:
+      - httpApi: '*'
 
 appSync:
   name: demo-api

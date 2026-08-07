@@ -554,3 +554,37 @@ fn detects_silex_routes() {
     assert_eq!(hats.confidence, Confidence::Heuristic);
     find(ep, HttpMethod::Delete, "/workshop/hats/{*}");
 }
+
+#[test]
+fn detects_silex_legacy_method_chains() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+    use gigagraph::types::Confidence;
+
+    // Silex 1.x `$app->match(...)->method('GET|POST')`: the chained
+    // restriction replaces ANY with one endpoint per listed verb.
+    let toggle_get = find(ep, HttpMethod::Get, "/gnomes/toggle");
+    assert_eq!(toggle_get.framework, "silex");
+    assert_eq!(toggle_get.confidence, Confidence::High);
+    assert_eq!(
+        g.functions[toggle_get.handler.unwrap() as usize].name,
+        "createGnome"
+    );
+    find(ep, HttpMethod::Post, "/gnomes/toggle");
+    assert!(
+        ep.endpoints
+            .iter()
+            .all(|e| !(e.path_norm == "/gnomes/toggle" && e.method == HttpMethod::Any)),
+        "->method('GET|POST') chain must replace the ANY row"
+    );
+
+    // $controllers->match(...) on a mounted collection: ANY + mount prefix.
+    let rename = find(ep, HttpMethod::Any, "/workshop/hats/{*}/rename");
+    assert_eq!(rename.framework, "silex");
+    assert_eq!(rename.confidence, Confidence::Heuristic);
+    assert_eq!(
+        g.functions[rename.handler.unwrap() as usize].name,
+        "createGnome"
+    );
+}

@@ -26,12 +26,14 @@ $app->put('/gnomes/{id}', function ($id) {
 $app->match('/gnomes/ping', function () {
     return 'pong';
 });
+$app->match('/gnomes/toggle', 'GnomeController::createGnome')->method('GET|POST');
 
 $controllers = $app['controllers_factory'];
 $controllers->get('/hats', function () {
     return ['hats' => []];
 });
 $controllers->delete('/hats/{id}', 'GnomeController::listGnomes');
+$controllers->match('/hats/{id}/rename', 'GnomeController::createGnome');
 
 $app->mount('/workshop', $controllers);
 

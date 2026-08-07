@@ -1374,17 +1374,42 @@ fn detect_server(
                     let Some(norm) = normalize_path(&path) else {
                         continue;
                     };
-                    push_endpoint(
-                        idx,
-                        method,
-                        path,
-                        norm,
-                        "silex",
-                        func,
-                        call,
-                        class_static_string_handler(call, functions, name_index),
-                        conf,
-                    );
+                    // Silex 1/2 `->method('GET|POST')` restriction: the
+                    // chained call arrives receiver-less (the chain text
+                    // contains parens, so receiver sanitization drops it)
+                    // but shares the route call's chain-start byte — the
+                    // same containment trick Laravel prefix->group uses.
+                    // A parsed restriction replaces the route's own verb
+                    // (which is ANY for `match`).
+                    let listed: Vec<HttpMethod> = calls
+                        .iter()
+                        .find(|m| {
+                            m.name == "method"
+                                && m.receiver.is_none()
+                                && m.start_byte == call.start_byte
+                                && m.end_byte > call.end_byte
+                        })
+                        .and_then(first_str_lit)
+                        .map(|s| s.split('|').filter_map(HttpMethod::from_name).collect())
+                        .unwrap_or_default();
+                    let handler = class_static_string_handler(call, functions, name_index);
+                    for m in if listed.is_empty() {
+                        vec![method]
+                    } else {
+                        listed
+                    } {
+                        push_endpoint(
+                            idx,
+                            m,
+                            path.clone(),
+                            norm.clone(),
+                            "silex",
+                            func,
+                            call,
+                            handler,
+                            conf,
+                        );
+                    }
                 }
             }
             // `symfony` covers PHP8 attributes AND legacy docblock
@@ -2141,12 +2166,41 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                     Confidence::Heuristic,
                 );
             }
+            // L1 escape hatch (CDK v1-era code): CfnRoute carries a literal
+            // "VERB /path" route key. Python constructions surface with
+            // kwargs; the TS `new apigwv2.CfnRoute(...)` form never reaches
+            // the extractor (see fn doc), so this arm is Python-only in
+            // practice. The Target integration chain is invisible, so the
+            // handler is the usual borrowed file-scope lambda.
+            "CfnRoute" => {
+                let Some(rk) = str_lit_by_key(call, &["route_key", "routeKey"]) else {
+                    continue;
+                };
+                let rk = rk.trim().to_string();
+                let (method, path) = if rk == "$default" {
+                    (HttpMethod::Any, "$default".to_string())
+                } else {
+                    let Some((m, p)) = rk.split_once(' ') else {
+                        continue;
+                    };
+                    let Some(method) = HttpMethod::from_name(m) else {
+                        continue;
+                    };
+                    (method, ensure_slash(p.trim()))
+                };
+                let Some(norm) = normalize_path(&path) else {
+                    continue;
+                };
+                let (handler, conf) = bind(Confidence::High);
+                push_endpoint(idx, method, path, norm, "cdk", func, call, handler, conf);
+            }
             // AppSync resolvers: ds.createResolver('id', { typeName,
             // fieldName }) / options-only arity / Python create_resolver
             // kwargs / Python `appsync.Resolver(...)` constructions (the TS
-            // `new appsync.Resolver` form never surfaces — see fn doc). The
+            // `new appsync.Resolver` form never surfaces — see fn doc) /
+            // Python L1 `appsync.CfnResolver(type_name=, field_name=)`. The
             // op is "Type.field", correlating by name on the RPC branch.
-            "createResolver" | "create_resolver" | "Resolver" => {
+            "createResolver" | "create_resolver" | "Resolver" | "CfnResolver" => {
                 let t = str_lit_by_key(call, &["typeName", "type_name"]);
                 let f = str_lit_by_key(call, &["fieldName", "field_name"]);
                 if let (Some(t), Some(f)) = (t, f) {
@@ -2234,6 +2288,23 @@ fn collect_cdk_lambdas(
                             let (stem, export) = handler.rsplit_once('.')?;
                             let t = cdk_find_file(files, dir, &format!("{asset}/{stem}.py"))?;
                             cdk_fn_in_file(functions, name_index, t, export)
+                        });
+                        out.push(resolved);
+                    }
+                    // L1 CfnFunction (v1-era escape hatch): template-shaped
+                    // props carry no local asset dir, so the handler stem is
+                    // tried against the indexed tree directly (the
+                    // path-suffix fallback in cdk_find_file does the real
+                    // work). S3/inline-coded functions fail to resolve and
+                    // record an unresolved declaration like any other lambda.
+                    "CfnFunction" => {
+                        let resolved = str_lit_by_key(call, &["handler"]).and_then(|handler| {
+                            let (stem, export) = handler.rsplit_once('.')?;
+                            ["py", "js", "ts", "mjs", "cjs"].iter().find_map(|ext| {
+                                cdk_find_file(files, dir, &format!("{stem}.{ext}")).and_then(|t| {
+                                    cdk_fn_in_file(functions, name_index, t, export)
+                                })
+                            })
                         });
                         out.push(resolved);
                     }

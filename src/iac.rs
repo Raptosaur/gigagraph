@@ -479,6 +479,58 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
         }
     }
 
+    // AWS::Serverless::Api with an inline swagger/OpenAPI DefinitionBody:
+    // paths/methods are real routes (common in older SAM apps predating
+    // implicit events); the x-amazon-apigateway-integration uri can name a
+    // same-template lambda. `x-amazon-apigateway-any-method` is the swagger
+    // spelling of ANY; non-method keys (parameters, summary, ...) fall out
+    // of the HttpMethod parse.
+    for res in catalog.values() {
+        if res.rtype != "AWS::Serverless::Api" {
+            continue;
+        }
+        let Some(paths) = res
+            .props
+            .and_then(|p| get(p, "DefinitionBody"))
+            .and_then(|d| get(d, "paths"))
+            .and_then(as_map)
+        else {
+            continue;
+        };
+        for (pk, ops) in paths {
+            let Y::String(path) = pk else { continue };
+            let Some(ops) = as_map(ops) else { continue };
+            for (mk, op) in ops {
+                let Y::String(mname) = mk else { continue };
+                let method = if mname == "x-amazon-apigateway-any-method" {
+                    HttpMethod::Any
+                } else {
+                    match HttpMethod::from_name(mname) {
+                        Some(m) => m,
+                        None => continue,
+                    }
+                };
+                let lambda = get(op, "x-amazon-apigateway-integration")
+                    .and_then(|i| get(i, "uri").or_else(|| get(i, "Uri")))
+                    .and_then(logical_target);
+                let href = lambda.as_deref().and_then(lambda_ref);
+                if let Some(l) = lambda {
+                    routed.insert(l);
+                }
+                out.push(IacFinding {
+                    kind: ApiKind::Http,
+                    method,
+                    confidence: path_conf(path),
+                    path_raw: path.clone(),
+                    framework: "sam",
+                    line: line_of(source, path),
+                    handler: href,
+                    require_handler: false,
+                });
+            }
+        }
+    }
+
     // ApiGatewayV2 routes: Target -> Integration -> IntegrationUri -> lambda.
     for (name, res) in &catalog {
         if res.rtype != "AWS::ApiGatewayV2::Route" {
