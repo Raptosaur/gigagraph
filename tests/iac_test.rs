@@ -299,6 +299,136 @@ fn terraform_legacy_forms() {
 }
 
 #[test]
+fn sam_httpapi_definition_body() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // Duplicate `CodeUri:` key in Properties (real aws-samples template
+    // shape): a strict parse rejects the whole file; the lenient retry must
+    // keep every route. Handler resolves through the surviving CodeUri.
+    let dup: Vec<_> = g
+        .endpoints
+        .endpoints
+        .iter()
+        .filter(|e| e.framework == "sam" && e.method.as_str() == "GET" && e.path_norm == "/dup")
+        .collect();
+    assert_eq!(
+        dup.len(),
+        1,
+        "event route restated in the HttpApi DefinitionBody must not double-count"
+    );
+    assert_eq!(g.files[dup[0].file_id as usize].path, "sam_httpapi.yaml");
+    assert_eq!(
+        handler_loc(g, dup[0]),
+        Some(("src/handlers/items.js".into(), "handler".into()))
+    );
+
+    // AWS::Serverless::HttpApi DefinitionBody route proxying an external
+    // upstream: a real route of the deployed API, handler honestly None.
+    let jokes = ep(g, "sam", "GET", "/jokes");
+    assert_eq!(g.files[jokes.file_id as usize].path, "sam_httpapi.yaml");
+    assert_eq!(jokes.handler, None);
+    assert_eq!(jokes.confidence, Confidence::High);
+}
+
+#[test]
+fn terraform_quoted_rest_chain() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // HCL1-quoted "${...}" resource_id/parent_id strings: the root method
+    // lands on "/", the greedy proxy chain assembles through the quoted
+    // parent links — both High, both linked to the lambda integration.
+    let root = ep(g, "terraform", "ANY", "/");
+    assert_eq!(g.files[root.file_id as usize].path, "legacy.tf");
+    assert_eq!(root.confidence, Confidence::High);
+    assert_eq!(
+        handler_loc(g, root),
+        Some(("src/handlers/orders.js".into(), "handler".into()))
+    );
+
+    let proxy = ep(g, "terraform", "ANY", "/legacyapi/{*}");
+    assert_eq!(proxy.path_raw, "/legacyapi/{proxy+}");
+    assert_eq!(proxy.confidence, Confidence::High);
+    assert_eq!(
+        handler_loc(g, proxy),
+        Some(("src/handlers/orders.js".into(), "handler".into()))
+    );
+}
+
+#[test]
+fn websocket_routes() {
+    let idx = index();
+    let g = &idx.graph;
+
+    let find = |file: &str, norm: &str| {
+        g.endpoints
+            .endpoints
+            .iter()
+            .find(|e| {
+                e.framework == "websocket"
+                    && e.path_norm == norm
+                    && g.files[e.file_id as usize].path == file
+            })
+            .unwrap_or_else(|| panic!("missing websocket route {norm} in {file}"))
+    };
+
+    // CFN: bare RouteKey ($connect + custom action) -> /ws/<action> rows,
+    // lambda resolved through Target -> Integration -> !Sub IntegrationUri.
+    let connect = find("websocket.yaml", "/ws/connect");
+    assert_eq!(connect.path_raw, "$connect");
+    assert_eq!(connect.confidence, Confidence::High);
+    assert_eq!(
+        handler_loc(g, connect),
+        Some(("src/handlers/report.py".into(), "lambda_handler".into()))
+    );
+    let send = find("websocket.yaml", "/ws/sendmessage");
+    assert_eq!(send.path_raw, "sendMessage");
+    assert_eq!(
+        handler_loc(g, send),
+        Some(("src/handlers/report.py".into(), "lambda_handler".into()))
+    );
+    // The routed function must not double as a lambda: entry-point row.
+    assert!(
+        !g.endpoints
+            .endpoints
+            .iter()
+            .any(|e| e.path_raw == "lambda:WsHandlerFunction"),
+        "ws-routed function must not emit a lambda: row"
+    );
+
+    // Terraform: bare route_key on aws_apigatewayv2_route.
+    let disc = find("legacy.tf", "/ws/disconnect");
+    assert_eq!(disc.path_raw, "$disconnect");
+    assert_eq!(
+        handler_loc(g, disc),
+        Some(("src/handlers/orders.js".into(), "handler".into()))
+    );
+
+    // serverless.yml: shorthand action and object route form.
+    let bc = find("serverless.yml", "/ws/broadcast");
+    assert_eq!(bc.path_raw, "broadcast");
+    assert_eq!(
+        handler_loc(g, bc),
+        Some(("src/handlers/users.js".into(), "create".into()))
+    );
+    let sc = find("serverless.yml", "/ws/connect");
+    assert_eq!(sc.path_raw, "$connect");
+    assert_eq!(
+        handler_loc(g, sc),
+        Some(("src/handlers/users.js".into(), "create".into()))
+    );
+
+    // `websocket: $default` is a ws route, not an HTTP catch-all.
+    let sd = find("serverless.yml", "/ws/default");
+    assert_eq!(sd.path_raw, "$default");
+    assert_eq!(
+        handler_loc(g, sd),
+        Some(("src/handlers/users.js".into(), "create".into()))
+    );
+}
+
+#[test]
 fn serverless_variable_resolution() {
     let idx = index();
     let g = &idx.graph;

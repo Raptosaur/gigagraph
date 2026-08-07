@@ -45,3 +45,67 @@ resource "aws_apigatewayv2_route" "old_route" {
   route_key = "GET /old"
   target    = "integrations/${aws_apigatewayv2_integration.old_int.id}"
 }
+
+# WebSocket API: bare route_key is a wss:// action, not an HTTP route key.
+resource "aws_apigatewayv2_api" "ws" {
+  name                       = "ws-api"
+  protocol_type              = "WEBSOCKET"
+  route_selection_expression = "$request.body.action"
+}
+
+resource "aws_apigatewayv2_route" "ws_disconnect" {
+  api_id    = "${aws_apigatewayv2_api.ws.id}"
+  route_key = "$disconnect"
+  target    = "integrations/${aws_apigatewayv2_integration.old_int.id}"
+}
+
+# HCL1-quoted REST chain (futurice terraform-examples shape): resource_id /
+# parent_id written as "${...}" interpolation strings rather than bare
+# traversals — root method on root_resource_id plus a greedy proxy resource.
+resource "aws_api_gateway_rest_api" "old_rest" {
+  name = "old-rest"
+}
+
+resource "aws_api_gateway_method" "old_root" {
+  rest_api_id   = "${aws_api_gateway_rest_api.old_rest.id}"
+  resource_id   = "${aws_api_gateway_rest_api.old_rest.root_resource_id}"
+  http_method   = "ANY"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "old_root" {
+  rest_api_id             = "${aws_api_gateway_rest_api.old_rest.id}"
+  resource_id             = "${aws_api_gateway_rest_api.old_rest.root_resource_id}"
+  http_method             = "ANY"
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = "${aws_lambda_function.quick_fn.invoke_arn}"
+}
+
+resource "aws_api_gateway_resource" "legacyapi" {
+  rest_api_id = "${aws_api_gateway_rest_api.old_rest.id}"
+  parent_id   = "${aws_api_gateway_rest_api.old_rest.root_resource_id}"
+  path_part   = "legacyapi"
+}
+
+resource "aws_api_gateway_resource" "legacyapi_proxy" {
+  rest_api_id = "${aws_api_gateway_rest_api.old_rest.id}"
+  parent_id   = "${aws_api_gateway_resource.legacyapi.id}"
+  path_part   = "{proxy+}"
+}
+
+resource "aws_api_gateway_method" "legacyapi_proxy" {
+  rest_api_id   = "${aws_api_gateway_rest_api.old_rest.id}"
+  resource_id   = "${aws_api_gateway_resource.legacyapi_proxy.id}"
+  http_method   = "ANY"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "legacyapi_proxy" {
+  rest_api_id             = "${aws_api_gateway_rest_api.old_rest.id}"
+  resource_id             = "${aws_api_gateway_resource.legacyapi_proxy.id}"
+  http_method             = "ANY"
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = "${aws_lambda_function.quick_fn.invoke_arn}"
+}
