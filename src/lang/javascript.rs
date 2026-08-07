@@ -96,6 +96,14 @@ pub(crate) const CORE_QUERY: &str = r#"
     arguments: (arguments (string (string_fragment) @import.path)))
   (#eq? @_req "require")) @import
 
+(variable_declarator
+  name: (identifier) @import.name
+  value: (call_expression
+    function: (call_expression
+      function: (identifier) @_req
+      arguments: (arguments (string (string_fragment) @import.path)))
+    (#eq? @_req "require"))) @import
+
 (lexical_declaration
   (variable_declarator
     name: (identifier) @const.name

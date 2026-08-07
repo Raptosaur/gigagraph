@@ -2700,6 +2700,32 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                     conf,
                 );
             }
+            // Explicit ProxyResource construct: `new ProxyResource(this, id,
+            // { parent, anyMethod })` — a greedy {proxy+} under a parent
+            // resource that arrives as an unharvestable ident, so the base
+            // is unknown and the method (anyMethod / later addMethod with a
+            // dynamic ident) is unknowable -> ANY /{proxy+} Heuristic.
+            "ProxyResource" => {
+                if !call
+                    .arg_lits
+                    .iter()
+                    .any(|l| l.kind == LitKind::Ident && l.text == "parent")
+                {
+                    continue;
+                }
+                let (handler, _) = bind(Confidence::Heuristic);
+                push_endpoint(
+                    idx,
+                    HttpMethod::Any,
+                    "/{proxy+}".to_string(),
+                    "/{*}".to_string(),
+                    "cdk",
+                    func,
+                    call,
+                    handler,
+                    Confidence::Heuristic,
+                );
+            }
             // StepFunctionsRestApi: ANY on the API root proxying to the
             // state machine (plus whatever explicit resources follow, which
             // the addResource/addMethod arms emit on their own).
