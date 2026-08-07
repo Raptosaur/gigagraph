@@ -384,6 +384,27 @@ pub fn detect(
                 }
             }
             Lang::Php => {
+                // Symfony class-level docblock `@Route("/prefix")` (annotation
+                // era, Symfony 2-5 / PHP 7): the php.rs query captures the
+                // class docblock COMMENT as a decoration riding along to the
+                // class's first method (name = raw comment text — see
+                // src/lang/php.rs). Recovered here into `controller_prefix`
+                // keyed by containing_type, NestJS-style, so every sibling
+                // method joins the prefix. Class-level PHP8 `#[Route]`
+                // ATTRIBUTES are not captured (documented gap: they would be
+                // indistinguishable from the method-level docblock-synthesized
+                // "Route" decorations that also precede the method line).
+                if has(fid, &["symfony", "sensio"]) {
+                    if let Some(t) = &func.containing_type {
+                        for d in &decorations[func.id as usize] {
+                            if let Some(prefix) = php_class_docblock_route(d) {
+                                ctx.controller_prefix
+                                    .entry((fid, t.clone()))
+                                    .or_insert(prefix);
+                            }
+                        }
+                    }
+                }
                 // `define('NAME', '/path')` is call-shaped, so it is the one
                 // const definition the extractor surfaces (see the
                 // `php_consts` field doc for what is NOT visible).
@@ -1214,6 +1235,15 @@ fn detect_server(
         Lang::Php => {
             // Laravel: Route::get('/x', ...), Route::match([...], '/x'),
             // Route::any('/x'), Route::resource('users', ...).
+            // Known limits (validated against crater-invoice/crater and the
+            // laravel/laravel v8.6.12 skeleton): the RouteServiceProvider's
+            // out-of-file base prefix (classically `api` for routes/api.php)
+            // is invisible here, so detected paths are file-local truth.
+            // Documented candidates, not implemented (no near-working shape
+            // today): Lumen `$router->get(...)` + `$router->group(['prefix'
+            // => ...])` (needs its own evidence gate and receiver rule),
+            // CakePHP `$routes->connect(...)`, CodeIgniter `$routes->
+            // get(...)`.
             let laravel_ev = has(fid, &["illuminate"]);
             let conf = if laravel_ev {
                 Confidence::High
@@ -1235,11 +1265,18 @@ fn detect_server(
                 .iter()
                 .filter(|g| g.name == "group")
                 .filter_map(|g| {
+                    // Receiver `Some("Route")` is the chain-initial spelling
+                    // (`Route::prefix('/x')->group(...)`); `None` is a
+                    // mid-chain prefix (`Route::middleware([...])
+                    // ->prefix('x')->group(...)` — crater's routes/api.php
+                    // uses this throughout): the chained receiver text
+                    // contains parens, so sanitization drops it, but the
+                    // shared chain-start byte still pairs it with the group.
                     let chained = calls
                         .iter()
                         .find(|p| {
                             p.name == "prefix"
-                                && p.receiver.as_deref() == Some("Route")
+                                && matches!(p.receiver.as_deref(), Some("Route") | None)
                                 && p.start_byte == g.start_byte
                                 && p.end_byte < g.end_byte
                         })
@@ -1268,8 +1305,23 @@ fn detect_server(
                         .fold(String::new(), |acc, (_, _, p)| join_prefix(&acc, p)),
                 )
             };
+            // `Route::middleware('auth')->get('/user', ...)` (the Laravel 8
+            // skeleton's api.php shape): the verb call ends a chain, so its
+            // receiver text contains parens and sanitization drops it — but a
+            // `Route`-received call sharing the chain's start byte proves the
+            // chain is a route registration (same pairing the prefix->group
+            // join uses). Non-verb chain members (middleware/name/prefix)
+            // fail HttpMethod::from_name below and never become endpoints.
+            let chained_route = |c: &RawCall| {
+                c.receiver.is_none()
+                    && calls.iter().any(|p| {
+                        p.receiver.as_deref() == Some("Route")
+                            && p.start_byte == c.start_byte
+                            && p.end_byte < c.end_byte
+                    })
+            };
             for call in calls {
-                if call.receiver.as_deref() != Some("Route") {
+                if call.receiver.as_deref() != Some("Route") && !chained_route(call) {
                     continue;
                 }
                 match call.name.as_str() {
@@ -1311,21 +1363,37 @@ fn detect_server(
                             });
                         }
                     }
-                    "resource" => {
+                    "resource" | "apiResource" => {
                         // Route::resource('photos', Controller::class):
-                        // conventional 7-route expansion. Nested resources
-                        // ('photos.comments') are skipped, and group prefixes
-                        // are NOT applied to the expansion (the routes are
-                        // already convention-implied; compounding two
-                        // heuristics invites wrong paths).
+                        // conventional 7-route expansion; Route::apiResource
+                        // drops the HTML-form routes (create/edit — crater
+                        // registers a dozen of these). Nested resources
+                        // ('photos.comments') are skipped. Enclosing group
+                        // prefixes ARE joined: crater's `Route::prefix('/v1')
+                        // ->group(...)` wraps every resource call, and the
+                        // unprefixed expansion was simply wrong against the
+                        // real route list (`php artisan route:list` truth).
                         let Some(base) = first_str_lit(call) else {
                             continue;
                         };
-                        let base = base.trim_matches('/');
+                        let base = base.trim_matches('/').to_string();
                         if base.is_empty() || base.contains(['.', '/']) {
                             continue;
                         }
-                        expand_resource(idx, base, "{id}", true, "laravel", fid, call.line);
+                        let base = match group_prefix(call) {
+                            Some(gp) => join_prefix(&gp, &base).trim_matches('/').to_string(),
+                            None => base,
+                        };
+                        expand_resource(
+                            idx,
+                            &base,
+                            "{id}",
+                            true,
+                            call.name == "apiResource",
+                            "laravel",
+                            fid,
+                            call.line,
+                        );
                     }
                     _ => {
                         let Some(method) = HttpMethod::from_name(&call.name) else {
@@ -1334,10 +1402,18 @@ fn detect_server(
                         // Const resolution BEFORE the plain path literal: for
                         // `Route::get(BASE . '/x')` the first '/'-lit is the
                         // concat TAIL, which alone would be a wrong path.
+                        // Slash-less URIs (`Route::post('login', ...)` —
+                        // routine in real apps, crater included) are accepted
+                        // from argument 0 only: a verb call's first argument
+                        // is the URI by API contract.
                         let (path, conf) = match php_const_path(call, fid, ctx) {
                             Some(p) => (p, Confidence::Heuristic),
-                            None => match first_path_lit(call) {
-                                Some(p) => (p, conf),
+                            None => match call
+                                .arg_lits
+                                .iter()
+                                .find(|l| l.index == 0 && l.key.is_none() && l.kind == LitKind::Str)
+                            {
+                                Some(l) => (ensure_slash(&l.text), conf),
                                 None => continue,
                             },
                         };
@@ -1357,8 +1433,14 @@ fn detect_server(
                             framework: "laravel".into(),
                             file_id: fid,
                             line: call.line,
-                            // Legacy string handlers: 'UserController@show'.
-                            handler: laravel_string_handler(call, functions, name_index),
+                            // Legacy string handlers 'UserController@show',
+                            // Laravel 8 invokables (Controller::class) and
+                            // tuples ([Controller::class, 'show']).
+                            handler: laravel_string_handler(call, functions, name_index)
+                                .or_else(|| {
+                                    laravel_invokable_handler(call, functions, name_index)
+                                })
+                                .or_else(|| laravel_tuple_handler(call, functions, name_index)),
                             confidence: conf,
                         });
                     }
@@ -1522,6 +1604,14 @@ fn detect_server(
             // `sensio` covers Symfony 2/3 apps routing exclusively through
             // the SensioFrameworkExtraBundle annotations.
             if has(fid, &["symfony", "sensio"]) {
+                // Class-level docblock @Route("/prefix") joined onto every
+                // method route (annotation-era Symfony; validated against
+                // symfony/demo v1.7.0). Honest Heuristic: the prefix rides
+                // along via nearest-following-function association.
+                let class_prefix = func
+                    .containing_type
+                    .as_ref()
+                    .and_then(|t| ctx.controller_prefix.get(&(fid, t.clone())));
                 for d in decos {
                     if d.name != "Route" {
                         continue;
@@ -1529,14 +1619,23 @@ fn detect_server(
                     let Some(path) = first_deco_str(d) else {
                         continue;
                     };
+                    let (path, conf) = match class_prefix {
+                        Some(p) => (join_prefix(p, &path), Confidence::Heuristic),
+                        None => (path, Confidence::High),
+                    };
                     let Some(norm) = normalize_path(&path) else {
                         continue;
                     };
+                    // `methods={"GET","POST"}` brace lists arrive one lit per
+                    // element; `methods="GET|POST"` (equally common in the
+                    // Symfony 5 docs era — symfony/demo uses it throughout)
+                    // arrives as ONE pipe-joined lit, so split before parsing.
                     let mut methods: Vec<HttpMethod> = d
                         .arg_lits
                         .iter()
                         .filter(|l| l.key.as_deref() == Some("methods") && l.kind == LitKind::Str)
-                        .filter_map(|l| HttpMethod::from_name(&l.text))
+                        .flat_map(|l| l.text.split('|'))
+                        .filter_map(HttpMethod::from_name)
                         .collect();
                     // Symfony 2/3 companion annotation: @Method({"GET"}).
                     if methods.is_empty() {
@@ -1564,8 +1663,93 @@ fn detect_server(
                             file_id: fid,
                             line: d.line,
                             handler: Some(func.id),
-                            confidence: Confidence::High,
+                            confidence: conf,
                         });
+                    }
+                }
+            }
+            // Framework-agnostic fallback tier, LAST so framework-specific
+            // blocks keep their precise labels and this only catches what
+            // they missed (unknown micro-frameworks, project router
+            // wrappers, Lumen $router->get, ...). Two shapes:
+            //   $recv->verb('/path', handler, ...)   — arg_count >= 2 keeps
+            //     single-arg HTTP-client gets out; client-ish receiver names
+            //     are excluded outright.
+            //   $recv->route('GET /path', handler) / ->map('GET|POST /x', h)
+            //     — Fat-Free/klein-style verb-in-string.
+            // Always Heuristic, framework "php"; a same-file:line row from a
+            // framework block above suppresses the generic one.
+            {
+                const CLIENTY: &[&str] = &["client", "http", "guzzle", "curl", "browser"];
+                for call in calls {
+                    let Some(recv) = call.receiver.as_deref() else {
+                        continue;
+                    };
+                    if !recv.starts_with('$') || recv == "$this" {
+                        continue;
+                    }
+                    let recv_lc = recv.to_ascii_lowercase();
+                    if CLIENTY.iter().any(|c| recv_lc.contains(c)) {
+                        continue;
+                    }
+                    let verb_string = matches!(call.name.as_str(), "route" | "map")
+                        .then(|| first_str_lit(call))
+                        .flatten()
+                        .and_then(|s| {
+                            let (verbs, path) = s.split_once(' ')?;
+                            let parsed = verbs
+                                .split('|')
+                                .map(|v| HttpMethod::from_name(v.trim()))
+                                .collect::<Option<Vec<HttpMethod>>>()?;
+                            path.starts_with('/')
+                                .then(|| (parsed, path.trim().to_string()))
+                        });
+                    let (methods, path) = if let Some((v, p)) = verb_string {
+                        (v, p)
+                    } else {
+                        let Some(m) = HttpMethod::from_name(&call.name) else {
+                            continue;
+                        };
+                        if call.arg_count < 2 {
+                            continue;
+                        }
+                        let Some(p) = call
+                            .arg_lits
+                            .iter()
+                            .find(|l| l.kind == LitKind::Str && l.key.is_none() && l.index == 0)
+                            .filter(|l| l.text.starts_with('/'))
+                            .map(|l| l.text.clone())
+                        else {
+                            continue;
+                        };
+                        (vec![m], p)
+                    };
+                    if idx
+                        .endpoints
+                        .iter()
+                        .any(|e| e.file_id == fid && e.line == call.line)
+                    {
+                        continue;
+                    }
+                    let Some(norm) = normalize_path(&path) else {
+                        continue;
+                    };
+                    let handler = class_static_string_handler(call, functions, name_index)
+                        .or_else(|| silex_service_handler(call, functions, name_index))
+                        .or_else(|| array_this_handler(call, func, functions, name_index))
+                        .or_else(|| handler_from_ident(call, func, functions, name_index));
+                    for m in methods {
+                        push_endpoint(
+                            idx,
+                            m,
+                            path.clone(),
+                            norm.clone(),
+                            "php",
+                            func,
+                            call,
+                            handler,
+                            Confidence::Heuristic,
+                        );
                     }
                 }
             }
@@ -1827,7 +2011,7 @@ fn detect_server(
                         if base.is_empty() || base.contains(['/', '.', ':']) {
                             continue;
                         }
-                        expand_resource(idx, base, ":id", plural, "rails", fid, call.line);
+                        expand_resource(idx, base, ":id", plural, false, "rails", fid, call.line);
                     }
                     continue;
                 }
@@ -2045,6 +2229,23 @@ fn spring_path_arg(d: &RawDecoration) -> String {
         })
         .map(|l| l.text.clone())
         .unwrap_or_else(|| "/".to_string())
+}
+
+/// Prefix path from a Symfony class-level docblock `@Route` decoration. The
+/// php.rs query captures the whole class docblock COMMENT as the decoration
+/// name (see src/lang/php.rs), so a real class prefix arrives as a name
+/// starting with `/**` containing `@Route(`; the first quoted string after
+/// `@Route(` is the prefix. Method-level docblock @Route annotations are
+/// synthesized with name == "Route" and never enter here.
+fn php_class_docblock_route(d: &RawDecoration) -> Option<String> {
+    if !d.name.starts_with("/**") {
+        return None;
+    }
+    let rest = &d.name[d.name.find("@Route(")? + "@Route(".len()..];
+    let q = rest.find(['"', '\''])?;
+    let quote = rest.as_bytes()[q] as char;
+    let rest = &rest[q + 1..];
+    Some(rest[..rest.find(quote)?].to_string())
 }
 
 /// Path from a leading PHP const reference (`Route::get(BASE . '/x', ...)` /
@@ -2896,28 +3097,34 @@ fn push_endpoint(
 }
 
 /// Conventional REST resource expansion (Rails `resources`, Laravel
-/// `Route::resource`). Always Heuristic: the routes are implied by
-/// convention, not written in the source.
+/// `Route::resource` / `Route::apiResource`). Always Heuristic: the routes
+/// are implied by convention, not written in the source. `api` drops the
+/// HTML-form routes (new/create-form, edit) the way Laravel's apiResource
+/// does.
 fn expand_resource(
     idx: &mut EndpointIndex,
     base: &str,
     param: &str,
     plural: bool,
+    api: bool,
     framework: &str,
     file_id: u32,
     line: u32,
 ) {
     let root = format!("/{base}");
     let routes: Vec<(HttpMethod, String)> = if plural {
-        vec![
-            (HttpMethod::Get, root.clone()),                   // index
-            (HttpMethod::Get, format!("{root}/new")),          // new
-            (HttpMethod::Post, root.clone()),                  // create
-            (HttpMethod::Get, format!("{root}/{param}")),      // show
-            (HttpMethod::Get, format!("{root}/{param}/edit")), // edit
-            (HttpMethod::Patch, format!("{root}/{param}")),    // update
-            (HttpMethod::Delete, format!("{root}/{param}")),   // destroy
-        ]
+        let mut r = vec![
+            (HttpMethod::Get, root.clone()), // index
+            (HttpMethod::Post, root.clone()), // create/store
+            (HttpMethod::Get, format!("{root}/{param}")), // show
+            (HttpMethod::Patch, format!("{root}/{param}")), // update
+            (HttpMethod::Delete, format!("{root}/{param}")), // destroy
+        ];
+        if !api {
+            r.push((HttpMethod::Get, format!("{root}/new"))); // new
+            r.push((HttpMethod::Get, format!("{root}/{param}/edit"))); // edit
+        }
+        r
     } else {
         vec![
             (HttpMethod::Get, format!("{root}/new")),
@@ -2969,6 +3176,60 @@ fn laravel_string_handler(
         .iter()
         .copied()
         .filter(|&id| functions[id as usize].containing_type.as_deref() == Some(ctrl))
+        .collect();
+    (hits.len() == 1).then(|| hits[0])
+}
+
+/// Laravel single-action controllers: `Route::get('/x', VersionController::
+/// class)` — the bare `::class` const arrives as two Idents sharing an
+/// argument index ("VersionController", "class"; probe-verified against
+/// tests/fixtures/probe shapes). Resolve to the class's `__invoke`.
+fn laravel_invokable_handler(
+    call: &RawCall,
+    functions: &[FunctionInfo],
+    name_index: &FxHashMap<String, Vec<u32>>,
+) -> Option<u32> {
+    let class = call.arg_lits.windows(2).find_map(|w| {
+        (w[0].kind == LitKind::Ident
+            && w[0].key.is_none()
+            && w[0].index > 0
+            && w[0].text.chars().next().is_some_and(|c| c.is_uppercase())
+            && w[1].kind == LitKind::Ident
+            && w[1].text == "class"
+            && w[1].index == w[0].index)
+            .then(|| w[0].text.clone())
+    })?;
+    let hits: Vec<u32> = name_index
+        .get("__invoke")?
+        .iter()
+        .copied()
+        .filter(|&id| functions[id as usize].containing_type.as_deref() == Some(class.as_str()))
+        .collect();
+    (hits.len() == 1).then(|| hits[0])
+}
+
+/// Laravel 8 tuple handlers `[UserController::class, 'show']`: the class
+/// const sits one level below harvest depth inside the array (probe-verified
+/// — only the method-name string survives), so the class is unknowable here.
+/// Resolve by PROJECT-UNIQUE method name among class methods; anything
+/// ambiguous stays unresolved.
+fn laravel_tuple_handler(
+    call: &RawCall,
+    functions: &[FunctionInfo],
+    name_index: &FxHashMap<String, Vec<u32>>,
+) -> Option<u32> {
+    let lit = call.arg_lits.iter().find(|l| {
+        l.kind == LitKind::Str
+            && l.key.is_none()
+            && l.index > 0
+            && !l.text.is_empty()
+            && !l.text.contains(['@', ':', '/', '.', ' '])
+    })?;
+    let hits: Vec<u32> = name_index
+        .get(&lit.text)?
+        .iter()
+        .copied()
+        .filter(|&id| functions[id as usize].containing_type.is_some())
         .collect();
     (hits.len() == 1).then(|| hits[0])
 }

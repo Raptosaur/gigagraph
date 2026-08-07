@@ -706,3 +706,146 @@ fn detects_silex_provider_with_qualified_interface() {
         "listQualified"
     );
 }
+
+#[test]
+fn detects_symfony5_annotation_class_prefixes() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+    use gigagraph::types::Confidence;
+
+    // Class-level docblock @Route("/member") (annotation-era Symfony,
+    // validated against symfony/demo v1.7.0) joins every method route via
+    // the php.rs comment ride-along; honest Heuristic.
+    let pref = find(ep, HttpMethod::Get, "/member/preferences");
+    assert_eq!(pref.framework, "symfony");
+    assert_eq!(pref.confidence, Confidence::Heuristic);
+    assert_eq!(
+        g.functions[pref.handler.unwrap() as usize].name,
+        "preferences"
+    );
+
+    // methods="GET|POST" pipe-string form splits into one row per verb and
+    // must not leave an ANY row behind.
+    find(ep, HttpMethod::Post, "/member/preferences");
+    assert!(
+        ep.endpoints
+            .iter()
+            .all(|e| !(e.path_norm == "/member/preferences" && e.method == HttpMethod::Any)),
+        "pipe methods form must replace the ANY row"
+    );
+
+    // requirements={}/defaults={} and inline `{id<\d+>}` requirements leave
+    // the path intact (the regex segment folds to {*}).
+    let badge = find(ep, HttpMethod::Get, "/member/badges/{*}");
+    assert_eq!(g.functions[badge.handler.unwrap() as usize].name, "badge");
+    assert!(
+        ep.endpoints
+            .iter()
+            .all(|e| !(e.path_norm == "/member/badges/{*}" && e.method == HttpMethod::Any)),
+        "brace methods form must replace the ANY row"
+    );
+
+    // The class-level prefix itself must be a prefix, not an endpoint.
+    assert!(
+        ep.endpoints.iter().all(|e| e.path_norm != "/member"),
+        "class-level @Route must not become its own endpoint"
+    );
+
+    // Method-level docblock routes in prefix-less classes stay High.
+    assert_eq!(
+        find(ep, HttpMethod::Post, "/reports/export").confidence,
+        Confidence::High
+    );
+}
+
+#[test]
+fn detects_laravel8_route_shapes() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+    use gigagraph::types::Confidence;
+
+    // Mid-chain prefix: Route::middleware([...])->prefix('/setup')->group()
+    // (crater's installation block) — the prefix call is receiver-less but
+    // shares the chain-start byte with the group.
+    let steps = find(ep, HttpMethod::Get, "/setup/steps");
+    assert_eq!(steps.framework, "laravel");
+    assert_eq!(steps.confidence, Confidence::Heuristic);
+
+    // Chained verb: Route::middleware('auth')->get('/whoami', ...) — the
+    // Laravel 8 skeleton's api.php shape.
+    let who = find(ep, HttpMethod::Get, "/whoami");
+    assert_eq!(who.framework, "laravel");
+    assert_eq!(who.confidence, Confidence::High);
+
+    // Slash-less URI (Route::post('signin', ...)) — argument 0 is the URI
+    // by API contract.
+    let signin = find(ep, HttpMethod::Post, "/signin");
+    assert_eq!(signin.confidence, Confidence::High);
+
+    // Laravel 8 tuple handler [CouponController::class, 'redeem']: the class
+    // const sits below harvest depth, so resolution is by project-unique
+    // method name.
+    let redeem = find(ep, HttpMethod::Post, "/coupons/redeem");
+    let h = &g.functions[redeem.handler.expect("tuple handler resolved") as usize];
+    assert_eq!(h.name, "redeem");
+    assert_eq!(h.containing_type.as_deref(), Some("CouponController"));
+
+    // Single-action (invokable) controller: Route::get('/x', C::class)
+    // resolves to the class's __invoke.
+    let ver = find(ep, HttpMethod::Get, "/app-version");
+    let h = &g.functions[ver.handler.expect("invokable handler resolved") as usize];
+    assert_eq!(h.name, "__invoke");
+    assert_eq!(h.containing_type.as_deref(), Some("AppVersionController"));
+
+    // apiResource inside a prefix group: 5-route expansion (no HTML form
+    // routes) joined with the enclosing prefix, all Heuristic.
+    for (m, p) in [
+        (HttpMethod::Get, "/api/v1/coupons"),
+        (HttpMethod::Post, "/api/v1/coupons"),
+        (HttpMethod::Get, "/api/v1/coupons/{*}"),
+        (HttpMethod::Patch, "/api/v1/coupons/{*}"),
+        (HttpMethod::Delete, "/api/v1/coupons/{*}"),
+    ] {
+        let e = find(ep, m, p);
+        assert_eq!(e.framework, "laravel");
+        assert_eq!(e.confidence, Confidence::Heuristic);
+    }
+    assert!(
+        ep.endpoints.iter().all(|e| {
+            e.path_norm != "/api/v1/coupons/new" && e.path_norm != "/api/v1/coupons/{*}/edit"
+        }),
+        "apiResource must not expand create/edit form routes"
+    );
+}
+
+#[test]
+fn generic_php_tier_catches_unknown_routers() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+    use gigagraph::types::Confidence;
+
+    // No framework evidence at all: bare $router verbs land as Heuristic
+    // "php" rows, with string handlers still resolving.
+    let e = find(ep, HttpMethod::Get, "/beacons");
+    assert_eq!(e.framework, "php");
+    assert_eq!(e.confidence, Confidence::Heuristic);
+    assert_eq!(
+        g.functions[e.handler.unwrap() as usize].name,
+        "listBeacons"
+    );
+    find(ep, HttpMethod::Post, "/beacons");
+    find(ep, HttpMethod::Put, "/beacons/{*}");
+
+    // Fat-Free style verb-in-string: $f3->route('GET|POST /signals', h).
+    find(ep, HttpMethod::Get, "/signals");
+    find(ep, HttpMethod::Post, "/signals");
+
+    // Client-ish receivers stay out.
+    assert!(
+        !ep.endpoints.iter().any(|e| e.path_norm == "/not-a-route"),
+        "$client->get must not become an endpoint"
+    );
+}

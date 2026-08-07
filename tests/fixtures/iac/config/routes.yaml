@@ -1,0 +1,22 @@
+almanac_list:
+    path: /almanacs
+    controller: App\Controller\AlmanacController::listAlmanacs
+    methods: GET|HEAD
+
+almanac_create:
+    path: /almanacs
+    controller: App\Controller\AlmanacController::createAlmanac
+    methods: [POST]
+
+health:
+    path: /healthz
+    controller: App\Controller\HealthController
+
+annotations_import:
+    resource: ../src/Controller/
+    type: annotation
+
+when@dev:
+    almanac_debug:
+        path: /almanacs/_debug
+        controller: App\Controller\AlmanacController::listAlmanacs

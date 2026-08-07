@@ -180,3 +180,112 @@ fn extracts_php_type_information() {
     let ctor = func(&file, "__construct");
     assert_eq!(local_of(ctor, "repo"), Some("UserRepository"));
 }
+
+#[test]
+fn extracts_php7_legacy_syntax() {
+    // PHP 7.0-7.4 feature sweep (fixtures/php/Legacy7.php): nullable types,
+    // return type declarations, null coalescing, spaceship, anonymous
+    // classes, arrow functions, typed + docblock-only properties,
+    // destructuring, heredoc.
+    let file = extract_fixture("php", "php/Legacy7.php");
+    let names: Vec<&str> = file.functions.iter().map(|f| f.name.as_str()).collect();
+
+    for expected in [
+        "__construct",
+        "summarize",
+        "renderBanner",
+        "makeInlineAuditor",
+        "afterAnonymous",
+        "bump",
+        "legacy_percent",
+        "add", // 7.4 arrow fn assigned to $add inside bump()
+    ] {
+        assert!(
+            names.contains(&expected),
+            "missing {expected}; got {names:?}"
+        );
+    }
+
+    // Nullable return/param types don't break method extraction or params.
+    assert_eq!(func(&file, "summarize").param_count, 2);
+    assert_eq!(func(&file, "legacy_percent").param_count, 2);
+    assert_eq!(func(&file, "add").param_count, 1);
+
+    // Calls still attribute through ??, destructuring, and closures.
+    assert_calls(func(&file, "summarize"), &["findByRegion", "usort", "audit"]);
+    let find_call = func(&file, "summarize")
+        .calls
+        .iter()
+        .find(|c| c.name == "findByRegion")
+        .unwrap();
+    assert_eq!(find_call.receiver.as_deref(), Some("$this->orders"));
+
+    // Heredoc bodies parse; the following call is still attributed.
+    assert_calls(func(&file, "renderBanner"), &["trim"]);
+
+    // The anonymous class's method extracts (it holds the error_log call)…
+    let anon_audit = file
+        .functions
+        .iter()
+        .find(|f| f.name == "audit" && has_call(f, "error_log"))
+        .expect("anonymous-class audit method with error_log call");
+    // …and takes the ENCLOSING named class as containing_type
+    // (anonymous_class is not a TYPE_KINDS ancestor — documented in
+    // src/lang/php.rs). The interface signature keeps its own owner.
+    assert_eq!(
+        anon_audit.containing_type.as_deref(),
+        Some("LegacyReportService")
+    );
+    assert!(
+        file.functions
+            .iter()
+            .any(|f| f.name == "audit" && f.containing_type.as_deref() == Some("Auditor")),
+        "interface audit signature should keep containing_type Auditor"
+    );
+
+    // Methods FOLLOWING the anonymous class are not corrupted by it.
+    let after = func(&file, "afterAnonymous");
+    assert_eq!(after.containing_type.as_deref(), Some("LegacyReportService"));
+    assert_calls(after, &["intdiv"]);
+    assert_eq!(
+        func(&file, "bump").containing_type.as_deref(),
+        Some("TypedCounters")
+    );
+
+    // match/if-free spaceship comparator and ?? are plain expressions —
+    // summarize still lands loop/branch-free extraction without panicking.
+    assert_calls(func(&file, "legacy_percent"), &["round"]);
+}
+
+#[test]
+fn extracts_php7_nullable_di_types() {
+    let file = extract_fixture("php", "php/Legacy7.php");
+
+    // `private ?Auditor $auditor` — optional_type-wrapped property captures
+    // the inner class name, no `?` residue.
+    assert_eq!(
+        field_of(&file, "LegacyReportService", "auditor"),
+        Some("Auditor")
+    );
+
+    // Nullable ctor param `?Auditor $auditor` becomes a typed local.
+    let ctor = func(&file, "__construct");
+    assert_eq!(local_of(ctor, "auditor"), Some("Auditor"));
+    // Plain (non-nullable) param capture is unaffected.
+    assert_eq!(local_of(ctor, "orders"), Some("OrderRepository"));
+
+    // Docblock-@var-only property: no declared type to capture, but the
+    // `$this->orders = $orders` ctor join records the param name in type
+    // position for the graph build to substitute (same shape Service.php's
+    // typed property dedups away).
+    assert!(
+        file.fields
+            .iter()
+            .any(|f| f.owner == "LegacyReportService" && f.name == "orders"),
+        "ctor-join field entry for docblock-only $orders should exist"
+    );
+
+    // Nullable PRIMITIVE property (`public ?string $label`) stays uncaptured
+    // like its non-nullable spelling — no bogus `string` DI type.
+    assert_eq!(field_of(&file, "TypedCounters", "label"), None);
+}

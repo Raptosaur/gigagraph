@@ -513,3 +513,49 @@ fn list_endpoints_tool_roundtrip() {
     );
     assert_eq!(put["kind"], "http");
 }
+
+#[test]
+fn detects_symfony_yaml_routes() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+    use gigagraph::endpoints::HttpMethod;
+    use gigagraph::types::Confidence;
+
+    let find = |m: HttpMethod, norm: &str| {
+        ep.endpoints
+            .iter()
+            .find(|e| e.method == m && e.path_norm == norm && e.framework == "symfony")
+            .unwrap_or_else(|| panic!("missing symfony yaml route {m:?} {norm}"))
+    };
+
+    // config/routes.yaml declarations: pipe methods, list methods, when@dev.
+    let list = find(HttpMethod::Get, "/almanacs");
+    assert_eq!(list.confidence, Confidence::High);
+    assert_eq!(
+        g.functions[list.handler.unwrap() as usize].name,
+        "listAlmanacs"
+    );
+    find(HttpMethod::Head, "/almanacs");
+    let create = find(HttpMethod::Post, "/almanacs");
+    assert_eq!(
+        g.functions[create.handler.unwrap() as usize].name,
+        "createAlmanac"
+    );
+    find(HttpMethod::Any, "/almanacs/_debug");
+
+    // Controller without ::method resolves __invoke.
+    let health = find(HttpMethod::Any, "/healthz");
+    assert_eq!(
+        g.functions[health.handler.unwrap() as usize].name,
+        "__invoke"
+    );
+
+    // resource: imports must not fabricate routes.
+    assert!(
+        !ep.endpoints
+            .iter()
+            .any(|e| e.framework == "symfony" && e.path_raw.contains("../")),
+        "resource imports are not routes"
+    );
+}

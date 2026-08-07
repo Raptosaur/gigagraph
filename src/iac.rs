@@ -68,6 +68,9 @@ pub enum Runtime {
     Node,
     Python,
     Ruby,
+    /// Symfony YAML routing: handler is `Fully\Qualified\Class::method`,
+    /// resolved by method name + simple class name, not by file path.
+    Php,
     /// Go/Java/.NET/container images: handler strings do not name a source
     /// file — resolution is skipped.
     Other,
@@ -105,6 +108,15 @@ pub fn scan(rel_path: &str, source: &str) -> Vec<IacFinding> {
     if yamlish && source.contains("Resources") && source.contains("AWS::") {
         return scan_cloudformation(dir, source);
     }
+    // Symfony YAML routing: config/routes.yaml or anything under a routes/
+    // config dir with route-shaped entries (path + controller).
+    if yamlish
+        && (name.starts_with("routes.") || rel_path.contains("config/routes"))
+        && source.contains("path:")
+        && (source.contains("controller:") || source.contains("_controller"))
+    {
+        return scan_symfony_routes(source);
+    }
     // Any other .yml might be a serverless functions fragment pulled in via
     // `${file(...)}`; findings are tagged Fragment and stay inert unless a
     // serverless.yml claims the file (see attach).
@@ -112,6 +124,85 @@ pub fn scan(rel_path: &str, source: &str) -> Vec<IacFinding> {
         return scan_sls_fragment(dir, source);
     }
     Vec::new()
+}
+
+// -------------------------------------------------- Symfony YAML routing
+
+/// `config/routes.yaml` route declarations — no PHP call in sight:
+///
+/// ```yaml
+/// blog_list:
+///     path: /blog/{page}
+///     controller: App\Controller\BlogController::list
+///     methods: GET|HEAD          # or [GET, POST]
+/// legacy:
+///     path: /old
+///     defaults: { _controller: App\Controller\LegacyController::show }
+/// ```
+///
+/// `resource:` imports (annotation/attribute loaders, directory imports) are
+/// skipped — those routes are declared in the PHP the resource points at,
+/// which the source detectors already cover. `when@<env>` wrappers are
+/// walked through.
+fn scan_symfony_routes(source: &str) -> Vec<IacFinding> {
+    let Ok(doc) = serde_norway::from_str::<Y>(source) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let Some(top) = as_map(&doc) else {
+        return Vec::new();
+    };
+    let mut walk_entries: Vec<(&serde_norway::Mapping, u32)> = vec![(top, 0)];
+    while let Some((map, after)) = walk_entries.pop() {
+        for (k, v) in map {
+            let Some(key) = as_str(k) else { continue };
+            if let Some(env_map) = key.strip_prefix("when@").and(as_map(v)) {
+                walk_entries.push((env_map, after));
+                continue;
+            }
+            let Some(path) = get(v, "path").and_then(as_str) else {
+                continue; // resource: imports and non-route keys
+            };
+            let controller = get(v, "controller")
+                .and_then(as_str)
+                .or_else(|| get(v, "defaults").and_then(|d| get(d, "_controller")).and_then(as_str));
+            let methods: Vec<HttpMethod> = match get(v, "methods").map(untag) {
+                Some(Y::String(s)) => s
+                    .split('|')
+                    .filter_map(|m| HttpMethod::from_name(m.trim()))
+                    .collect(),
+                Some(Y::Sequence(seq)) => seq
+                    .iter()
+                    .filter_map(|m| as_str(m).and_then(HttpMethod::from_name))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let methods = if methods.is_empty() {
+                vec![HttpMethod::Any]
+            } else {
+                methods
+            };
+            let line = line_of_key(source, key, after);
+            for m in methods {
+                out.push(IacFinding {
+                    kind: ApiKind::Http,
+                    method: m,
+                    path_raw: path.to_string(),
+                    framework: "symfony",
+                    line,
+                    confidence: Confidence::High,
+                    handler: controller.map(|c| HandlerRef {
+                        base_dir: String::new(),
+                        handler: c.to_string(),
+                        runtime: Runtime::Php,
+                    }),
+                    require_handler: false,
+                    sls: None,
+                });
+            }
+        }
+    }
+    out
 }
 
 // -------------------------------------------------------------- YAML utils
@@ -1715,7 +1806,32 @@ fn strip_node_ext(p: &str) -> &str {
     p
 }
 
+/// `App\Controller\BlogController::list` -> the method on that class, by
+/// simple class name (containing_type never carries a namespace). Invokable
+/// controllers (`App\Controller\HealthController` alone) resolve `__invoke`.
+fn resolve_php_class(graph: &GigaGraph, handler: &str) -> Option<u32> {
+    let (class, method) = match handler.rsplit_once("::") {
+        Some((c, m)) => (c, m),
+        None => (handler, "__invoke"),
+    };
+    let class = class.rsplit('\\').next().unwrap_or(class);
+    if class.is_empty() || method.is_empty() {
+        return None;
+    }
+    let hits: Vec<u32> = graph
+        .name_index
+        .get(method)?
+        .iter()
+        .copied()
+        .filter(|&id| graph.functions[id as usize].containing_type.as_deref() == Some(class))
+        .collect();
+    (hits.len() == 1).then(|| hits[0])
+}
+
 fn resolve_handler(graph: &GigaGraph, h: &HandlerRef) -> Option<u32> {
+    if h.runtime == Runtime::Php {
+        return resolve_php_class(graph, &h.handler);
+    }
     if h.handler.contains("${") || h.handler.contains("::") {
         return None;
     }
@@ -1731,7 +1847,8 @@ fn resolve_handler(graph: &GigaGraph, h: &HandlerRef) -> Option<u32> {
             &format!("{}.rb", join_norm(&h.base_dir, module)),
             export,
         ),
-        Runtime::Other => None,
+        // Unreachable: Php early-returns through resolve_php_class above.
+        Runtime::Php | Runtime::Other => None,
         Runtime::Unknown => resolve_node(graph, &h.base_dir, module, export)
             .or_else(|| resolve_python(graph, &h.base_dir, module, export))
             .or_else(|| {

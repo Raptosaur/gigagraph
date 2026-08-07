@@ -21,9 +21,30 @@ use crate::types::{ImportStyle, Lang};
 //   locals, untyped-property joins (`$this->repo = $repo` captures the param
 //   NAME in type position — graph build substitutes the param's type), and
 //   class_interface_clause / base_clause hierarchy edges.
+// - Nullable PHP 7.1+ types (`?Auditor`) parse as `(optional_type
+//   (named_type ...))` — probe-verified against tests/fixtures/php/Legacy7.php
+//   — so each named_type DI pattern (typed property, promoted ctor param,
+//   simple parameter) has an optional_type twin capturing the inner name;
+//   the `?` never reaches the capture, so no cleanup is needed. Nullable
+//   PRIMITIVE types (`?string`) wrap `primitive_type` and stay uncaptured
+//   like their non-nullable spelling.
 // - `new Foo(...)` / `new \A\B\Foo(...)` capture the class simple name as
 //   `@call.name` (last segment of a `qualified_name`). `new $class(...)` and
-//   anonymous classes are skipped (no clean name).
+//   anonymous classes are skipped (no clean name). An `anonymous_class` body
+//   is NOT a TYPE_KINDS ancestor: its methods take the enclosing NAMED
+//   class as `containing_type` (verified harmless — methods following the
+//   anonymous class are unaffected).
+// - Legacy Symfony class-level docblock routing (`/** @Route("/prefix") */`
+//   directly above `class X`): the comment node itself is captured as a
+//   decoration (name = the raw comment text, gated by `#match?` on
+//   "@Route("). With no same-match `@func.def` the extractor's
+//   nearest-following-function fallback attaches it to the class's first
+//   method — the endpoint pre-pass recovers the prefix from there via
+//   `containing_type` (same ride-along trick java.rs uses for Spring
+//   class-level `@RequestMapping`; same known limit: a routed class with no
+//   methods leaks the comment-decoration to the next function in the file).
+//   Method-level docblocks are untouched: they precede `method_declaration`,
+//   not `class_declaration`, so the anchored pattern never matches them.
 // - `use A\B\C;` binds its last segment as `@import.name`; the trailing anchor
 //   keeps aliased declarations out of that pattern so `use X as Y;` binds only
 //   `Y`. Grouped `use A\{B, C};` captures the shared `namespace_name` prefix as
@@ -139,6 +160,27 @@ const QUERY: &str = r#"
 (simple_parameter
   type: (named_type (name) @local.type)
   name: (variable_name (name) @local.name))
+
+(property_declaration
+  type: (optional_type (named_type (name) @field.type))
+  (property_element name: (variable_name (name) @field.name)))
+
+(property_promotion_parameter
+  type: (optional_type (named_type (name) @field.type))
+  name: (variable_name (name) @field.name))
+
+(property_promotion_parameter
+  type: (optional_type (named_type (name) @local.type))
+  name: (variable_name (name) @local.name))
+
+(simple_parameter
+  type: (optional_type (named_type (name) @local.type))
+  name: (variable_name (name) @local.name))
+
+((comment) @deco @deco.name
+  .
+  (class_declaration)
+  (#match? @deco.name "@Route\\("))
 
 (assignment_expression
   left: (variable_name (name) @local.name)
