@@ -690,3 +690,19 @@ fn detects_silex_2_1_api_surface() {
         "listEntries"
     );
 }
+
+#[test]
+fn detects_silex_provider_with_qualified_interface() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+
+    // `implements \Silex\ControllerProviderInterface` (FQCN, zero imports):
+    // the qualified_name hierarchy pattern supplies the evidence edge.
+    let e = find(ep, HttpMethod::Get, "/qualified-ledgers");
+    assert_eq!(e.framework, "silex");
+    assert_eq!(
+        g.functions[e.handler.unwrap() as usize].name,
+        "listQualified"
+    );
+}

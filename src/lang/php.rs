@@ -158,6 +158,14 @@ const QUERY: &str = r#"
 (class_declaration
   name: (name) @hier.type
   (base_clause (name) @hier.base))
+
+(class_declaration
+  name: (name) @hier.type
+  (class_interface_clause (qualified_name (name) @hier.base .)))
+
+(class_declaration
+  name: (name) @hier.type
+  (base_clause (qualified_name (name) @hier.base .)))
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &["name", "variable_name"];
