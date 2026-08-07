@@ -276,7 +276,7 @@ pub fn build_index(root: &Path, force: bool) -> Result<Index> {
     // Project-level endpoint evidence: composer.json dependency names cover
     // script-style files (Silex `src/controllers.php`) that route on an
     // `$app` arriving via `require` with no framework import in sight.
-    let project_deps = std::fs::read_to_string(root.join("composer.json"))
+    let mut project_deps = std::fs::read_to_string(root.join("composer.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .map(|v| {
@@ -288,6 +288,20 @@ pub fn build_index(root: &Path, force: bool) -> Result<Index> {
                 .join("\n")
         })
         .unwrap_or_default();
+    // Python dependency manifests, appended raw (evidence is substring-
+    // matched): route modules routinely take the app/router as a parameter
+    // with no framework import in sight (aiohttp `setup_routes(app, ...)`).
+    for manifest in [
+        "requirements.txt",
+        "requirements-dev.txt",
+        "pyproject.toml",
+        "Pipfile",
+    ] {
+        if let Ok(s) = std::fs::read_to_string(root.join(manifest)) {
+            project_deps.push('\n');
+            project_deps.push_str(&s.to_ascii_lowercase());
+        }
+    }
     let (mut graph, features) = GigaGraph::build(root_str, inputs, &project_deps);
     crate::iac::attach(&mut graph, &iac_files);
     let graph = graph;
