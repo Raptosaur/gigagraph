@@ -64,8 +64,15 @@ use crate::types::{ImportStyle, Lang};
 //   Because the annotation lies within the function's byte range, the deco
 //   pattern must capture `@func.def` in the same match (same-match
 //   association) — nearest-following-function would skip to the NEXT
-//   function. Marker annotations without arguments (`@Deprecated`) are not
-//   captured (no argument payload to interpret).
+//   function. Marker annotations without arguments sit in the same
+//   `modifiers` child as `(annotation (user_type (identifier)))` (no
+//   constructor_invocation wrapper, probe-verified on Quarkus-Kotlin) and ARE
+//   captured too — JAX-RS routes hang off bare `@GET`/`@POST` markers, which
+//   detection needs; matching Java behavior, where markers like `@Deprecated`
+//   have always been in the decoration stream. Class-level ride-along
+//   patterns mirror src/lang/java.rs: `RequestMapping`/`Path` prefixes with
+//   args, plus argument-less `FeignClient`/`RegisterRestClient` client
+//   markers (see the java.rs comment for the ride-along mechanics).
 const QUERY: &str = r#"
 (function_declaration
   name: (identifier) @func.name
@@ -107,6 +114,13 @@ const QUERY: &str = r#"
   name: (identifier) @func.name
   (function_value_parameters) @func.params) @func.def
 
+(function_declaration
+  (modifiers
+    (annotation
+      (user_type (identifier) @deco.name)) @deco)
+  name: (identifier) @func.name
+  (function_value_parameters) @func.params) @func.def
+
 (import (qualified_identifier) @import.path) @import
 
 (import
@@ -132,7 +146,13 @@ const QUERY: &str = r#"
       (constructor_invocation
         (user_type (identifier) @deco.name)
         (value_arguments) @deco.args)) @deco))
-  (#eq? @deco.name "RequestMapping"))
+  (#any-of? @deco.name "RequestMapping" "Path" "FeignClient" "RegisterRestClient"))
+
+((class_declaration
+  (modifiers
+    (annotation
+      (user_type (identifier) @deco.name)) @deco))
+  (#any-of? @deco.name "FeignClient" "RegisterRestClient"))
 
 (class_parameter
   ["val" "var"]

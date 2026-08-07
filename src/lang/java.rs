@@ -16,7 +16,7 @@ use crate::types::{ImportStyle, Lang};
 // - A record's compact constructor (`record R(int x) { R { ... } }`) has no
 //   parameter list of its own; the pattern reaches up to the enclosing
 //   `record_declaration` so the record header supplies `@func.params`.
-// - The class-level `@RequestMapping` pattern deliberately captures NEITHER
+// - The class-level annotation patterns deliberately capture NEITHER
 //   `@deco.type` (that would route it to `ExtractedFile.type_decorations`,
 //   which endpoint detection never sees) NOR `@func.def`: with no same-match
 //   definition the extractor falls back to nearest-following-function
@@ -24,9 +24,15 @@ use crate::types::{ImportStyle, Lang};
 //   endpoint pre-pass recovers the prefix from there via `containing_type`
 //   (same ride-along trick the TS query uses for NestJS `@Controller`).
 //   Known limit: a mapped class with no methods leaks the annotation to the
-//   next function in the file. Gated to `RequestMapping` so ordinary class
-//   annotations (`@Entity(...)`) don't pollute the decoration stream or set
-//   `has_decorations` on unrelated methods.
+//   next function in the file. Gated to the route-shaping names —
+//   `RequestMapping` (Spring prefix), `Path` (JAX-RS prefix) on classes;
+//   those two plus the declarative-client markers `FeignClient` /
+//   `RegisterRestClient` on interfaces (interface methods are captured by the
+//   plain method_declaration patterns, so Feign/rest-client interfaces
+//   otherwise read as servers) — so ordinary class annotations (`@Entity`)
+//   don't pollute the decoration stream or set `has_decorations` on
+//   unrelated methods. `RegisterRestClient` additionally needs a
+//   marker_annotation twin (it is commonly argument-less).
 // - DI type captures (shapes verified via probe dump):
 //   - `field_declaration` keeps annotations (`@Autowired`) inside `modifiers`,
 //     so one pattern covers plain and annotated fields alike. Generic fields
@@ -79,7 +85,20 @@ const QUERY: &str = r#"
     (annotation
       name: (identifier) @deco.name
       arguments: (annotation_argument_list) @deco.args) @deco))
-  (#eq? @deco.name "RequestMapping"))
+  (#any-of? @deco.name "RequestMapping" "Path"))
+
+((interface_declaration
+  (modifiers
+    (annotation
+      name: (identifier) @deco.name
+      arguments: (annotation_argument_list) @deco.args) @deco))
+  (#any-of? @deco.name "RequestMapping" "Path" "FeignClient" "RegisterRestClient"))
+
+((interface_declaration
+  (modifiers
+    (marker_annotation
+      name: (identifier) @deco.name) @deco))
+  (#eq? @deco.name "RegisterRestClient"))
 
 (constructor_declaration
   name: (identifier) @func.name

@@ -13,7 +13,7 @@
 
 use crate::extract::{LitKind, RawCall, RawDecoration};
 use crate::types::{Confidence, FileInfo, FunctionInfo, Lang};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 /// Protocol family of a published operation / outbound call. `Http` rows
@@ -165,11 +165,20 @@ struct FileCtx {
     /// (file id, class name) -> path prefix from NestJS `@Controller("x")`.
     controller_prefix: FxHashMap<(u32, String), String>,
     /// (file id, class name) -> class-level Spring `@RequestMapping` prefix.
-    /// Java only: the Java query lets the class annotation ride along to the
-    /// class's first method (see `src/lang/java.rs`); Kotlin class-level
-    /// annotations are not captured at all, so Spring-Kotlin prefixes stay
-    /// unrecovered.
+    /// Both Java and Kotlin queries let the class annotation ride along to
+    /// the class's first method (see `src/lang/java.rs` and the matching
+    /// kotlin.rs pattern); the pre-pass re-keys it by `containing_type`.
     spring_prefix: FxHashMap<(u32, String), String>,
+    /// (file id, class name) -> class-level JAX-RS `@Path` prefix (Quarkus /
+    /// Micronaut / plain JEE). Same ride-along mechanics as `spring_prefix`,
+    /// gated on `javax.ws.rs` / `jakarta.ws.rs` imports in the pre-pass.
+    jaxrs_prefix: FxHashMap<(u32, String), String>,
+    /// (file id, type name) of interfaces that are declarative HTTP CLIENTS:
+    /// Spring Cloud OpenFeign `@FeignClient` and MicroProfile
+    /// `@RegisterRestClient`. Mapping annotations on their methods describe
+    /// outbound requests, so detect_spring/detect_jaxrs route them to
+    /// `client_calls` instead of `endpoints`.
+    client_iface: FxHashSet<(u32, String)>,
     /// Target file id -> mount prefix from `app.use("/api", importedRouter)`
     /// in ANOTHER file, applied to endpoints declared in the target file.
     /// `None` = conflicting prefixes seen (ambiguous — no join).
@@ -379,6 +388,37 @@ pub fn detect(
                             ctx.spring_prefix
                                 .entry((fid, t.clone()))
                                 .or_insert_with(|| spring_path_arg(d));
+                        }
+                    }
+                }
+                // JAX-RS class-level `@Path("prefix")`: same ride-along
+                // shape, gated on the ws.rs import families so a stray
+                // `@Path` annotation from another library can't seed a
+                // prefix.
+                if let (true, Some(t)) = (
+                    has(fid, &["javax.ws.rs", "jakarta.ws.rs"]),
+                    &func.containing_type,
+                ) {
+                    for d in &decorations[func.id as usize] {
+                        if d.name == "Path" && d.line < func.start_line {
+                            ctx.jaxrs_prefix
+                                .entry((fid, t.clone()))
+                                .or_insert_with(|| spring_path_arg(d));
+                        }
+                    }
+                }
+                // Declarative HTTP-client interfaces: OpenFeign
+                // `@FeignClient(...)` and MicroProfile `@RegisterRestClient`
+                // ride along from the interface declaration exactly like the
+                // prefixes above. Their mapped methods describe OUTBOUND
+                // calls, so the detectors below must not publish them as
+                // routes.
+                if let Some(t) = &func.containing_type {
+                    for d in &decorations[func.id as usize] {
+                        if (d.name == "FeignClient" || d.name == "RegisterRestClient")
+                            && d.line < func.start_line
+                        {
+                            ctx.client_iface.insert((fid, t.clone()));
                         }
                     }
                 }
@@ -1754,10 +1794,15 @@ fn detect_server(
                 }
             }
         }
-        Lang::Java => detect_spring(func, decos, has, ctx, idx),
-        Lang::Kotlin => {
-            // Spring-Kotlin shares the Java annotation shapes.
+        Lang::Java => {
             detect_spring(func, decos, has, ctx, idx);
+            detect_jaxrs(func, decos, has, ctx, idx);
+        }
+        Lang::Kotlin => {
+            // Spring-Kotlin and JAX-RS-Kotlin share the Java annotation
+            // shapes.
+            detect_spring(func, decos, has, ctx, idx);
+            detect_jaxrs(func, decos, has, ctx, idx);
             // Ktor: bare `get("/x") { ... }` verb calls inside routing
             // blocks. Route DSL lambdas are not captured as functions, so a
             // verb call and its surrounding `route("/api") { ... }` calls
@@ -1786,21 +1831,32 @@ fn detect_server(
                     if method == HttpMethod::Any {
                         continue; // skip route()/match() containers
                     }
-                    let Some(sub) = first_path_lit(call) else {
-                        continue;
-                    };
                     let mut encl: Vec<&(u32, u32, String)> = route_spans
                         .iter()
                         .filter(|(s, e, _)| *s < call.start_byte && *e >= call.end_byte)
                         .collect();
                     encl.sort_by_key(|r| r.0); // outermost first
-                    let path = encl
+                    let prefix = encl
                         .iter()
                         .fold(String::new(), |acc, (_, _, p)| join_prefix(&acc, p));
-                    let path = if path.is_empty() {
-                        sub
-                    } else {
-                        join_prefix(&path, &sub)
+                    // Ktor paths need no leading slash (`route("wish") {
+                    // post("make") }` == /wish/make), and a verb with no path
+                    // argument at all (`get { }`) binds to the enclosing
+                    // route's own path. Both shapes are only trusted INSIDE a
+                    // route(...) span — a bare `get("token")` call with no
+                    // route evidence around it is more likely a map lookup
+                    // than a route.
+                    let sub = first_str_lit(call);
+                    let path = match (sub, prefix.is_empty()) {
+                        (Some(s), true) => {
+                            if !s.starts_with('/') {
+                                continue;
+                            }
+                            s
+                        }
+                        (Some(s), false) => join_prefix(&prefix, &s),
+                        (None, false) => prefix,
+                        (None, true) => continue,
                     };
                     let Some(norm) = normalize_path(&path) else {
                         continue;
@@ -2135,14 +2191,16 @@ fn detect_server(
 
 /// Spring annotations, shared between Java and Kotlin sources.
 ///
-/// Class-level `@RequestMapping` prefixes are recovered for JAVA only, via
-/// the ride-along association set up in `src/lang/java.rs` and keyed by
-/// `containing_type` in the pre-pass (`FileCtx::spring_prefix`). A ride-along
-/// annotation is recognized here by its line preceding the method declaration
-/// (method-level annotations sit inside the declaration node) and is skipped
-/// as a route of its own. Kotlin class-level annotations are not captured by
-/// the Kotlin query at all, so Spring-Kotlin method paths are still emitted
-/// without their class prefix.
+/// Class-level `@RequestMapping` prefixes are recovered via the ride-along
+/// association set up in `src/lang/java.rs` / `src/lang/kotlin.rs` and keyed
+/// by `containing_type` in the pre-pass (`FileCtx::spring_prefix`). A
+/// ride-along annotation is recognized here by its line preceding the method
+/// declaration (method-level annotations sit inside the declaration node) and
+/// is skipped as a route of its own.
+///
+/// Methods of an OpenFeign `@FeignClient` interface (`FileCtx::client_iface`)
+/// carry the same mapping annotations but describe OUTBOUND requests — they
+/// are pushed as client calls (library "feign") instead of endpoints.
 fn detect_spring(
     func: &FunctionInfo,
     decos: &[RawDecoration],
@@ -2187,28 +2245,137 @@ fn detect_spring(
         } else {
             vec![method]
         };
-        let path = spring_path_arg(d);
         let prefix = func
             .containing_type
             .as_ref()
             .and_then(|t| ctx.spring_prefix.get(&(fid, t.clone())));
-        // Joined prefixes stay Heuristic: the ride-along association can
-        // mis-key when a mapped class declares no methods.
+        let is_client = func
+            .containing_type
+            .as_ref()
+            .is_some_and(|t| ctx.client_iface.contains(&(fid, t.clone())));
+        for path in spring_path_args(d) {
+            // Joined prefixes stay Heuristic: the ride-along association can
+            // mis-key when a mapped class declares no methods.
+            let (path, conf) = match prefix {
+                Some(p) => (join_prefix(p, &path), Confidence::Heuristic),
+                None => (ensure_slash(&path), Confidence::High),
+            };
+            let Some(norm) = normalize_path(&path) else {
+                continue;
+            };
+            for m in &methods {
+                if is_client {
+                    idx.client_calls.push(ClientCall {
+                        id: idx.client_calls.len() as u32,
+                        kind: ApiKind::Http,
+                        method: *m,
+                        url_raw: path.clone(),
+                        path_norm: norm.clone(),
+                        library: "feign".into(),
+                        caller: func.id,
+                        file_id: fid,
+                        line: d.line,
+                        confidence: conf,
+                    });
+                } else {
+                    idx.endpoints.push(Endpoint {
+                        id: idx.endpoints.len() as u32,
+                        kind: ApiKind::Http,
+                        method: *m,
+                        path_raw: path.clone(),
+                        path_norm: norm.clone(),
+                        framework: "spring".into(),
+                        file_id: fid,
+                        line: d.line,
+                        handler: Some(func.id),
+                        confidence: conf,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// JAX-RS (Quarkus / Micronaut / plain JEE) resource annotations, shared
+/// between Java and Kotlin sources: a bare verb marker (`@GET`, `@POST`, ...)
+/// on the method plus an optional method-level `@Path("sub")`, composed onto
+/// the class-level `@Path("prefix")` recovered ride-along-style into
+/// `FileCtx::jaxrs_prefix`. JAX-RS paths conventionally omit the leading
+/// slash (`@Path("fruits")`, `@Path("{id}")`); `ensure_slash`/`join_prefix`
+/// re-anchor them.
+///
+/// MicroProfile rest-client interfaces (`@RegisterRestClient`, in
+/// `FileCtx::client_iface`) use the identical annotation surface for
+/// OUTBOUND requests and are pushed as client calls (library "rest-client")
+/// instead.
+fn detect_jaxrs(
+    func: &FunctionInfo,
+    decos: &[RawDecoration],
+    has: &dyn Fn(u32, &[&str]) -> bool,
+    ctx: &FileCtx,
+    idx: &mut EndpointIndex,
+) {
+    let fid = func.file_id;
+    if !has(fid, &["javax.ws.rs", "jakarta.ws.rs"]) {
+        return;
+    }
+    // Method-level decorations only (class-level ride-alongs precede the
+    // declaration and arrive via jaxrs_prefix / client_iface instead).
+    let method_decos = || decos.iter().filter(|d| d.line >= func.start_line);
+    let sub = method_decos()
+        .find(|d| d.name == "Path")
+        .map(|d| spring_path_arg(d))
+        .unwrap_or_default();
+    let prefix = func
+        .containing_type
+        .as_ref()
+        .and_then(|t| ctx.jaxrs_prefix.get(&(fid, t.clone())));
+    let is_client = func
+        .containing_type
+        .as_ref()
+        .is_some_and(|t| ctx.client_iface.contains(&(fid, t.clone())));
+    for d in method_decos() {
+        // Uppercase gate: `from_name` is case-insensitive, but only the
+        // all-caps forms are the JAX-RS verb annotations.
+        if d.name.chars().any(|c| c.is_ascii_lowercase()) {
+            continue;
+        }
+        let Some(method) = HttpMethod::from_name(&d.name) else {
+            continue;
+        };
+        if method == HttpMethod::Any {
+            continue;
+        }
+        // Joined prefixes stay Heuristic (ride-along mis-key caveat, see
+        // detect_spring).
         let (path, conf) = match prefix {
-            Some(p) => (join_prefix(p, &path), Confidence::Heuristic),
-            None => (ensure_slash(&path), Confidence::High),
+            Some(p) => (join_prefix(p, &sub), Confidence::Heuristic),
+            None => (ensure_slash(&sub), Confidence::High),
         };
         let Some(norm) = normalize_path(&path) else {
             continue;
         };
-        for m in methods {
+        if is_client {
+            idx.client_calls.push(ClientCall {
+                id: idx.client_calls.len() as u32,
+                kind: ApiKind::Http,
+                method,
+                url_raw: path,
+                path_norm: norm,
+                library: "rest-client".into(),
+                caller: func.id,
+                file_id: fid,
+                line: d.line,
+                confidence: conf,
+            });
+        } else {
             idx.endpoints.push(Endpoint {
                 id: idx.endpoints.len() as u32,
                 kind: ApiKind::Http,
-                method: m,
-                path_raw: path.clone(),
-                path_norm: norm.clone(),
-                framework: "spring".into(),
+                method,
+                path_raw: path,
+                path_norm: norm,
+                framework: "jaxrs".into(),
                 file_id: fid,
                 line: d.line,
                 handler: Some(func.id),
@@ -2221,14 +2388,31 @@ fn detect_spring(
 /// Path argument of a Spring mapping annotation: first positional / `value` /
 /// `path` string literal, defaulting to "/".
 fn spring_path_arg(d: &RawDecoration) -> String {
-    d.arg_lits
+    spring_path_args(d)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "/".to_string())
+}
+
+/// ALL path arguments of a Spring mapping annotation — `@GetMapping({"/a",
+/// "/b"})` and `@RequestMapping(value = {"/a", "/b"}, ...)` declare one route
+/// per array member, and the harvester surfaces each member as its own
+/// Str lit (same index, same key). Defaults to a single "/".
+fn spring_path_args(d: &RawDecoration) -> Vec<String> {
+    let paths: Vec<String> = d
+        .arg_lits
         .iter()
-        .find(|l| {
+        .filter(|l| {
             l.kind == LitKind::Str
                 && matches!(l.key.as_deref(), None | Some("value") | Some("path"))
         })
         .map(|l| l.text.clone())
-        .unwrap_or_else(|| "/".to_string())
+        .collect();
+    if paths.is_empty() {
+        vec!["/".to_string()]
+    } else {
+        paths
+    }
 }
 
 /// Prefix path from a Symfony class-level docblock `@Route` decoration. The
