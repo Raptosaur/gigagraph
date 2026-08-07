@@ -24,6 +24,12 @@ pub struct RawCall {
     /// Distilled literal/identifier arguments (capped); fuels endpoint and
     /// client-call detection without keeping full argument text.
     pub arg_lits: Vec<ArgLit>,
+    /// Generic type arguments at the call site (`AddScoped<IStore, DbStore>()`),
+    /// captured via `@call.typearg` (repeatable). Simple identifier names only
+    /// — qualified/generic/predefined type args are not captured. Fuels .NET
+    /// DI-binding detection in graph.rs.
+    #[serde(default)]
+    pub type_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +126,7 @@ struct Caps {
     call_name: Option<u32>,
     call_recv: Option<u32>,
     call_args: Option<u32>,
+    call_typearg: Option<u32>,
     import: Option<u32>,
     import_path: Option<u32>,
     import_path_system: Option<u32>,
@@ -153,6 +160,7 @@ impl Caps {
             call_name: idx("call.name"),
             call_recv: idx("call.recv"),
             call_args: idx("call.args"),
+            call_typearg: idx("call.typearg"),
             import: idx("import"),
             import_path: idx("import.path"),
             import_path_system: idx("import.path.system"),
@@ -208,6 +216,7 @@ struct CallCand<'t> {
     name: String,
     recv: Option<Node<'t>>,
     args: Option<Node<'t>>,
+    type_args: Vec<String>,
 }
 
 pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
@@ -264,6 +273,21 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
                     name_node.start_byte() as u32,
                 );
                 let recv = get(caps.call_recv);
+                // `@call.typearg` is repeatable: collect ALL captures with
+                // that index in this match (not just the first, as `get`
+                // would). Quantified captures may also arrive split across
+                // several matches of the same pattern — the dedupe below
+                // merges them in match order.
+                let type_args: Vec<String> = caps
+                    .call_typearg
+                    .map(|w| {
+                        m.captures
+                            .iter()
+                            .filter(|c| c.index == w)
+                            .map(|c| node_text(c.node, source))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 match call_slots.get(&key) {
                     Some(&slot) => {
                         // Same call matched by several patterns (e.g. with and
@@ -274,6 +298,15 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
                         if calls[slot].args.is_none() {
                             calls[slot].args = get(caps.call_args);
                         }
+                        // Extend, not replace: quantifier expansions of the
+                        // same call can surface one type arg per match.
+                        // (Literal duplicate type args collapse — acceptable,
+                        // DI detection needs distinct (abstract, concrete).)
+                        for t in type_args {
+                            if !calls[slot].type_args.contains(&t) {
+                                calls[slot].type_args.push(t);
+                            }
+                        }
                     }
                     None => {
                         call_slots.insert(key, calls.len());
@@ -282,6 +315,7 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
                             name: node_text(name_node, source),
                             recv,
                             args: get(caps.call_args),
+                            type_args,
                         });
                     }
                 }
@@ -316,12 +350,22 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
             let key = (deco_node.start_byte() as u32, deco_node.end_byte() as u32);
             if seen_decos.insert(key) {
                 if let Some(name_node) = get(caps.deco_name) {
+                    let deco_name = node_text(name_node, source);
+                    let mut arg_lits = get(caps.deco_args)
+                        .map(|a| harvest_arg_lits(spec, a, source))
+                        .unwrap_or_default();
+                    // NestJS `@Module({providers: [{provide, useClass}]})`
+                    // provider objects sit below the generic harvest depth;
+                    // a targeted secondary walk surfaces them.
+                    if deco_name == "Module" {
+                        if let Some(a) = get(caps.deco_args) {
+                            harvest_module_providers(spec, a, source, &mut arg_lits);
+                        }
+                    }
                     decos.push(DecoCand {
                         deco: RawDecoration {
-                            name: node_text(name_node, source),
-                            arg_lits: get(caps.deco_args)
-                                .map(|a| harvest_arg_lits(spec, a, source))
-                                .unwrap_or_default(),
+                            name: deco_name,
+                            arg_lits,
                             line: deco_node.start_position().row as u32 + 1,
                         },
                         end_byte: deco_node.end_byte() as u32,
@@ -430,6 +474,7 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
                 .args
                 .map(|a| harvest_arg_lits(spec, a, source))
                 .unwrap_or_default(),
+            type_args: c.type_args.clone(),
         };
         // Walk backwards from the last function starting at/before `pos`;
         // the first one whose range contains the call is the innermost.
@@ -722,6 +767,69 @@ fn harvest_arg_lits(spec: &LangSpec, args: Node, source: &str) -> Vec<ArgLit> {
         }
     }
     out
+}
+
+/// Targeted deep harvest for NestJS `@Module({providers: [{provide: X,
+/// useClass: Y}]})`: the provider objects sit at depth 3 (args -> object ->
+/// providers pair -> array -> object), below `harvest_arg_lits`' reach. For a
+/// decoration named `Module`, walk the args node down to the `providers`
+/// array and emit each provider object's `provide`/`useClass` values as a
+/// synthetic keyed Ident pair. Both lits of one provider share an `index`
+/// (the provider ordinal), which is how graph.rs pairs them back up.
+/// Deliberately appended OUTSIDE the MAX_ARG_LITS cap: a long providers array
+/// must not evict real signal, and these keyed lits are ignored by every
+/// positional consumer (they carry keys no detector matches).
+fn harvest_module_providers(spec: &LangSpec, args: Node, source: &str, out: &mut Vec<ArgLit>) {
+    const MAX_PROVIDERS: u16 = 16;
+    let mut provider_idx: u16 = 0;
+    let mut c0 = args.walk();
+    for obj in args.children(&mut c0).filter(|c| c.is_named()) {
+        let mut c1 = obj.walk();
+        for pair in obj.children(&mut c1).filter(|c| c.is_named()) {
+            let mut c2 = pair.walk();
+            let kv: Vec<Node> = pair.children(&mut c2).filter(|c| c.is_named()).collect();
+            if kv.len() < 2 || strip_quotes(&node_text(kv[0], source)) != "providers" {
+                continue;
+            }
+            let mut c3 = kv[1].walk();
+            for provider in kv[1].children(&mut c3).filter(|c| c.is_named()) {
+                if provider_idx >= MAX_PROVIDERS {
+                    return;
+                }
+                let mut c4 = provider.walk();
+                let mut provide: Option<(LitKind, String)> = None;
+                let mut use_class: Option<(LitKind, String)> = None;
+                for entry in provider.children(&mut c4).filter(|c| c.is_named()) {
+                    let mut c5 = entry.walk();
+                    let ekv: Vec<Node> =
+                        entry.children(&mut c5).filter(|c| c.is_named()).collect();
+                    if ekv.len() < 2 {
+                        continue;
+                    }
+                    match strip_quotes(&node_text(ekv[0], source)).as_str() {
+                        "provide" => provide = classify_lit(spec, ekv[1], source),
+                        "useClass" => use_class = classify_lit(spec, ekv[1], source),
+                        _ => {}
+                    }
+                }
+                if let (Some(p), Some(u)) = (provide, use_class) {
+                    out.push(ArgLit {
+                        index: provider_idx,
+                        key: Some("provide".to_string()),
+                        kind: p.0,
+                        text: p.1,
+                    });
+                    out.push(ArgLit {
+                        index: provider_idx,
+                        key: Some("useClass".to_string()),
+                        kind: u.0,
+                        text: u.1,
+                    });
+                    provider_idx += 1;
+                }
+            }
+        }
+    }
 }
 
 fn classify_lit(spec: &LangSpec, node: Node, source: &str) -> Option<(LitKind, String)> {

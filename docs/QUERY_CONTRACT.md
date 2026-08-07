@@ -17,6 +17,7 @@ only the query string and the metadata lists on `LangSpec`.
 | `@call.name` | Callee simple-name node (same match, required). |
 | `@call.recv` | Optional receiver node (`obj` in `obj.m()`). Discarded if text contains `(`/newline or exceeds 48 chars. |
 | `@call.args` | Optional argument-list node. Arg count = named children. |
+| `@call.typearg` | Optional generic type argument at the call site (`AddScoped<IStore, DbStore>()`). **Repeatable**: the extractor collects every `@call.typearg` capture for the call — within one match and across quantifier-split matches of the same pattern — in order, into `RawCall.type_args` (duplicate texts collapse). Capture only simple-name nodes (bare identifiers); qualified/generic/predefined type args should simply not match. Fuels .NET DI-binding detection (`AddScoped`/`AddSingleton`/`AddTransient` with exactly two type args → `di_bindings`) in `src/graph.rs`. |
 | `@import` | Whole import/include node. Multiple query patterns may capture the same `@import` node; their `path`/`name` captures are merged by node identity. |
 | `@import.path` | Module path / header node. Surrounding quotes/angles are stripped. |
 | `@import.path.system` | Same, but marks a system include (C `<...>`). |
@@ -42,6 +43,16 @@ with kwarg/object keys captured one level down (`methods=["POST"]`,
 `{ method: "PUT" }`). Single-child wrapper nodes are unwrapped automatically.
 No query changes are needed for this — only `string_kinds` metadata.
 
+**`@Module` deep harvest**: NestJS provider objects
+(`@Module({providers: [{provide: X, useClass: Y}]})`) sit at depth 3, below
+the generic walk. For a decoration named exactly `Module`, the extractor runs
+a targeted secondary harvest of the `@deco.args` node: each provider object's
+`provide`/`useClass` values are appended as a synthetic keyed `ArgLit` pair
+sharing an `index` (the provider ordinal, how `src/graph.rs` pairs them back
+into `di_bindings`). These pairs are appended OUTSIDE the 8-lit cap so a long
+providers array cannot evict real signal; positional consumers ignore them
+(keys no detector matches). No query changes needed — it reuses `@deco.args`.
+
 Notes:
 - Patterns match **anywhere** in the tree (exported/nested/annotated wrappers
   don't need their own patterns).
@@ -57,6 +68,10 @@ Three optional capture families feed the receiver-type resolution rung in
 `src/graph.rs` (`this.userService.getUser()` narrows to `UserService`'s
 methods, expanded through interface→implementation edges). Call-side queries
 need **no changes** — `@call.recv` already carries the dotted receiver text.
+Bare two-segment receivers (`s.store.Save()` where `s` is a typed local —
+e.g. a Go method receiver) resolve through local→type→field→type, capped at
+Heuristic confidence; uppercase-initial bases (`System.out`, `Acme.Store`)
+and self-qualified multi-hop (`this.a.b`) stay excluded.
 
 | Capture | Meaning |
 |---|---|

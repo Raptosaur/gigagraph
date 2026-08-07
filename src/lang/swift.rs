@@ -62,8 +62,17 @@ use crate::types::{ImportStyle, Lang};
 //   (`inherits_from: (user_type (type_identifier))`) on `class_declaration`
 //   (class/struct alike) and `protocol_declaration` (protocol inheritance);
 //   one @hier match fires per specifier. Extension conformance
-//   (`extension Foo: Codable`) is NOT captured: the extension's `name` field
-//   is a `user_type`, not a `type_identifier`, and it declares no type.
+//   (`extension Foo: Codable`) is the same shape except the extension's
+//   `name` field is a `user_type` wrapping the extended `type_identifier`
+//   (probe-verified), so a dedicated pattern reads @hier.type from the
+//   user_type's inner identifier (`.` anchor keeps the LAST segment of a
+//   qualified `extension Foo.Bar`, matching clean_type's last-segment rule).
+// - Protocol `var x: T { get }` requirements are
+//   `protocol_property_declaration` (probe-verified) with the same
+//   `name: (pattern ...)` + `(type_annotation (user_type ...))` shape as
+//   `property_declaration`; they become @field, owned by the protocol via
+//   the TYPE_KINDS `protocol_declaration` entry. No `class_body` guard is
+//   needed — the node kind only occurs in protocol bodies.
 const QUERY: &str = r#"
 (function_declaration
   name: (simple_identifier) @func.name) @func.def
@@ -150,6 +159,15 @@ const QUERY: &str = r#"
   name: (type_identifier) @hier.type
   (inheritance_specifier
     inherits_from: (user_type (type_identifier) @hier.base)))
+
+(class_declaration
+  name: (user_type (type_identifier) @hier.type .)
+  (inheritance_specifier
+    inherits_from: (user_type (type_identifier) @hier.base)))
+
+(protocol_property_declaration
+  name: (pattern bound_identifier: (simple_identifier) @field.name)
+  (type_annotation (user_type (type_identifier) @field.type)))
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &["simple_identifier", "type_identifier"];

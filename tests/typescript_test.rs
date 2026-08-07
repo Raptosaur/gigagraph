@@ -252,6 +252,74 @@ fn captures_javascript_di_types() {
 }
 
 #[test]
+fn captures_new_expression_arguments() {
+    use gigagraph::extract::LitKind;
+
+    let src = r#"
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+const fn = new lambda.Function(this, 'Fn', {
+  handler: 'index.handler',
+  code: lambda.Code.fromAsset('assets'),
+});
+const bare = new Widget('left', 2);
+"#;
+    let file = extract_str("ts", src);
+    let top = func(&file, "(toplevel)");
+
+    // Member-form `new ns.Ctor(...)`: name from the property, receiver from
+    // the object, arguments harvested.
+    let ctor = top
+        .calls
+        .iter()
+        .find(|c| c.name == "Function")
+        .expect("member-form new_expression not captured");
+    assert_eq!(ctor.receiver.as_deref(), Some("lambda"));
+    assert_eq!(ctor.arg_count, 3, "this + id string + props object");
+    // Object props arrive as Ident-key followed by Str-value at the same
+    // argument index (the window shape endpoints.rs pairs back up).
+    let lits: Vec<(LitKind, &str)> = ctor
+        .arg_lits
+        .iter()
+        .map(|l| (l.kind, l.text.as_str()))
+        .collect();
+    assert!(
+        lits.contains(&(LitKind::Str, "Fn")),
+        "construct id missing; got {lits:?}"
+    );
+    let key_pos = lits
+        .iter()
+        .position(|l| *l == (LitKind::Ident, "handler"))
+        .unwrap_or_else(|| panic!("handler key ident missing; got {lits:?}"));
+    assert_eq!(
+        lits.get(key_pos + 1),
+        Some(&(LitKind::Str, "index.handler")),
+        "handler value must follow its key; got {lits:?}"
+    );
+
+    // The nested Code.fromAsset call still surfaces as its own call.
+    let asset = top
+        .calls
+        .iter()
+        .find(|c| c.name == "fromAsset")
+        .expect("nested fromAsset call missing");
+    assert_eq!(asset.receiver.as_deref(), Some("lambda.Code"));
+
+    // Identifier-form constructor: the name-only and with-arguments patterns
+    // both match — the extractor must merge them into ONE call, with args.
+    let widgets: Vec<_> = top.calls.iter().filter(|c| c.name == "Widget").collect();
+    assert_eq!(widgets.len(), 1, "overlapping new patterns must dedup");
+    assert_eq!(widgets[0].arg_count, 2);
+    assert!(
+        widgets[0]
+            .arg_lits
+            .iter()
+            .any(|l| l.kind == LitKind::Str && l.text == "left"),
+        "bare-new arguments not harvested: {:?}",
+        widgets[0].arg_lits
+    );
+}
+
+#[test]
 fn comments_feed_doc_features() {
     let src = "// Retry with exponential backoff.\nfunction retryBackoff(): void {\n  // jitter the delay window\n  const x = 1;\n}\n";
     let file = extract_str("ts", src);

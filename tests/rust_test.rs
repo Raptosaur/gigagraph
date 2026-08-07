@@ -149,12 +149,19 @@ fn extracts_rust_di_types() {
     assert_eq!(field_of(&file, "Service", "config"), Some("Config"));
     // Rc<T> with a plain (non-dyn) argument also unwraps.
     assert_eq!(field_of(&file, "Service", "cache"), Some("Cache"));
+    // Nested wrappers unwrap one more level: Arc<Mutex<Journal>> -> Journal.
+    assert_eq!(field_of(&file, "Service", "journal"), Some("Journal"));
+    // Generic trait object: Box<dyn Bus<Event>> keeps the base trait.
+    assert_eq!(field_of(&file, "Service", "bus"), Some("Bus"));
 
     // Typed params land as locals of their function; `&self` never does.
     let ctor = func(&file, "with_store");
     assert_eq!(local_of(ctor, "store"), Some("DbStore"));
     assert_eq!(local_of(ctor, "shared"), Some("Store"));
     assert_eq!(local_of(ctor, "config"), Some("Config"));
+    // Nested-wrapper and generic-trait-object params unwrap the same way.
+    assert_eq!(local_of(ctor, "journal"), Some("Journal"));
+    assert_eq!(local_of(ctor, "bus"), Some("Bus"));
     assert_eq!(local_of(ctor, "self"), None);
 
     // Locals: `let x = T::new()`, annotated `let x: T`, `let x: &T`, and

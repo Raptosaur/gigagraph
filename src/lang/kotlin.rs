@@ -46,10 +46,13 @@ use crate::types::{ImportStyle, Lang};
 //     whose callee is its first named child. Class-body properties become
 //     @field (the `class_body` wrapper keeps method-body locals from being
 //     promoted to fields — containing_type would find the class ancestor
-//     for those too); the unconstrained @local twins rely on the extractor
+//     for those too); `enum_class_body` holds the identical
+//     `property_declaration` shape (probe-verified), so each field pattern
+//     has an enum-body twin, and nullable properties (`val t: Tracer? =
+//     null`) unwrap `nullable_type` at the property position just like
+//     params do. The unconstrained @local twins rely on the extractor
 //     dropping bindings outside any function. Constructed captures are
-//     gated on an uppercase callee (`#match? "^[A-Z]"`). Properties in
-//     `enum_class_body` are not captured (only `class_body` is matched).
+//     gated on an uppercase callee (`#match? "^[A-Z]"`).
 //   - Supertypes live in `(delegation_specifiers (delegation_specifier ...))`
 //     on both `class_declaration` (also covers interfaces and enum classes)
 //     and `object_declaration`; the payload is a `constructor_invocation`
@@ -155,7 +158,33 @@ const QUERY: &str = r#"
       (identifier) @field.name
       (user_type (identifier) @field.type .))))
 
+(class_body
+  (property_declaration
+    (variable_declaration
+      (identifier) @field.name
+      (nullable_type (user_type (identifier) @field.type .)))))
+
 ((class_body
+  (property_declaration
+    (variable_declaration (identifier) @field.name .)
+    (call_expression
+      . (identifier) @field.type
+      (value_arguments))))
+  (#match? @field.type "^[A-Z]"))
+
+(enum_class_body
+  (property_declaration
+    (variable_declaration
+      (identifier) @field.name
+      (user_type (identifier) @field.type .))))
+
+(enum_class_body
+  (property_declaration
+    (variable_declaration
+      (identifier) @field.name
+      (nullable_type (user_type (identifier) @field.type .)))))
+
+((enum_class_body
   (property_declaration
     (variable_declaration (identifier) @field.name .)
     (call_expression

@@ -263,6 +263,17 @@ fn extracts_kotlin_di_types() {
 
     // Class-body properties: constructed initializer infers the type.
     assert_eq!(field_of(&file, "OrderService", "audit"), Some("AuditTrail"));
+    // Nullable class-body property unwraps nullable_type.
+    assert_eq!(
+        field_of(&file, "OrderService", "fallbackTracer"),
+        Some("Tracer")
+    );
+    // Enum-body properties: declared, nullable, and constructed all land as
+    // fields of the enum class (enum_class_body twins of the class_body
+    // patterns).
+    assert_eq!(field_of(&file, "Channel", "trail"), Some("AuditTrail"));
+    assert_eq!(field_of(&file, "Channel", "tracer"), Some("Tracer"));
+    assert_eq!(field_of(&file, "Channel", "made"), Some("AuditTrail"));
     // Explicitly typed property inside an object declaration; the owner is
     // the object (TYPE_KINDS covers object_declaration).
     assert_eq!(

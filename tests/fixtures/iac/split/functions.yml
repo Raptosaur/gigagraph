@@ -1,0 +1,7 @@
+# Functions fragment pulled in by split/serverless.yml.
+splitUsers:
+  handler: ../src/handlers/users.create
+  events:
+    - http:
+        path: split-users
+        method: get

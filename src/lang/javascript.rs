@@ -3,6 +3,16 @@ use crate::types::{ImportStyle, Lang};
 
 /// Query fragments shared by the JavaScript and TypeScript grammars
 /// (identical node kinds in both).
+///
+/// `new_expression` comes in three overlapping patterns: name-only (covers
+/// paren-less `new Thing;`), identifier constructor + arguments, and
+/// member-form `new ns.Ctor(...)` with receiver + arguments. The extractor
+/// dedups by (call range, name start), keeping the richest capture set, so
+/// the overlap merges instead of duplicating. Argument capture matters:
+/// CDK constructions (`new lambda.Function(this, 'X', { handler, code })`,
+/// `new NodejsFunction({ entry })`, `new appsync.Resolver({ typeName })`)
+/// carry their routing/handler props in the arguments object, which
+/// `src/endpoints.rs` reads via the Ident-key/Str-value window shape.
 pub(crate) const CORE_QUERY: &str = r#"
 (function_declaration
   name: (identifier) @func.name
@@ -41,6 +51,16 @@ pub(crate) const CORE_QUERY: &str = r#"
 
 (new_expression
   constructor: (identifier) @call.name) @call
+
+(new_expression
+  constructor: (identifier) @call.name
+  arguments: (arguments) @call.args) @call
+
+(new_expression
+  constructor: (member_expression
+    object: (_) @call.recv
+    property: (property_identifier) @call.name)
+  arguments: (arguments) @call.args) @call
 
 (import_statement
   source: (string (string_fragment) @import.path)) @import

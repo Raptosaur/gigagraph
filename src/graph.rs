@@ -46,13 +46,13 @@ pub struct GigaGraph {
     /// hierarchy edges inverted (base -> derived); DI container registrations
     /// append here as just more entries.
     pub type_bindings: FxHashMap<String, Vec<String>>,
-    /// Explicit DI container registrations (Laravel `$app->bind(A::class,
-    /// B::class)` / `singleton`): abstract -> concrete. Takes precedence over
+    /// Explicit DI container registrations: abstract -> concrete. Sources:
+    /// Laravel `$app->bind(A::class, B::class)` / `singleton`; .NET
+    /// `services.AddScoped<I, T>()` (and Singleton/Transient) via captured
+    /// call-site type args; NestJS `@Module({providers: [{provide, useClass}]})`
+    /// via the extractor's targeted deep harvest. Takes precedence over
     /// hierarchy expansion — the container names THE implementation, so a
     /// unique entry resolves High even when several implementors exist.
-    /// (NestJS `{provide, useClass}` objects sit below the arg-lit harvest
-    /// depth and stay invisible; .NET `AddScoped<I,T>` type args are not
-    /// captured — documented gaps.)
     pub di_bindings: FxHashMap<String, Vec<String>>,
 }
 
@@ -196,37 +196,102 @@ impl GigaGraph {
             v.dedup();
         }
 
-        // Laravel container registrations: `$this->app->bind(A::class,
-        // B::class)` arrives as per-index Ident pairs (the `::class` suffix is
-        // a separate "class" Ident at the same index). String-keyed
-        // registrations (`singleton('cache', ...)`) carry no abstract type
-        // and are skipped.
+        // ---- DI container registrations -> di_bindings ----
         for (fn_id, calls) in raw_calls.iter().enumerate() {
-            if g.functions[fn_id].language != Lang::Php {
+            match g.functions[fn_id].language {
+                // Laravel: `$this->app->bind(A::class, B::class)` arrives as
+                // per-index Ident pairs (the `::class` suffix is a separate
+                // "class" Ident at the same index). String-keyed
+                // registrations (`singleton('cache', ...)`) carry no abstract
+                // type and are skipped.
+                Lang::Php => {
+                    for call in calls {
+                        if !matches!(call.name.as_str(), "bind" | "singleton")
+                            || !call.receiver.as_deref().is_some_and(|r| r.contains("app"))
+                        {
+                            continue;
+                        }
+                        let ident_at = |i: u16| {
+                            call.arg_lits.iter().find(|l| {
+                                l.index == i
+                                    && l.kind == crate::extract::LitKind::Ident
+                                    && l.text != "class"
+                                    && l.text.chars().next().is_some_and(|c| c.is_uppercase())
+                            })
+                        };
+                        if let (Some(a), Some(c)) = (ident_at(0), ident_at(1)) {
+                            g.di_bindings
+                                .entry(a.text.clone())
+                                .or_default()
+                                .push(c.text.clone());
+                        }
+                    }
+                }
+                // .NET: `services.AddScoped<IUserStore, DbUserStore>()` (and
+                // Singleton/Transient). The captured type args are simple
+                // names only, so exactly-two means (abstract, concrete);
+                // factory/instance overloads carry 0 or 1 and are skipped.
+                Lang::CSharp => {
+                    for call in calls {
+                        if matches!(
+                            call.name.as_str(),
+                            "AddScoped" | "AddSingleton" | "AddTransient"
+                        ) && call.type_args.len() == 2
+                        {
+                            g.di_bindings
+                                .entry(call.type_args[0].clone())
+                                .or_default()
+                                .push(call.type_args[1].clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // NestJS: `@Module({providers: [{provide: A, useClass: B}]})`. The
+        // extractor's targeted deep harvest emits each provider object as a
+        // keyed provide/useClass Ident pair sharing an index — pair them back
+        // up here. (Class decorators attach to the class's first method, or
+        // the file's synthetic toplevel when none follows; either way the
+        // decoration is on SOME function, so scanning all of them finds it.)
+        for (fn_id, decos) in decorations.iter().enumerate() {
+            if !matches!(
+                g.functions[fn_id].language,
+                Lang::TypeScript | Lang::Tsx | Lang::JavaScript
+            ) {
                 continue;
             }
-            for call in calls {
-                if !matches!(call.name.as_str(), "bind" | "singleton")
-                    || !call.receiver.as_deref().is_some_and(|r| r.contains("app"))
-                {
+            for d in decos {
+                if d.name != "Module" {
                     continue;
                 }
-                let ident_at = |i: u16| {
-                    call.arg_lits.iter().find(|l| {
-                        l.index == i
+                for lit in &d.arg_lits {
+                    if lit.key.as_deref() != Some("provide")
+                        || lit.kind != crate::extract::LitKind::Ident
+                        || !lit.text.chars().next().is_some_and(|c| c.is_uppercase())
+                    {
+                        continue;
+                    }
+                    if let Some(u) = d.arg_lits.iter().find(|l| {
+                        l.index == lit.index
+                            && l.key.as_deref() == Some("useClass")
                             && l.kind == crate::extract::LitKind::Ident
-                            && l.text != "class"
                             && l.text.chars().next().is_some_and(|c| c.is_uppercase())
-                    })
-                };
-                if let (Some(a), Some(c)) = (ident_at(0), ident_at(1)) {
-                    g.di_bindings
-                        .entry(a.text.clone())
-                        .or_default()
-                        .push(c.text.clone());
+                    }) {
+                        g.di_bindings
+                            .entry(lit.text.clone())
+                            .or_default()
+                            .push(u.text.clone());
+                    }
                 }
             }
         }
+        // Spring `@Bean` methods are deliberately NOT mined here: the query
+        // does not capture method return types, so a @Bean method's abstract
+        // side is unknown. Guessing it from a `new Concrete(...)` call in the
+        // body would only re-derive what hierarchy expansion (type_bindings)
+        // already provides, without the container's disambiguating authority
+        // — skipped until return types are captured.
         for v in g.di_bindings.values_mut() {
             v.sort_unstable();
             v.dedup();
@@ -1081,8 +1146,9 @@ fn resolve_call(
 /// Split a receiver expression into (is_self_qualified, binding name):
 /// `this.userService` -> (true, "userService"); `$this->repo` -> (true,
 /// "repo"); `self.users` -> (true, "users"); `userService` -> (false, ..).
-/// Multi-hop (`this.a.b`) and subscripted receivers are rejected — one hop
-/// is all the field table can answer.
+/// Multi-hop (`this.a.b`) and subscripted receivers are rejected here; bare
+/// two-segment receivers (`s.store`) get a dedicated two-hop path in
+/// `resolve_via_type`.
 fn receiver_binding(recv: &str) -> Option<(bool, &str)> {
     for (prefix, sep) in [("this", "."), ("self", "."), ("$this", "->"), ("Self", "::")] {
         if let Some(rest) = recv.strip_prefix(prefix).and_then(|r| r.strip_prefix(sep)) {
@@ -1103,6 +1169,10 @@ fn field_type<'a>(g: &'a GigaGraph, owner: &str, field: &str) -> Option<&'a str>
 /// self-qualified receivers, locals/params then fields for bare ones) ->
 /// methods of that type, expanded through type_bindings
 /// (interface -> implementations, container registrations).
+///
+/// Two-hop dotted receivers (`s.store.Save()` where `s` is a typed local —
+/// Go method receivers land in the locals table) resolve through
+/// local -> type -> field -> type, capped at Heuristic confidence.
 fn resolve_via_type(
     g: &GigaGraph,
     caller: &FunctionInfo,
@@ -1110,20 +1180,43 @@ fn resolve_via_type(
     recv: &str,
     name: &str,
 ) -> Option<Resolution> {
-    let (self_qualified, binding) = receiver_binding(recv)?;
-
-    let ty: &str = if self_qualified {
-        let owner = caller.containing_type.as_deref()?;
-        field_type(g, owner, binding)?
-    } else {
-        // Bare receivers starting uppercase are static-style (`Bar.baz()`) —
-        // leave them to the existing static rung.
-        if binding.chars().next().is_some_and(|c| c.is_uppercase()) {
-            return None;
+    let mut two_hop = false;
+    let ty: &str = match receiver_binding(recv) {
+        Some((self_qualified, binding)) => {
+            if self_qualified {
+                let owner = caller.containing_type.as_deref()?;
+                field_type(g, owner, binding)?
+            } else {
+                // Bare receivers starting uppercase are static-style
+                // (`Bar.baz()`) — leave them to the existing static rung.
+                if binding.chars().next().is_some_and(|c| c.is_uppercase()) {
+                    return None;
+                }
+                match locals.iter().find(|(n, _)| n == binding) {
+                    Some((_, t)) => t.as_str(),
+                    None => field_type(g, caller.containing_type.as_deref()?, binding)?,
+                }
+            }
         }
-        match locals.iter().find(|(n, _)| n == binding) {
-            Some((_, t)) => t.as_str(),
-            None => field_type(g, caller.containing_type.as_deref()?, binding)?,
+        // Two-hop: exactly one dot, lowercase-initial base that is a typed
+        // local/param, plain field segment. The uppercase guard keeps
+        // `System.out` / `Acme.Store` static-style receivers out; the
+        // self-variant check keeps `this.a.b` (genuinely multi-hop) out;
+        // `->`/`::` receivers never contain a bare `.` and are unaffected.
+        None => {
+            let (base, field) = recv.split_once('.')?;
+            if base.is_empty()
+                || field.is_empty()
+                || base.contains(['-', ':', '[', '$'])
+                || field.contains(['.', '-', ':', '[', '$'])
+                || matches!(base, "this" | "self" | "Self")
+                || base.chars().next().is_some_and(|c| c.is_uppercase())
+            {
+                return None;
+            }
+            let (_, t1) = locals.iter().find(|(n, _)| n == base)?;
+            two_hop = true;
+            field_type(g, t1, field)?
         }
     };
 
@@ -1164,12 +1257,15 @@ fn resolve_via_type(
     });
 
     // Overloads within the declared type itself stay High (Java/C#);
-    // multi-implementor interface fan-out is honest Heuristic.
+    // multi-implementor interface fan-out is honest Heuristic. Two-hop
+    // receivers are capped at Heuristic regardless — two table lookups.
     let declared_only = g
         .type_index
         .get(ty)
         .is_some_and(|ids| ids.iter().any(|&id| g.functions[id as usize].name == name));
-    let conf = if hits.len() == 1 || declared_only {
+    let conf = if two_hop {
+        Confidence::Heuristic
+    } else if hits.len() == 1 || declared_only {
         Confidence::High
     } else {
         Confidence::Heuristic

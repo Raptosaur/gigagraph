@@ -299,6 +299,12 @@ fn extracts_java_di_type_captures() {
     );
     assert_eq!(field_of(&file, "SignupService", "mailer"), Some("Mailer"));
     assert_eq!(field_of(&file, "SignupService", "pending"), Some("List"));
+    // Qualified field type: the whole `com.acme.Notifier` scoped node is
+    // captured and clean_type keeps the last segment.
+    assert_eq!(
+        field_of(&file, "SignupService", "notifier"),
+        Some("Notifier")
+    );
     // Primitive fields (`int retries`) are not type-captured.
     assert_eq!(field_of(&file, "SignupService", "retries"), None);
 
@@ -315,6 +321,12 @@ fn extracts_java_di_type_captures() {
     assert_eq!(local_of(register, "clock"), Some("Clock"));
     // The method's own typed param is a local too.
     assert_eq!(local_of(register, "user"), Some("String"));
+
+    // Generic-typed param and local capture the container's simple name,
+    // same as the generic field pattern.
+    let enqueue = func(&file, "enqueue");
+    assert_eq!(local_of(enqueue, "tags"), Some("List"));
+    assert_eq!(local_of(enqueue, "index"), Some("Map"));
 
     // The receiver call the field type is meant to resolve.
     assert_eq!(

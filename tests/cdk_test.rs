@@ -79,9 +79,9 @@ fn detects_ts_cdk_stack() {
     let users = find(&idx, HttpMethod::Get, "/users", "stack.ts");
     assert_eq!(users.framework, "cdk");
     assert_eq!(users.confidence, Confidence::Heuristic);
-    // File-scope lambda heuristic: handler resolved through the fromAsset
-    // dir + Lambda's index.handler convention (TS constructor props are
-    // invisible to the extractor).
+    // File-scope lambda heuristic: the `new lambda.Function` construction's
+    // handler prop ('index.handler') resolved against the byte-contained
+    // fromAsset dir.
     assert_eq!(handler_name(&idx, users), "handler");
     let show = find(&idx, HttpMethod::Delete, "/users/{*}", "stack.ts");
     assert_eq!(show.confidence, Confidence::Heuristic);
@@ -95,8 +95,9 @@ fn detects_ts_cdk_stack() {
     assert_eq!(books.confidence, Confidence::Heuristic);
     assert_eq!(handler_name(&idx, books), "handler");
 
-    // HTTP API v2 addRoutes: TS object-literal array members are not
+    // HTTP API v2 addRoutes: TS MULTI-member methods arrays are not
     // harvested, so methods degrade honestly to ANY (path stays literal).
+    // Single-member arrays do surface — see detects_ts_v2_constructs.
     let orders = find(&idx, HttpMethod::Any, "/orders", "stack.ts");
     assert_eq!(orders.framework, "cdk");
     assert_eq!(handler_name(&idx, orders), "handler");
@@ -120,6 +121,52 @@ fn detects_ts_cdk_stack() {
         idx.graph.files[idx.graph.functions[hid as usize].file_id as usize].path,
         "lambda/index.ts"
     );
+}
+
+#[test]
+fn detects_ts_v2_constructs() {
+    let idx = index();
+
+    // NodejsFunction: `entry` IS the handler source file, `handler` names
+    // the export — resolved without any fromAsset call in the file.
+    // LambdaRestApi (member form) proxies everything to it: ANY /{*},
+    // Heuristic because the handler is the borrowed file-scope lambda.
+    let proxy = find(&idx, HttpMethod::Any, "/{*}", "v2app.ts");
+    assert_eq!(proxy.framework, "cdk");
+    assert_eq!(proxy.confidence, Confidence::Heuristic);
+    assert_eq!(handler_name(&idx, proxy), "main");
+    let hid = proxy.handler.unwrap();
+    assert_eq!(
+        idx.graph.files[idx.graph.functions[hid as usize].file_id as usize].path,
+        "fns/orders.ts"
+    );
+
+    // addRoutes with a SINGLE-member methods array: the lone member is
+    // unwrapped by the harvester, so the row is per-method, not ANY.
+    let reports = find(&idx, HttpMethod::Patch, "/v2reports", "v2app.ts");
+    assert_eq!(reports.framework, "cdk");
+    assert_eq!(handler_name(&idx, reports), "main");
+    assert!(
+        !idx.graph
+            .endpoints
+            .endpoints
+            .iter()
+            .any(|e| e.method == HttpMethod::Any && e.path_norm == "/v2reports"),
+        "single-member methods array must not also widen to ANY"
+    );
+
+    // TS L1 CfnRoute: literal 'GET /v2items' routeKey via the
+    // Ident-key/Str-value window.
+    let items = find(&idx, HttpMethod::Get, "/v2items", "v2app.ts");
+    assert_eq!(items.framework, "cdk");
+    assert_eq!(items.confidence, Confidence::Heuristic);
+    assert_eq!(handler_name(&idx, items), "main");
+
+    // TS `new appsync.Resolver({ typeName, fieldName })` L2 construct.
+    let status = find_rpc(&idx, ApiKind::Graphql, "/query.orderstatus");
+    assert_eq!(status.framework, "cdk-appsync");
+    assert_eq!(status.method, HttpMethod::Any);
+    assert_eq!(handler_name(&idx, status), "main");
 }
 
 #[test]

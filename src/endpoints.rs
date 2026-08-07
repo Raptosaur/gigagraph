@@ -151,6 +151,12 @@ pub struct EndpointIndex {
 
 const VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
 
+/// Silex evidence: the framework import itself, or any `*ControllerProvider`
+/// import — provider classes routinely extend a project base provider and
+/// never import Silex directly (the interface import lives in the base). A
+/// same-namespace `extends` with no `use` at all stays undetectable.
+const SILEX_EV: &[&str] = &["silex", "controllerprovider"];
+
 /// Cross-function facts gathered in a pre-pass over the whole file set.
 #[derive(Default)]
 struct FileCtx {
@@ -380,7 +386,7 @@ pub fn detect(
                 // Known gap: collection routes declared in a different
                 // function (provider classes) key on a different local and
                 // stay unprefixed.
-                if has(fid, &["silex"]) {
+                if has(fid, SILEX_EV) {
                     for call in calls {
                         if call.name != "mount" || call.receiver.as_deref() != Some("$app") {
                             continue;
@@ -1303,7 +1309,7 @@ fn detect_server(
                     }
                 }
             }
-            let silex = has(fid, &["silex"]);
+            let silex = has(fid, SILEX_EV);
             // Slim (classic PHP micro-framework): $app->get('/x', ...).
             // Slim's own `$app->group('/p', ...)` prefixes are not joined
             // (different chain shape from Laravel's, no fixture demand yet).
@@ -1984,16 +1990,19 @@ fn php_const_path(call: &RawCall, fid: u32, ctx: &FileCtx) -> Option<String> {
 /// operation name). Framework "cdk" / "cdk-appsync".
 ///
 /// Extraction constraints this is designed around (all verified empirically):
-/// TS `new ns.Ctor(...)` new-expressions are not captured at all and bare
-/// `new Ctor(...)` ones carry no arguments, so on the TS side construction
-/// props (Lambda `handler:`, `NodejsFunction` `entry:`, `new
-/// appsync.Resolver` fields) are invisible — detection leans on the METHOD
-/// calls (`addMethod`, `addRoutes`, `createResolver`, `Code.fromAsset`),
-/// which arrive complete. TS object-literal fields surface as
-/// Ident-key/Str-value pairs (`str_lit_by_key` handles them) but array
-/// members inside those objects do NOT surface, so `methods: [HttpMethod.GET]`
-/// yields nothing and TS `addRoutes` rows fall back to ANY. Python calls
-/// arrive complete with kwargs, including `methods=[HttpMethod.GET]` idents.
+/// TS/JS new-expressions — both bare `new Ctor(...)` and member-form
+/// `new ns.Ctor(...)` — arrive complete with their arguments, so
+/// construction props (Lambda `handler:`, `NodejsFunction` `entry:`, `new
+/// appsync.Resolver` fields, `CfnRoute` routeKey) are visible alongside the
+/// METHOD calls (`addMethod`, `addRoutes`, `createResolver`,
+/// `Code.fromAsset`). TS object-literal fields surface as
+/// Ident-key/Str-value pairs (`str_lit_by_key` re-pairs them). Array members
+/// inside those objects sit one level too deep for the harvester UNLESS the
+/// array has exactly one element (single-child wrappers are unwrapped), so
+/// `methods: [HttpMethod.GET]` surfaces as an Ident right after the
+/// `methods` key ident while `methods: [GET, POST]` yields nothing and the
+/// TS `addRoutes` row honestly widens to ANY. Python calls arrive complete
+/// with kwargs, including full `methods=[HttpMethod.GET, ...]` ident lists.
 fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut EndpointIndex) {
     let fid = func.file_id;
     let file_lambda = ctx.cdk_lambda.get(&fid).copied().flatten();
@@ -2095,10 +2104,11 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                     Confidence::Heuristic,
                 );
             }
-            // LambdaRestApi proxies EVERY method+path to one lambda. Python
-            // constructions arrive complete; on the TS side only the bare
-            // `new LambdaRestApi(...)` named-import form surfaces (name-only),
-            // the `new apigateway.LambdaRestApi(...)` form not at all.
+            // LambdaRestApi proxies EVERY method+path to one lambda. Both
+            // Python constructions and TS new-expressions (bare and
+            // `new apigateway.LambdaRestApi(...)` member form) surface; the
+            // `handler:` prop is an ident (dataflow), so the handler is the
+            // borrowed file-scope lambda either way.
             "LambdaRestApi" => {
                 let (handler, conf) = bind(Confidence::High);
                 push_endpoint(
@@ -2122,9 +2132,12 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                     continue;
                 };
                 // Python kwarg: methods=[HttpMethod.GET, ...] arrives as
-                // `methods`-keyed Idents. TS array members are unharvested
-                // (see fn doc), so TS rows honestly widen to ANY.
-                let listed: Vec<HttpMethod> = call
+                // `methods`-keyed Idents. TS: only a single-member array
+                // survives harvesting, unwrapped to an unkeyed Ident right
+                // after the `methods` key ident (see fn doc) — consume that
+                // run until a non-verb ident (the next prop key) stops it.
+                // Multi-member TS arrays yield nothing -> honest ANY.
+                let mut listed: Vec<HttpMethod> = call
                     .arg_lits
                     .iter()
                     .filter(|l| l.key.as_deref() == Some("methods") && l.kind == LitKind::Ident)
@@ -2132,6 +2145,24 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                         l.text.rsplit('.').next().and_then(HttpMethod::from_name)
                     })
                     .collect();
+                if listed.is_empty() {
+                    if let Some(pos) = call.arg_lits.iter().position(|l| {
+                        l.kind == LitKind::Ident && l.key.is_none() && l.text == "methods"
+                    }) {
+                        let key_index = call.arg_lits[pos].index;
+                        listed = call.arg_lits[pos + 1..]
+                            .iter()
+                            .take_while(|l| {
+                                l.index == key_index
+                                    && l.key.is_none()
+                                    && l.kind == LitKind::Ident
+                            })
+                            .map_while(|l| {
+                                l.text.rsplit('.').next().and_then(HttpMethod::from_name)
+                            })
+                            .collect();
+                    }
+                }
                 let (handler, conf) = bind(Confidence::High);
                 for m in if listed.is_empty() {
                     vec![HttpMethod::Any]
@@ -2168,10 +2199,11 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
             }
             // L1 escape hatch (CDK v1-era code): CfnRoute carries a literal
             // "VERB /path" route key. Python constructions surface with
-            // kwargs; the TS `new apigwv2.CfnRoute(...)` form never reaches
-            // the extractor (see fn doc), so this arm is Python-only in
-            // practice. The Target integration chain is invisible, so the
-            // handler is the usual borrowed file-scope lambda.
+            // kwargs; TS `new apigwv2.CfnRoute(...)` member-form
+            // constructions surface with their props object (routeKey as an
+            // Ident-key/Str-value window). The Target integration chain is
+            // invisible either way, so the handler is the usual borrowed
+            // file-scope lambda.
             "CfnRoute" => {
                 let Some(rk) = str_lit_by_key(call, &["route_key", "routeKey"]) else {
                     continue;
@@ -2196,10 +2228,11 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
             }
             // AppSync resolvers: ds.createResolver('id', { typeName,
             // fieldName }) / options-only arity / Python create_resolver
-            // kwargs / Python `appsync.Resolver(...)` constructions (the TS
-            // `new appsync.Resolver` form never surfaces — see fn doc) /
-            // Python L1 `appsync.CfnResolver(type_name=, field_name=)`. The
-            // op is "Type.field", correlating by name on the RPC branch.
+            // kwargs / `appsync.Resolver(...)` constructions in BOTH
+            // languages (TS `new appsync.Resolver` props arrive as
+            // Ident-key/Str-value windows) / Python L1
+            // `appsync.CfnResolver(type_name=, field_name=)`. The op is
+            // "Type.field", correlating by name on the RPC branch.
             "createResolver" | "create_resolver" | "Resolver" | "CfnResolver" => {
                 let t = str_lit_by_key(call, &["typeName", "type_name"]);
                 let f = str_lit_by_key(call, &["fieldName", "field_name"]);
@@ -2225,11 +2258,17 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
 /// Pre-pass: harvest one file-slice's CDK Lambda declarations and try to
 /// resolve each to an indexed handler function. Python constructions arrive
 /// with their kwargs, so `handler="app.lambda_handler"` +
-/// `Code.from_asset("src")` resolve exactly. TS constructions are invisible
-/// (see `detect_cdk`'s doc), so the declaration marker is the
-/// `Code.fromAsset(...)` call and the handler file falls back to Lambda's
-/// `index.handler` default convention — inherently Heuristic, which the
-/// borrow in `detect_cdk` enforces anyway.
+/// `Code.from_asset("src")` resolve exactly. TS/JS constructions now arrive
+/// too (member-form new-expressions carry arguments): `new lambda.Function`
+/// resolves its `handler:` prop against the byte-contained
+/// `Code.fromAsset(...)` dir, `new NodejsFunction({ entry })` treats entry
+/// as the handler source file itself, and `new PythonFunction` mirrors the
+/// Python arm. A standalone `Code.fromAsset` (asset stored in a variable)
+/// still counts as a declaration marker with the `index.handler` default —
+/// unless it is the file's sole standalone asset AND exactly one Function
+/// construction lacked a contained asset, in which case the two are the same
+/// lambda and merge. All of this stays Heuristic at the routes via the
+/// single-lambda borrow in `detect_cdk`.
 fn collect_cdk_lambdas(
     file: &FileInfo,
     files: &[FileInfo],
@@ -2241,27 +2280,121 @@ fn collect_cdk_lambdas(
     let dir = file.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
     match file.language {
         Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+            // lambda.Code.fromAsset('dir') — receiver keeps the `.Code`
+            // tail, distinguishing it from other fromAsset-ish APIs
+            // (appsync `Schema.fromAsset`). DockerImageFunction uses
+            // fromImageAsset and is skipped (no source handler to resolve).
+            let assets: Vec<&RawCall> = calls
+                .iter()
+                .filter(|c| {
+                    c.name == "fromAsset"
+                        && c.receiver
+                            .as_deref()
+                            .is_some_and(|r| r == "Code" || r.ends_with(".Code"))
+                })
+                .collect();
+            let resolve_js = |asset: &str, stem: &str, export: &str| {
+                ["ts", "tsx", "js", "mjs", "cjs"].iter().find_map(|ext| {
+                    cdk_find_file(files, dir, &format!("{asset}/{stem}.{ext}"))
+                        .and_then(|t| cdk_fn_in_file(functions, name_index, t, export))
+                })
+            };
+            // Constructions arrive with their props object (Ident-key /
+            // Str-value windows). Spans recorded so a fromAsset nested in a
+            // construction is not double-counted as a second declaration.
+            let mut spans: Vec<(u32, u32)> = Vec::new();
+            // handler strings of `new lambda.Function` constructions whose
+            // `code:` asset was NOT byte-contained (stored in a variable):
+            // deferred so the file's sole standalone fromAsset can be
+            // borrowed as their asset below.
+            let mut deferred: Vec<String> = Vec::new();
             for call in calls {
-                // lambda.Code.fromAsset('dir') — receiver keeps the `.Code`
-                // tail, distinguishing it from other fromAsset-ish APIs.
-                // DockerImageFunction uses fromImageAsset and is skipped (no
-                // source handler to resolve). NodejsFunction/PythonFunction
-                // `entry:` props are TS-invisible: documented gap.
-                if call.name != "fromAsset"
-                    || !call
-                        .receiver
-                        .as_deref()
-                        .is_some_and(|r| r == "Code" || r.ends_with(".Code"))
-                {
-                    continue;
+                match call.name.as_str() {
+                    // new lambda.Function(this, 'X', { handler:
+                    // 'index.handler', code: Code.fromAsset('dir') }): the
+                    // handler prop gates (RestApi/HttpApi/JS `new Function`
+                    // lack it); asset dir from the contained fromAsset.
+                    "Function" => {
+                        let Some(handler) = str_lit_by_key(call, &["handler"]) else {
+                            continue; // not a Lambda construction
+                        };
+                        spans.push((call.start_byte, call.end_byte));
+                        let contained = assets
+                            .iter()
+                            .find(|a| {
+                                a.start_byte >= call.start_byte && a.end_byte <= call.end_byte
+                            })
+                            .and_then(|a| first_str_lit(a));
+                        match contained {
+                            Some(asset) => out.push(handler.rsplit_once('.').and_then(
+                                |(stem, export)| resolve_js(&asset, stem, export),
+                            )),
+                            None => deferred.push(handler),
+                        }
+                    }
+                    // new NodejsFunction({ entry, handler }): entry IS the
+                    // handler source file; `handler:` names the export (CDK
+                    // default "handler"). A missing entry means esbuild
+                    // infers it from the DEFINING file's name — not modeled,
+                    // recorded as an unresolved declaration.
+                    "NodejsFunction" => {
+                        spans.push((call.start_byte, call.end_byte));
+                        let resolved = str_lit_by_key(call, &["entry"]).and_then(|entry| {
+                            let export = str_lit_by_key(call, &["handler"])
+                                .unwrap_or_else(|| "handler".to_string());
+                            cdk_find_file(files, dir, &entry)
+                                .and_then(|t| cdk_fn_in_file(functions, name_index, t, &export))
+                        });
+                        out.push(resolved);
+                    }
+                    // TS-declared PythonFunction: same defaults as the
+                    // Python arm (index="index.py", handler="handler").
+                    "PythonFunction" => {
+                        spans.push((call.start_byte, call.end_byte));
+                        let resolved = str_lit_by_key(call, &["entry"]).and_then(|entry| {
+                            let index = str_lit_by_key(call, &["index"])
+                                .unwrap_or_else(|| "index.py".to_string());
+                            let export = str_lit_by_key(call, &["handler"])
+                                .unwrap_or_else(|| "handler".to_string());
+                            let t = cdk_find_file(files, dir, &format!("{entry}/{index}"))?;
+                            cdk_fn_in_file(functions, name_index, t, &export)
+                        });
+                        out.push(resolved);
+                    }
+                    _ => {}
                 }
-                let resolved = first_str_lit(call).and_then(|asset| {
-                    ["ts", "tsx", "js", "mjs", "cjs"]
+            }
+            // Standalone fromAsset calls (outside every construction span):
+            // `const code = lambda.Code.fromAsset('dir')` wiring.
+            let standalone: Vec<&&RawCall> = assets
+                .iter()
+                .filter(|a| {
+                    !spans
                         .iter()
-                        .find_map(|ext| cdk_find_file(files, dir, &format!("{asset}/index.{ext}")))
-                        .and_then(|t| cdk_fn_in_file(functions, name_index, t, "handler"))
+                        .any(|(s, e)| a.start_byte >= *s && a.end_byte <= *e)
+                })
+                .collect();
+            if deferred.len() == 1 && standalone.len() == 1 {
+                // Sole asset-less Function + sole standalone asset: the same
+                // lambda seen from both ends — one declaration.
+                let resolved = first_str_lit(standalone[0]).and_then(|asset| {
+                    deferred[0]
+                        .rsplit_once('.')
+                        .and_then(|(stem, export)| resolve_js(&asset, stem, export))
                 });
                 out.push(resolved);
+            } else {
+                // Ambiguous pairings degrade to independent declarations:
+                // asset-less constructions stay unresolved, standalone assets
+                // fall back to Lambda's index.handler default convention.
+                for _ in &deferred {
+                    out.push(None);
+                }
+                for a in &standalone {
+                    out.push(
+                        first_str_lit(a).and_then(|asset| resolve_js(&asset, "index", "handler")),
+                    );
+                }
             }
         }
         Lang::Python => {

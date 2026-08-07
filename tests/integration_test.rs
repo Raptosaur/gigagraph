@@ -252,6 +252,137 @@ fn di_field_type_narrows_interface_call_to_implementation() {
 }
 
 #[test]
+fn nest_module_provider_pairs_surface_at_extraction() {
+    // Extraction-level proof for the @Module deep harvest: the provider
+    // object `{provide: Notifier, useClass: EmailNotifier}` sits below the
+    // generic depth-2 arg-lit walk; the targeted secondary harvest surfaces
+    // it as a keyed Ident pair sharing an index.
+    use gigagraph::extract::LitKind;
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/monorepo/nestsvc/app.module.ts");
+    let source = std::fs::read_to_string(&path).unwrap();
+    let spec = gigagraph::lang::spec_for_ext("ts").unwrap();
+    let file = gigagraph::extract::extract(spec, &source).unwrap();
+
+    let deco = file
+        .functions
+        .iter()
+        .flat_map(|f| &f.decorations)
+        .find(|d| d.name == "Module")
+        .expect("@Module decoration extracted");
+    let provide = deco
+        .arg_lits
+        .iter()
+        .find(|l| l.key.as_deref() == Some("provide"))
+        .expect("provide lit surfaced");
+    let use_class = deco
+        .arg_lits
+        .iter()
+        .find(|l| l.key.as_deref() == Some("useClass"))
+        .expect("useClass lit surfaced");
+    assert_eq!(provide.kind, LitKind::Ident);
+    assert_eq!(provide.text, "Notifier");
+    assert_eq!(use_class.kind, LitKind::Ident);
+    assert_eq!(use_class.text, "EmailNotifier");
+    assert_eq!(
+        provide.index, use_class.index,
+        "pair must share a provider ordinal"
+    );
+}
+
+#[test]
+fn nest_module_provider_binding_disambiguates() {
+    let index = index();
+    let g = &index.graph;
+
+    // Notifier has TWO implementors (AlertNotifier first by fn id) — only
+    // the @Module {provide, useClass} binding names EmailNotifier.
+    assert_eq!(
+        g.di_bindings.get("Notifier"),
+        Some(&vec!["EmailNotifier".to_string()])
+    );
+    assert_eq!(
+        callee_qname(
+            &index,
+            "nestsvc/dispatch.service::DispatchService::broadcast",
+            "send"
+        )
+        .as_deref(),
+        Some("nestsvc/notifiers::EmailNotifier::send")
+    );
+}
+
+#[test]
+fn csharp_addscoped_type_args_bind_container() {
+    let index = index();
+    let g = &index.graph;
+
+    // `services.AddScoped<IShipStore, DbShipStore>()`: the captured type
+    // args land in di_bindings and beat the two-implementor hierarchy
+    // fan-out (MemShipStore comes first by fn id).
+    assert_eq!(
+        g.di_bindings.get("IShipStore"),
+        Some(&vec!["DbShipStore".to_string()])
+    );
+    assert_eq!(
+        callee_qname(&index, "Acme.Store::ShipModule::Enqueue", "Persist").as_deref(),
+        Some("Acme.Store::DbShipStore::Persist")
+    );
+}
+
+#[test]
+fn two_hop_receiver_narrows_through_field_type() {
+    let index = index();
+    let g = &index.graph;
+
+    // C#: `load.Store.Stamp()` — load: Crate (local), Crate.Store:
+    // CrateStore (field), so the call narrows to CrateStore::Stamp even
+    // though LabelPrinter::Stamp comes first by fn id (name-based same-file
+    // resolution would pick it).
+    assert_eq!(
+        callee_qname(&index, "Acme.Store::Dockyard::Seal", "Stamp").as_deref(),
+        Some("Acme.Store::CrateStore::Stamp")
+    );
+    // Two hops through the tables is honest Heuristic, never High.
+    let seal = resolve_function_ref(g, "Acme.Store::Dockyard::Seal").unwrap();
+    let stamp = g.calls_by_caller[seal as usize]
+        .iter()
+        .map(|&i| &g.calls[i as usize])
+        .find(|c| c.name == "Stamp")
+        .expect("Seal calls Stamp");
+    match &stamp.resolution {
+        Resolution::Internal { confidence, .. } => {
+            assert_eq!(*confidence, gigagraph::types::Confidence::Heuristic)
+        }
+        other => panic!("Stamp not internally resolved: {other:?}"),
+    }
+
+    // Go: `d.store.Save()` in gosvc/dispatch.go. Go methods carry no
+    // containing_type today, so the two-hop rung finds no OrderStore methods
+    // and resolution falls through to the same-file name rung — assert by
+    // callee identity (name + file) so this keeps passing if go.rs later
+    // gains receiver-based containing_type.
+    let flush = g
+        .functions
+        .iter()
+        .find(|f| f.name == "Flush" && f.language == gigagraph::types::Lang::Go)
+        .expect("go Flush extracted");
+    let save = g.calls_by_caller[flush.id as usize]
+        .iter()
+        .map(|&i| &g.calls[i as usize])
+        .find(|c| c.name == "Save")
+        .expect("Flush calls Save");
+    match &save.resolution {
+        Resolution::Internal { callee, .. } => {
+            let f = &g.functions[*callee as usize];
+            assert_eq!(f.name, "Save");
+            assert_eq!(g.files[f.file_id as usize].path, "gosvc/dispatch.go");
+        }
+        other => panic!("Save not internally resolved: {other:?}"),
+    }
+}
+
+#[test]
 fn di_container_binding_disambiguates_multiple_implementors() {
     let index = index();
 

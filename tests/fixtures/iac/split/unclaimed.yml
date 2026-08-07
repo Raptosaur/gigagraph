@@ -1,0 +1,8 @@
+# Looks like a functions fragment but no serverless.yml includes it: must
+# contribute no endpoints.
+ghostFn:
+  handler: ../src/handlers/users.create
+  events:
+    - http:
+        path: unclaimed-route
+        method: get

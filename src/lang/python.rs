@@ -30,7 +30,11 @@ use crate::types::{ImportStyle, Lang};
 //   `(type (identifier))` shape — intended, `clean_type` rejects them anyway).
 //   `typed_default_parameter` is the same but with a `name:` field. Annotated
 //   assignments (`x: T = ...`) put the same `type: (type ...)` field on the
-//   `assignment` node. Constructed locals/fields (`x = Klass()`,
+//   `assignment` node. Dotted annotations (`x: mod.T`) are an `attribute`
+//   node inside `(type ...)` (probe-verified); each pattern has an
+//   attribute twin capturing the WHOLE attribute node — its text is
+//   dot-joined with no whitespace, so clean_type keeps the last segment
+//   (`mod.deep.T` -> `T`). Constructed locals/fields (`x = Klass()`,
 //   `self.x = Klass()`) capture the callee as the type, guarded by
 //   `#match? "^[A-Z]"` because Python calls are case-blind — without the
 //   guard every `x = helper()` would record `helper` as a type.
@@ -39,8 +43,9 @@ use crate::types::{ImportStyle, Lang};
 //   substitutes the `__init__` parameter's declared type, so this pattern
 //   stays UNGUARDED by case — the param name is lowercase by convention.
 //   Hierarchy: `class_definition` lists bases in a `superclasses:`
-//   `argument_list`; one `@hier.type`/`@hier.base` pair per base identifier
-//   (dotted bases like `abc.ABC` are `attribute` nodes and are skipped).
+//   `argument_list`; one `@hier.type`/`@hier.base` pair per base. Dotted
+//   bases (`class X(abc.ABC)`) are `attribute` nodes captured whole, with
+//   clean_type again keeping the last segment (`ABC`).
 const QUERY: &str = r#"
 (function_definition
   name: (identifier) @func.name
@@ -95,13 +100,25 @@ const QUERY: &str = r#"
   (identifier) @local.name
   type: (type (identifier) @local.type))
 
+(typed_parameter
+  (identifier) @local.name
+  type: (type (attribute) @local.type))
+
 (typed_default_parameter
   name: (identifier) @local.name
   type: (type (identifier) @local.type))
 
+(typed_default_parameter
+  name: (identifier) @local.name
+  type: (type (attribute) @local.type))
+
 (assignment
   left: (identifier) @local.name
   type: (type (identifier) @local.type))
+
+(assignment
+  left: (identifier) @local.name
+  type: (type (attribute) @local.type))
 
 (assignment
   left: (identifier) @local.name
@@ -128,6 +145,10 @@ const QUERY: &str = r#"
 (class_definition
   name: (identifier) @hier.type
   superclasses: (argument_list (identifier) @hier.base))
+
+(class_definition
+  name: (identifier) @hier.type
+  superclasses: (argument_list (attribute) @hier.base))
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &["identifier"];

@@ -243,11 +243,19 @@ fn extracts_python_type_information() {
 
     // Typed ctor param -> local of __init__.
     assert_eq!(local_of(func(&file, "__init__"), "store"), Some("OrderStore"));
+    // Dotted-annotated ctor param: the whole `infra.EventBus` attribute node
+    // is captured; clean_type keeps the last segment.
+    assert_eq!(local_of(func(&file, "__init__"), "bus"), Some("EventBus"));
 
-    // Typed param with default (`store: OrderStore = None`).
+    // Typed param with default (`store: OrderStore = None`), plain and
+    // dotted (`bus: infra.EventBus = None`).
     assert_eq!(
         local_of(func(&file, "build_service"), "store"),
         Some("OrderStore")
+    );
+    assert_eq!(
+        local_of(func(&file, "build_service"), "bus"),
+        Some("EventBus")
     );
 
     // Constructed local (`audit = AuditTrail()`) and annotated local
@@ -255,6 +263,8 @@ fn extracts_python_type_information() {
     let place = func(&file, "place");
     assert_eq!(local_of(place, "audit"), Some("AuditTrail"));
     assert_eq!(local_of(place, "tag"), Some("OrderTag"));
+    // Dotted annotated local keeps only the last segment.
+    assert_eq!(local_of(place, "stamp"), Some("Stamp"));
     // Case guard: the lowercase call `make_tag(...)` must not be recorded as
     // a constructed type for `tag`.
     assert!(
@@ -280,6 +290,14 @@ fn extracts_python_type_information() {
         file.hierarchy
             .contains(&("OrderStore".into(), "BaseStore".into())),
         "missing hierarchy edge; got {:?}",
+        file.hierarchy
+    );
+    // Dotted base (`class Payment(events.Recorded)`): whole attribute node
+    // captured, last segment kept.
+    assert!(
+        file.hierarchy
+            .contains(&("Payment".into(), "Recorded".into())),
+        "missing dotted-base hierarchy edge; got {:?}",
         file.hierarchy
     );
 }

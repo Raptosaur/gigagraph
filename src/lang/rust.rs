@@ -38,7 +38,14 @@ use crate::types::{ImportStyle, Lang};
 //   `type_identifier` (`Rc<Cache>`) or a `dynamic_type` whose `trait:` field
 //   is the `type_identifier` (`dyn Store`); for the deref-transparent
 //   wrappers Arc/Box/Rc we capture the INNER type — `Arc<dyn Store>` /
-//   `Box<dyn Store>` are the Rust DI idiom. `parameter` has `pattern:` +
+//   `Box<dyn Store>` are the Rust DI idiom. Nested wrappers
+//   (`Arc<Mutex<T>>`, probe-verified) put a second `generic_type` inside
+//   `type_arguments:`; one extra unwrap level (outer Arc/Box/Rc, inner
+//   Arc/Box/Rc/Mutex/RwLock) captures the innermost `type_identifier`.
+//   Generic traits (`Box<dyn Store<String>>`) make the `dynamic_type`'s
+//   `trait:` field a `generic_type` whose `type:` is the base trait
+//   identifier — captured as the type; the trait's type-argument is NOT
+//   (same container-over-argument choice as everywhere else). `parameter` has `pattern:` +
 //   `type:` (same reference/generic shapes); `self_parameter` has no
 //   `pattern:` field so it never matches. `let_declaration` has `pattern:` +
 //   optional `type:` + `value:`; `DbStore::new()` is a `call_expression` over
@@ -184,6 +191,26 @@ const QUERY: &str = r#"
       (dynamic_type trait: (type_identifier) @field.type))))
   (#match? @_wrap "^(Arc|Box|Rc)$"))
 
+((field_declaration
+  name: (field_identifier) @field.name
+  type: (generic_type
+    type: (type_identifier) @_wrap
+    type_arguments: (type_arguments
+      (dynamic_type
+        trait: (generic_type type: (type_identifier) @field.type)))))
+  (#match? @_wrap "^(Arc|Box|Rc)$"))
+
+((field_declaration
+  name: (field_identifier) @field.name
+  type: (generic_type
+    type: (type_identifier) @_wrap
+    type_arguments: (type_arguments
+      (generic_type
+        type: (type_identifier) @_inner
+        type_arguments: (type_arguments (type_identifier) @field.type)))))
+  (#match? @_wrap "^(Arc|Box|Rc)$")
+  (#match? @_inner "^(Arc|Box|Rc|Mutex|RwLock)$"))
+
 (parameter
   pattern: (identifier) @local.name
   type: (type_identifier) @local.type)
@@ -206,6 +233,26 @@ const QUERY: &str = r#"
     type_arguments: (type_arguments
       (dynamic_type trait: (type_identifier) @local.type))))
   (#match? @_wrap "^(Arc|Box|Rc)$"))
+
+((parameter
+  pattern: (identifier) @local.name
+  type: (generic_type
+    type: (type_identifier) @_wrap
+    type_arguments: (type_arguments
+      (dynamic_type
+        trait: (generic_type type: (type_identifier) @local.type)))))
+  (#match? @_wrap "^(Arc|Box|Rc)$"))
+
+((parameter
+  pattern: (identifier) @local.name
+  type: (generic_type
+    type: (type_identifier) @_wrap
+    type_arguments: (type_arguments
+      (generic_type
+        type: (type_identifier) @_inner
+        type_arguments: (type_arguments (type_identifier) @local.type)))))
+  (#match? @_wrap "^(Arc|Box|Rc)$")
+  (#match? @_inner "^(Arc|Box|Rc|Mutex|RwLock)$"))
 
 (let_declaration
   pattern: (identifier) @local.name

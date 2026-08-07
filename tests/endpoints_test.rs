@@ -588,3 +588,14 @@ fn detects_silex_legacy_method_chains() {
         "createGnome"
     );
 }
+
+#[test]
+fn detects_silex_provider_without_direct_silex_import() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+
+    // Provider classes that extend a project base provider never import
+    // Silex itself — the `*ControllerProvider` import is the evidence.
+    let e = find(ep, HttpMethod::Get, "/widget-registry");
+    assert_eq!(e.framework, "silex");
+}

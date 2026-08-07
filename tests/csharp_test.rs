@@ -334,6 +334,36 @@ fn extracts_csharp_file_scoped_namespace_and_structs() {
 }
 
 #[test]
+fn captures_generic_call_type_args() {
+    let file = extract_fixture("cs", "csharp/Registry.cs");
+    let configure = func(&file, "Configure");
+
+    // `services.AddScoped<IClock, SystemClock>()`: both type args captured,
+    // in order, alongside the normal receiver/name captures.
+    for reg in ["AddScoped", "AddSingleton", "AddTransient"] {
+        let call = configure
+            .calls
+            .iter()
+            .find(|c| c.name == reg)
+            .unwrap_or_else(|| panic!("Configure has no call to {reg}"));
+        assert_eq!(
+            call.type_args,
+            vec!["IClock".to_string(), "SystemClock".to_string()],
+            "wrong type args on {reg}"
+        );
+        assert_eq!(call.receiver.as_deref(), Some("services"));
+    }
+
+    // Non-generic member call carries no type args.
+    let log = configure.calls.iter().find(|c| c.name == "Log").unwrap();
+    assert!(log.type_args.is_empty(), "got {:?}", log.type_args);
+
+    // Bare (receiver-less) generic call: single type arg captured too.
+    let pick = configure.calls.iter().find(|c| c.name == "Pick").unwrap();
+    assert_eq!(pick.type_args, vec!["IClock".to_string()]);
+}
+
+#[test]
 fn extracts_csharp_type_information() {
     let file = extract_fixture("cs", "csharp/Wiring.cs");
 

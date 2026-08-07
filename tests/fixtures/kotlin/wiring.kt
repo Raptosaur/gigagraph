@@ -35,6 +35,17 @@ object InMemoryStore : OrderStore {
 // Interface implementation by delegation.
 class DelegatingStore(private val impl: OrderStore) : OrderStore by impl
 
+// Enum-body properties: declared, nullable, and constructed.
+enum class Channel(val code: String) {
+    EMAIL("email"), SMS("sms");
+
+    val trail: AuditTrail = AuditTrail()
+    val tracer: Tracer? = null
+    val made = AuditTrail()
+
+    fun describe(): String = code
+}
+
 @Service
 class OrderService(
     private val store: OrderStore,
@@ -44,6 +55,7 @@ class OrderService(
     logger: Logger,
 ) : BaseUseCase(), Auditable {
     val audit = AuditTrail()
+    val fallbackTracer: Tracer? = null
 
     fun place(order: Order, note: String?): Order {
         val trail = AuditTrail()

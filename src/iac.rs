@@ -27,6 +27,28 @@ pub struct IacFinding {
     /// Route-less Lambda entry: pure noise unless the handler resolves to an
     /// indexed function, so `attach` drops it otherwise.
     pub require_handler: bool,
+    /// Split serverless config bookkeeping; None for ordinary findings.
+    pub sls: Option<SlsRole>,
+}
+
+/// serverless.yml `functions: - ${file(./functions.yml)}` splits the config
+/// across files, but `scan` sees one file at a time. Both sides emit tagged
+/// findings and `attach` — which sees every file's findings — stitches them.
+#[derive(Debug, Clone)]
+pub enum SlsRole {
+    /// Marker from a serverless.yml whose `functions:` list pulls in a
+    /// fragment file. Never becomes an endpoint itself. `target` is the
+    /// repo-relative fragment path; `base_dir`/`runtime` are the service dir
+    /// and provider runtime the fragment's handlers inherit.
+    Include {
+        target: String,
+        base_dir: String,
+        runtime: Runtime,
+    },
+    /// Finding scanned from a candidate fragment file (a bare map of
+    /// function defs). Inert unless a serverless.yml Include claims the
+    /// file — an unclaimed lookalike yields nothing.
+    Fragment,
 }
 
 /// A handler string plus the context needed to resolve it after the graph
@@ -83,6 +105,12 @@ pub fn scan(rel_path: &str, source: &str) -> Vec<IacFinding> {
     if yamlish && source.contains("Resources") && source.contains("AWS::") {
         return scan_cloudformation(dir, source);
     }
+    // Any other .yml might be a serverless functions fragment pulled in via
+    // `${file(...)}`; findings are tagged Fragment and stay inert unless a
+    // serverless.yml claims the file (see attach).
+    if (name.ends_with(".yml") || name.ends_with(".yaml")) && source.contains("handler") {
+        return scan_sls_fragment(dir, source);
+    }
     Vec::new()
 }
 
@@ -116,16 +144,24 @@ fn as_map(v: &Y) -> Option<&serde_norway::Mapping> {
     }
 }
 
-/// First line whose content starts with `<key>:`, 1-based; best-effort
-/// (serde gives no spans).
-fn line_of(source: &str, key: &str) -> u32 {
-    let pat = format!("{key}:");
-    for (i, l) in source.lines().enumerate() {
-        if l.trim_start().starts_with(&pat) {
-            return (i + 1) as u32;
+/// Best-effort line of a YAML `<key>:` line, 1-based (serde gives no spans).
+/// Exact key match — `Users:` does not hit `UsersTable:` — searched at or
+/// after `after` (1-based), preferring the least-indented hit so nested
+/// duplicates (an event or property sharing a resource's name deeper in the
+/// tree) don't shadow the declaration.
+fn line_of_key(source: &str, key: &str, after: u32) -> u32 {
+    let mut best: Option<(usize, u32)> = None; // (indent, line)
+    let skip = (after.max(1) - 1) as usize;
+    for (i, l) in source.lines().enumerate().skip(skip) {
+        let t = l.trim_start();
+        if t.strip_prefix(key).is_some_and(|rest| rest.starts_with(':')) {
+            let indent = l.len() - t.len();
+            if best.is_none_or(|(bi, _)| indent < bi) {
+                best = Some((indent, (i + 1) as u32));
+            }
         }
     }
-    1
+    best.map(|(_, ln)| ln).unwrap_or(1)
 }
 
 /// Logical-id target of an intrinsic in short (`!Ref X`, `!GetAtt X.Arn`,
@@ -328,6 +364,11 @@ struct SamGlobals<'a> {
 fn cfn_lambda_ref(dir: &str, res: &CfnRes, g: &SamGlobals) -> Option<HandlerRef> {
     match res.rtype {
         "AWS::Serverless::Function" => {
+            // InlineCode: the source lives in the template itself — nothing
+            // on disk to resolve against.
+            if res.props.and_then(|p| get(p, "InlineCode")).is_some() {
+                return None;
+            }
             let handler = res
                 .props
                 .and_then(|p| get(p, "Handler"))
@@ -392,6 +433,21 @@ fn cfn_lambda_ref(dir: &str, res: &CfnRes, g: &SamGlobals) -> Option<HandlerRef>
     }
 }
 
+/// The function's code is embedded in the template (`Code: {ZipFile: ...}`,
+/// SAM `InlineCode`): there is no file to resolve a handler against, but the
+/// declaration itself is certain.
+fn has_inline_code(res: &CfnRes) -> bool {
+    match res.rtype {
+        "AWS::Lambda::Function" => res
+            .props
+            .and_then(|p| get(p, "Code"))
+            .and_then(|c| get(c, "ZipFile"))
+            .is_some(),
+        "AWS::Serverless::Function" => res.props.and_then(|p| get(p, "InlineCode")).is_some(),
+        _ => false,
+    }
+}
+
 fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
     let Ok(doc) = serde_norway::from_str::<Y>(source) else {
         return Vec::new();
@@ -427,6 +483,10 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
             .get(id)
             .and_then(|r| cfn_lambda_ref(dir, r, &globals))
     };
+    // Anchor logical-id line searches below the Resources: section so keys
+    // duplicated in Parameters/Outputs/comments don't win.
+    let resources_line = line_of_key(source, "Resources", 1);
+    let res_line = |name: &str| line_of_key(source, name, resources_line);
 
     let mut out = Vec::new();
     // Lambda-shaped resources bound to some route; the rest become
@@ -439,16 +499,21 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
             continue;
         }
         let href = cfn_lambda_ref(dir, res, &globals);
-        let line = line_of(source, name);
+        let line = res_line(name);
         let mut had_http = false;
         if let Some(events) = res.props.and_then(|p| get(p, "Events")).and_then(as_map) {
-            for (_, ev) in events {
+            for (ek, ev) in events {
                 let Some(ev_type) = get(ev, "Type").and_then(as_str) else {
                     continue;
                 };
                 if ev_type != "Api" && ev_type != "HttpApi" {
                     continue;
                 }
+                // Route rows point at the event id's line, not the function's.
+                let ev_line = match ek {
+                    Y::String(en) => line_of_key(source, en, line),
+                    _ => line,
+                };
                 let ep = get(ev, "Properties");
                 let path = ep.and_then(|p| get(p, "Path")).and_then(as_str);
                 let method = ep.and_then(|p| get(p, "Method")).and_then(as_str);
@@ -467,9 +532,10 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
                     confidence: path_conf(&p),
                     path_raw: p,
                     framework: "sam",
-                    line,
+                    line: ev_line,
                     handler: href.clone(),
                     require_handler: false,
+                    sls: None,
                 });
                 had_http = true;
             }
@@ -523,9 +589,10 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
                     confidence: path_conf(path),
                     path_raw: path.clone(),
                     framework: "sam",
-                    line: line_of(source, path),
+                    line: line_of_key(source, path, resources_line),
                     handler: href,
                     require_handler: false,
+                    sls: None,
                 });
             }
         }
@@ -560,9 +627,10 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
             confidence: path_conf(&path),
             path_raw: path,
             framework: "cloudformation",
-            line: line_of(source, name),
+            line: res_line(name),
             handler: href,
             require_handler: false,
+            sls: None,
         });
     }
 
@@ -608,10 +676,11 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
             method,
             path_raw: path,
             framework: "cloudformation",
-            line: line_of(source, name),
+            line: res_line(name),
             confidence: conf,
             handler: href,
             require_handler: false,
+            sls: None,
         });
     }
 
@@ -660,10 +729,11 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
             method: HttpMethod::Any,
             path_raw: format!("{t}.{f}"),
             framework: "appsync",
-            line: line_of(source, name),
+            line: res_line(name),
             confidence: Confidence::High,
             handler: href,
             require_handler: false,
+            sls: None,
         });
     }
 
@@ -678,18 +748,25 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
         {
             continue;
         }
-        let Some(href) = cfn_lambda_ref(dir, res, &globals) else {
+        let href = cfn_lambda_ref(dir, res, &globals);
+        // Inline-code lambdas (Code.ZipFile / InlineCode) live entirely in
+        // the template: the declaration is certain even though there is no
+        // handler file to resolve, so emit the row with handler None instead
+        // of dropping the function.
+        let inline = href.is_none() && has_inline_code(res);
+        if href.is_none() && !inline {
             continue;
-        };
+        }
         out.push(IacFinding {
             kind: ApiKind::Http,
             method: HttpMethod::Any,
             path_raw: format!("lambda:{name}"),
             framework: "lambda",
-            line: line_of(source, name),
+            line: res_line(name),
             confidence: Confidence::Heuristic,
-            handler: Some(href),
-            require_handler: true,
+            handler: href,
+            require_handler: !inline,
+            sls: None,
         });
     }
     out
@@ -697,11 +774,112 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
 
 // ------------------------------------------------------------ serverless.yml
 
+/// One-level Serverless Framework variable expansion against this document's
+/// tree: `${self:custom.x}` -> the scalar at that path, `${opt:stage, 'dev'}`
+/// -> the default literal. Anything else — env:/cf:/ssm:, missing paths
+/// without a default, nested `${..${..}}` — stays raw, so path_conf keeps
+/// such routes Heuristic. Substituted values are NOT re-expanded (one level
+/// only, by design).
+fn sls_expand(doc: &Y, s: &str) -> String {
+    if !s.contains("${") {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find("${") {
+        out.push_str(&rest[..i]);
+        let Some((inner, tail)) = split_braced(&rest[i + 2..]) else {
+            // Unbalanced braces: keep the remainder verbatim.
+            out.push_str(&rest[i..]);
+            return out;
+        };
+        match sls_var_value(doc, inner) {
+            Some(v) => out.push_str(&v),
+            None => {
+                out.push_str("${");
+                out.push_str(inner);
+                out.push('}');
+            }
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Split `"inner}tail"` at the close brace matching an already-consumed
+/// `${`, counting nested `${` so a nested variable round-trips intact.
+fn split_braced(s: &str) -> Option<(&str, &str)> {
+    let b = s.as_bytes();
+    let mut depth = 1u32;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if b[i] == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some((&s[..i], &s[i + 1..]));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Value for one `${...}` body, or None to leave it raw.
+fn sls_var_value(doc: &Y, inner: &str) -> Option<String> {
+    if inner.contains("${") {
+        return None; // nested variables are out of scope
+    }
+    let (expr, default) = match inner.split_once(',') {
+        Some((e, d)) => {
+            let d = d.trim().trim_matches(|c| c == '\'' || c == '"');
+            (e.trim(), Some(d.to_string()))
+        }
+        None => (inner.trim(), None),
+    };
+    if let Some(path) = expr.strip_prefix("self:") {
+        return sls_self_lookup(doc, path).or(default);
+    }
+    if expr.starts_with("opt:") {
+        // CLI options are unknowable statically; the default literal is the
+        // only honest value.
+        return default;
+    }
+    None
+}
+
+fn sls_self_lookup(doc: &Y, path: &str) -> Option<String> {
+    let mut cur = doc;
+    for seg in path.split('.') {
+        cur = get(cur, seg)?;
+    }
+    match untag(cur) {
+        Y::String(s) => Some(s.clone()),
+        Y::Number(n) => Some(n.to_string()),
+        Y::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// `${file(./functions.yml)}` -> `./functions.yml`.
+fn sls_file_include(s: &str) -> Option<&str> {
+    let inner = s.trim().strip_prefix("${file(")?.strip_suffix(")}")?;
+    let inner = inner.trim().trim_matches(|c| c == '\'' || c == '"');
+    (!inner.is_empty()).then_some(inner)
+}
+
 /// `http`/`httpApi` event: object `{path, method}` or shorthand string
-/// `"GET /users"`; `'*'` is the $default catch-all.
-fn sls_http_event(v: &Y) -> Option<(HttpMethod, String)> {
+/// `"GET /users"`; `'*'` is the $default catch-all. Strings pass through
+/// `sls_expand` against `doc`.
+fn sls_http_event(v: &Y, doc: &Y) -> Option<(HttpMethod, String)> {
     match untag(v) {
         Y::String(s) => {
+            let s = sls_expand(doc, s.trim());
             let s = s.trim();
             if s == "*" {
                 return Some((HttpMethod::Any, "$default".to_string()));
@@ -717,9 +895,94 @@ fn sls_http_event(v: &Y) -> Option<(HttpMethod, String)> {
                 .and_then(as_str)
                 .and_then(HttpMethod::from_name)
                 .unwrap_or(HttpMethod::Any);
-            Some((method, path.to_string()))
+            Some((method, sls_expand(doc, path)))
         }
         _ => None,
+    }
+}
+
+/// Emit findings for one `functions:` mapping (name -> def). `doc` is the
+/// variable-expansion tree — the serverless.yml itself, or the fragment's
+/// own tree for split files (where `${self:...}` can't see the including
+/// service and honestly stays raw). `sls` tags fragment findings for
+/// attach-time stitching.
+#[allow(clippy::too_many_arguments)]
+fn sls_functions(
+    doc: &Y,
+    dir: &str,
+    source: &str,
+    provider_runtime: Option<&str>,
+    functions: &serde_norway::Mapping,
+    after_line: u32,
+    sls: Option<SlsRole>,
+    out: &mut Vec<IacFinding>,
+) {
+    for (k, fdef) in functions {
+        let Y::String(fname) = k else { continue };
+        let line = line_of_key(source, fname, after_line);
+        let runtime = get(fdef, "runtime")
+            .and_then(as_str)
+            .or(provider_runtime)
+            .map(|r| runtime_from(&sls_expand(doc, r)))
+            .unwrap_or(Runtime::Unknown);
+        // Handler paths are relative to the serverless.yml's directory.
+        let href = get(fdef, "handler").and_then(as_str).map(|h| HandlerRef {
+            base_dir: dir.to_string(),
+            handler: sls_expand(doc, h),
+            runtime,
+        });
+        let mut had_http = false;
+        if let Some(Y::Sequence(events)) = get(fdef, "events").map(untag) {
+            for ev in events {
+                let hit = get(ev, "http")
+                    .or_else(|| get(ev, "httpApi"))
+                    .and_then(|v| sls_http_event(v, doc));
+                let Some((method, path)) = hit else { continue };
+                out.push(IacFinding {
+                    kind: ApiKind::Http,
+                    method,
+                    confidence: path_conf(&path),
+                    path_raw: path,
+                    framework: "serverless",
+                    line,
+                    handler: href.clone(),
+                    require_handler: false,
+                    sls: sls.clone(),
+                });
+                had_http = true;
+            }
+        }
+        // Lambda function URL: a real catch-all endpoint.
+        let url = get(fdef, "url")
+            .map(|u| !matches!(untag(u), Y::Bool(false)))
+            .unwrap_or(false);
+        if url {
+            out.push(IacFinding {
+                kind: ApiKind::Http,
+                method: HttpMethod::Any,
+                path_raw: "/{*}".to_string(),
+                framework: "serverless",
+                line,
+                confidence: Confidence::High,
+                handler: href.clone(),
+                require_handler: false,
+                sls: sls.clone(),
+            });
+            had_http = true;
+        }
+        if !had_http && href.is_some() {
+            out.push(IacFinding {
+                kind: ApiKind::Http,
+                method: HttpMethod::Any,
+                path_raw: format!("lambda:{fname}"),
+                framework: "lambda",
+                line,
+                confidence: Confidence::Heuristic,
+                handler: href,
+                require_handler: true,
+                sls: sls.clone(),
+            });
+        }
     }
 }
 
@@ -734,73 +997,63 @@ fn scan_serverless(dir: &str, source: &str) -> Vec<IacFinding> {
     let provider_runtime = get(&doc, "provider")
         .and_then(|p| get(p, "runtime"))
         .and_then(as_str);
+    let functions_line = line_of_key(source, "functions", 1);
 
     let mut out = Vec::new();
-    if let Some(functions) = get(&doc, "functions").and_then(as_map) {
-        for (k, fdef) in functions {
-            let Y::String(fname) = k else { continue };
-            let line = line_of(source, fname);
-            let runtime = get(fdef, "runtime")
-                .and_then(as_str)
-                .or(provider_runtime)
-                .map(runtime_from)
-                .unwrap_or(Runtime::Unknown);
-            // Handler paths are relative to the serverless.yml's directory.
-            let href = get(fdef, "handler").and_then(as_str).map(|h| HandlerRef {
-                base_dir: dir.to_string(),
-                handler: h.to_string(),
-                runtime,
-            });
-            let mut had_http = false;
-            if let Some(Y::Sequence(events)) = get(fdef, "events").map(untag) {
-                for ev in events {
-                    let hit = get(ev, "http")
-                        .or_else(|| get(ev, "httpApi"))
-                        .and_then(sls_http_event);
-                    let Some((method, path)) = hit else { continue };
-                    out.push(IacFinding {
-                        kind: ApiKind::Http,
-                        method,
-                        confidence: path_conf(&path),
-                        path_raw: path,
-                        framework: "serverless",
-                        line,
-                        handler: href.clone(),
-                        require_handler: false,
-                    });
-                    had_http = true;
+    match get(&doc, "functions").map(untag) {
+        Some(Y::Mapping(m)) => sls_functions(
+            &doc,
+            dir,
+            source,
+            provider_runtime,
+            m,
+            functions_line,
+            None,
+            &mut out,
+        ),
+        // Split config: `functions:` as a list mixing inline {name: def}
+        // maps with `${file(./x.yml)}` includes. Includes become markers
+        // that attach uses to activate the fragment file's findings.
+        Some(Y::Sequence(items)) => {
+            for item in items {
+                match untag(item) {
+                    Y::String(s) => {
+                        let Some(rel) = sls_file_include(s) else {
+                            continue;
+                        };
+                        out.push(IacFinding {
+                            kind: ApiKind::Http,
+                            method: HttpMethod::Any,
+                            path_raw: format!("include:{rel}"),
+                            framework: "serverless",
+                            line: functions_line,
+                            confidence: Confidence::Heuristic,
+                            handler: None,
+                            require_handler: false,
+                            sls: Some(SlsRole::Include {
+                                target: join_norm(dir, rel),
+                                base_dir: dir.to_string(),
+                                runtime: provider_runtime
+                                    .map(runtime_from)
+                                    .unwrap_or(Runtime::Unknown),
+                            }),
+                        });
+                    }
+                    Y::Mapping(m) => sls_functions(
+                        &doc,
+                        dir,
+                        source,
+                        provider_runtime,
+                        m,
+                        functions_line,
+                        None,
+                        &mut out,
+                    ),
+                    _ => {}
                 }
             }
-            // Lambda function URL: a real catch-all endpoint.
-            let url = get(fdef, "url")
-                .map(|u| !matches!(untag(u), Y::Bool(false)))
-                .unwrap_or(false);
-            if url {
-                out.push(IacFinding {
-                    kind: ApiKind::Http,
-                    method: HttpMethod::Any,
-                    path_raw: "/{*}".to_string(),
-                    framework: "serverless",
-                    line,
-                    confidence: Confidence::High,
-                    handler: href.clone(),
-                    require_handler: false,
-                });
-                had_http = true;
-            }
-            if !had_http && href.is_some() {
-                out.push(IacFinding {
-                    kind: ApiKind::Http,
-                    method: HttpMethod::Any,
-                    path_raw: format!("lambda:{fname}"),
-                    framework: "lambda",
-                    line,
-                    confidence: Confidence::Heuristic,
-                    handler: href,
-                    require_handler: true,
-                });
-            }
         }
+        _ => {}
     }
 
     // serverless-appsync plugin: v2 `appSync.resolvers` keyed "Type.field",
@@ -815,13 +1068,14 @@ fn scan_serverless(dir: &str, source: &str) -> Vec<IacFinding> {
             confidence: Confidence::High,
             handler: None,
             require_handler: false,
+            sls: None,
         });
     };
     if let Some(rs) = get(&doc, "appSync").and_then(|a| get(a, "resolvers")).and_then(as_map) {
         for (k, _) in rs {
             let Y::String(op) = k else { continue };
             if op.contains('.') {
-                push_op(op.clone(), line_of(source, op));
+                push_op(op.clone(), line_of_key(source, op, 1));
             }
         }
     }
@@ -835,10 +1089,46 @@ fn scan_serverless(dir: &str, source: &str) -> Vec<IacFinding> {
                 get(mt, "type").and_then(as_str),
                 get(mt, "field").and_then(as_str),
             ) {
-                push_op(format!("{t}.{f}"), line_of(source, f));
+                push_op(format!("{t}.{f}"), line_of_key(source, f, 1));
             }
         }
     }
+    out
+}
+
+/// A candidate serverless functions fragment: a bare YAML map of function
+/// defs (every top-level value a mapping, at least one with a string
+/// `handler`). Findings are tagged Fragment and dropped by `attach` unless
+/// a serverless.yml `${file(...)}` include claims this file, so a stray
+/// lookalike contributes nothing.
+fn scan_sls_fragment(dir: &str, source: &str) -> Vec<IacFinding> {
+    let Ok(doc) = serde_norway::from_str::<Y>(source) else {
+        return Vec::new();
+    };
+    let Some(m) = as_map(&doc) else {
+        return Vec::new();
+    };
+    // Full configs and templates are handled by the dedicated scanners.
+    if m.is_empty()
+        || m.contains_key("service")
+        || m.contains_key("provider")
+        || m.contains_key("Resources")
+    {
+        return Vec::new();
+    }
+    if !m.iter().all(|(_, v)| as_map(v).is_some())
+        || !m
+            .iter()
+            .any(|(_, v)| get(v, "handler").and_then(as_str).is_some())
+    {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    // `${self:...}` refers to the including service file, which scan can't
+    // see; expansion against the fragment itself is a best-effort no-op for
+    // those (they stay raw -> Heuristic). base_dir/runtime are overridden by
+    // the claiming Include in attach.
+    sls_functions(&doc, dir, source, None, m, 1, Some(SlsRole::Fragment), &mut out);
     out
 }
 
@@ -946,6 +1236,60 @@ fn line_containing(source: &str, needle: &str) -> u32 {
     1
 }
 
+/// Best-effort line of `resource "<type>" "<name>"`: anchored to the block
+/// header so the name appearing earlier as a substring in strings or
+/// comments doesn't win. Falls back to the first quoted-name occurrence.
+fn line_of_tf_block(source: &str, rtype: &str, name: &str) -> u32 {
+    let tq = format!("\"{rtype}\"");
+    let nq = format!("\"{name}\"");
+    for (i, l) in source.lines().enumerate() {
+        let t = l.trim_start();
+        if t.starts_with("resource") && t.contains(&tq) && t.contains(&nq) {
+            return (i + 1) as u32;
+        }
+    }
+    line_containing(source, &nq)
+}
+
+/// One-hop `${local.x}` expansion against same-file literal string locals.
+/// `var.*`/`data.*`/`module.*` references and nested `${..${..}}` stay raw
+/// (nested interpolation never matches the `local.<ident>` shape, so it
+/// round-trips verbatim).
+fn resolve_tf_locals(s: &str, locals: &FxHashMap<String, String>) -> String {
+    if locals.is_empty() || !s.contains("${local.") {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find("${") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[i..]);
+            return out;
+        };
+        let inner = &after[..end];
+        let repl = inner
+            .strip_prefix("local.")
+            .filter(|name| {
+                name.chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            })
+            .and_then(|name| locals.get(name));
+        match repl {
+            Some(v) => out.push_str(v),
+            None => {
+                out.push_str("${");
+                out.push_str(inner);
+                out.push('}');
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn scan_terraform(dir: &str, source: &str) -> Vec<IacFinding> {
     // Cheap pre-filter before a full HCL parse.
     if !source.contains("resource") {
@@ -954,6 +1298,23 @@ fn scan_terraform(dir: &str, source: &str) -> Vec<IacFinding> {
     let Ok(body) = hcl::from_str::<hcl::Body>(source) else {
         return Vec::new();
     };
+
+    // Same-file literal string locals, for one-hop `${local.x}` expansion in
+    // template strings (route_key, path_part, handler...). Non-literal
+    // locals (expressions, interpolations) are skipped: expanding them would
+    // be guesswork.
+    let mut locals: FxHashMap<String, String> = FxHashMap::default();
+    for block in body.blocks() {
+        if block.identifier() != "locals" {
+            continue;
+        }
+        for a in block.body().attributes() {
+            if let hcl::Expression::String(s) = a.expr() {
+                locals.insert(a.key().to_string(), s.clone());
+            }
+        }
+    }
+    let lstr = |e: &hcl::Expression| expr_string(e).map(|s| resolve_tf_locals(&s, &locals));
 
     struct TfLambda {
         handler: Option<String>,
@@ -980,10 +1341,10 @@ fn scan_terraform(dir: &str, source: &str) -> Vec<IacFinding> {
             "resource" if labels.len() >= 2 => {
                 let rtype = labels[0].as_str();
                 let name = labels[1].as_str().to_string();
-                let line = line_containing(source, &format!("\"{name}\""));
+                let line = line_of_tf_block(source, rtype, &name);
                 match rtype {
                     "aws_apigatewayv2_route" => {
-                        let Some(rk) = attr(b, "route_key").and_then(expr_string) else {
+                        let Some(rk) = attr(b, "route_key").and_then(&lstr) else {
                             continue;
                         };
                         let target = attr(b, "target")
@@ -999,21 +1360,21 @@ fn scan_terraform(dir: &str, source: &str) -> Vec<IacFinding> {
                     }
                     // Quick-create API: inline route_key + lambda target.
                     "aws_apigatewayv2_api" => {
-                        if let Some(rk) = attr(b, "route_key").and_then(expr_string) {
+                        if let Some(rk) = attr(b, "route_key").and_then(&lstr) {
                             let lam =
                                 attr(b, "target").and_then(|e| ref_of(e, "aws_lambda_function"));
                             quick.push((rk, lam, line));
                         }
                     }
                     "aws_api_gateway_resource" => {
-                        let Some(part) = attr(b, "path_part").and_then(expr_string) else {
+                        let Some(part) = attr(b, "path_part").and_then(&lstr) else {
                             continue;
                         };
                         let parent = attr(b, "parent_id").map(tf_parent).unwrap_or(Parent::Unknown);
                         rest_parts_owned.push((name, part, parent));
                     }
                     "aws_api_gateway_method" => {
-                        let Some(m) = attr(b, "http_method").and_then(expr_string) else {
+                        let Some(m) = attr(b, "http_method").and_then(&lstr) else {
                             continue;
                         };
                         let resource =
@@ -1025,7 +1386,7 @@ fn scan_terraform(dir: &str, source: &str) -> Vec<IacFinding> {
                             attr(b, "resource_id").map(tf_parent).unwrap_or(Parent::Unknown);
                         // Often a traversal to the method's http_method ->
                         // None -> wildcard match on the resource.
-                        let m = attr(b, "http_method").and_then(expr_string);
+                        let m = attr(b, "http_method").and_then(&lstr);
                         let lam = attr(b, "uri").and_then(|e| ref_of(e, "aws_lambda_function"));
                         rest_ints.push((resource, m, lam));
                     }
@@ -1033,8 +1394,8 @@ fn scan_terraform(dir: &str, source: &str) -> Vec<IacFinding> {
                         lambdas.insert(
                             name,
                             TfLambda {
-                                handler: attr(b, "handler").and_then(expr_string),
-                                runtime: attr(b, "runtime").and_then(expr_string),
+                                handler: attr(b, "handler").and_then(&lstr),
+                                runtime: attr(b, "runtime").and_then(&lstr),
                                 archive: attr(b, "filename")
                                     .and_then(|e| data_ref(e, "archive_file")),
                                 line,
@@ -1042,8 +1403,8 @@ fn scan_terraform(dir: &str, source: &str) -> Vec<IacFinding> {
                         );
                     }
                     "aws_appsync_resolver" => {
-                        let t = attr(b, "type").and_then(expr_string);
-                        let f = attr(b, "field").and_then(expr_string);
+                        let t = attr(b, "type").and_then(&lstr);
+                        let f = attr(b, "field").and_then(&lstr);
                         let ds = attr(b, "data_source").and_then(|e| {
                             ref_of(e, "aws_appsync_datasource").or_else(|| expr_string(e))
                         });
@@ -1074,11 +1435,11 @@ fn scan_terraform(dir: &str, source: &str) -> Vec<IacFinding> {
             }
             "data" if labels.len() >= 2 && labels[0].as_str() == "archive_file" => {
                 let base = attr(b, "source_dir")
-                    .and_then(expr_string)
+                    .and_then(&lstr)
                     .and_then(|r| module_path(dir, &r))
                     .or_else(|| {
                         attr(b, "source_file")
-                            .and_then(expr_string)
+                            .and_then(&lstr)
                             .and_then(|r| module_path(dir, &r))
                             .map(|p| parent_dir(&p).to_string())
                     });
@@ -1135,6 +1496,7 @@ fn scan_terraform(dir: &str, source: &str) -> Vec<IacFinding> {
                 line,
                 handler: href,
                 require_handler: false,
+                sls: None,
             });
         };
 
@@ -1192,6 +1554,7 @@ fn scan_terraform(dir: &str, source: &str) -> Vec<IacFinding> {
             confidence: Confidence::High,
             handler: href,
             require_handler: false,
+            sls: None,
         });
     }
     for (name, l) in &lambdas {
@@ -1210,6 +1573,7 @@ fn scan_terraform(dir: &str, source: &str) -> Vec<IacFinding> {
             confidence: Confidence::Heuristic,
             handler: Some(href),
             require_handler: true,
+            sls: None,
         });
     }
     out
@@ -1233,13 +1597,48 @@ impl ConfMin for Confidence {
 /// Appends IaC findings as endpoints (ids stay sequential — only ever push)
 /// and re-correlates so IaC routes join in-repo client calls.
 pub fn attach(graph: &mut GigaGraph, files: &[(String, Vec<IacFinding>)]) {
+    // Split serverless configs: Include markers claim fragment files. A
+    // claimed fragment's findings adopt the including service's base_dir and
+    // provider runtime; unclaimed Fragment findings stay inert (the include
+    // is the evidence that a bare map of function defs is serverless config
+    // at all).
+    let mut includes: FxHashMap<&str, (&str, Runtime)> = FxHashMap::default();
+    for (_, findings) in files {
+        for f in findings {
+            if let Some(SlsRole::Include {
+                target,
+                base_dir,
+                runtime,
+            }) = &f.sls
+            {
+                includes.insert(target.as_str(), (base_dir.as_str(), *runtime));
+            }
+        }
+    }
     let mut appended = false;
     for (rel, findings) in files {
         let Some(&file_id) = graph.path_index.get(rel.as_str()) else {
             continue;
         };
         for f in findings {
-            let resolved = f.handler.as_ref().and_then(|h| resolve_handler(graph, h));
+            let frag_ctx = match &f.sls {
+                Some(SlsRole::Include { .. }) => continue, // marker, not an endpoint
+                Some(SlsRole::Fragment) => match includes.get(rel.as_str()) {
+                    Some(ctx) => Some(*ctx),
+                    None => continue, // unclaimed lookalike
+                },
+                None => None,
+            };
+            let href = f.handler.clone().map(|mut h| {
+                if let Some((base, rt)) = frag_ctx {
+                    h.base_dir = base.to_string();
+                    if h.runtime == Runtime::Unknown {
+                        h.runtime = rt;
+                    }
+                }
+                h
+            });
+            let resolved = href.as_ref().and_then(|h| resolve_handler(graph, h));
             if f.require_handler && resolved.is_none() {
                 continue;
             }
@@ -1278,7 +1677,7 @@ pub fn attach(graph: &mut GigaGraph, files: &[(String, Vec<IacFinding>)]) {
                 }
             };
             // A declared-but-unresolved handler string caps confidence.
-            let confidence = if f.handler.is_some() && resolved.is_none() {
+            let confidence = if href.is_some() && resolved.is_none() {
                 Confidence::Heuristic
             } else {
                 f.confidence

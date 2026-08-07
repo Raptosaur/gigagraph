@@ -1,6 +1,7 @@
 import Foundation
 
 protocol Store {
+    var name: String { get }
     func save(_ record: String)
 }
 
@@ -17,6 +18,10 @@ class DbStore: Store {
 struct MemoryStore: Store {
     func save(_ record: String) {}
 }
+
+// Extension conformance: the extended name is a user_type, still a
+// hierarchy edge.
+extension MemoryStore: Codable {}
 
 class Service {
     let store: Store

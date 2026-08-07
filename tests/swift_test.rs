@@ -271,6 +271,10 @@ fn extracts_swift_di_types() {
     assert_eq!(field_of(&file, "Service", "store"), Some("Store"));
     assert_eq!(field_of(&file, "Service", "label"), Some("String"));
 
+    // Protocol `var x: T { get }` requirement lands as a field of the
+    // protocol (protocol_property_declaration pattern).
+    assert_eq!(field_of(&file, "Store", "name"), Some("String"));
+
     // The @field pattern is restricted to class-body children, so a
     // function-body `let annotated: Store` must NOT become a Service field.
     assert_eq!(field_of(&file, "Service", "annotated"), None);
@@ -326,12 +330,14 @@ fn extracts_swift_di_types() {
         .collect();
     assert_eq!(recvs, vec![Some("self.store"), Some("store")]);
 
-    // Hierarchy edges: class conformance, struct conformance, and protocol
-    // inheritance each produce one declaring-type -> base edge.
+    // Hierarchy edges: class conformance, struct conformance, protocol
+    // inheritance, and extension conformance (`extension MemoryStore:
+    // Codable`) each produce one declaring-type -> base edge.
     for edge in [
         ("DbStore", "Store"),
         ("MemoryStore", "Store"),
         ("Cache", "Store"),
+        ("MemoryStore", "Codable"),
     ] {
         assert!(
             file.hierarchy

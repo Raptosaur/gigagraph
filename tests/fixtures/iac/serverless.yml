@@ -41,6 +41,39 @@ functions:
     handler: src/handlers/users.create
     events:
       - httpApi: '*'
+  # ${self:...} one-level resolution against this document.
+  varPath:
+    handler: ${self:custom.handlers.users}
+    events:
+      - http:
+          path: ${self:custom.basePath}/profiles
+          method: get
+  # ${opt:...} with a default literal.
+  optStage:
+    handler: src/handlers/users.create
+    events:
+      - http:
+          path: /stage/${opt:stage, 'dev'}/info
+          method: get
+  # Unresolvable self: path stays raw.
+  unresolvedVar:
+    handler: src/handlers/users.create
+    events:
+      - http:
+          path: /raw/${self:custom.missing}/x
+          method: get
+  # Nested variables stay raw.
+  nestedVar:
+    handler: src/handlers/users.create
+    events:
+      - http:
+          path: /n/${self:custom.${opt:k}}/y
+          method: get
+
+custom:
+  basePath: /v1
+  handlers:
+    users: src/handlers/users.create
 
 appSync:
   name: demo-api

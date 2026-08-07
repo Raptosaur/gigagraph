@@ -24,6 +24,7 @@ class SignupService extends BaseService implements Lifecycle, Auditable {
     private List<Signup> pending;
     @Autowired
     private Mailer mailer;
+    private com.acme.Notifier notifier;
     private int retries;
 
     SignupService(UserStore store, Mailer mailer) {
@@ -36,6 +37,11 @@ class SignupService extends BaseService implements Lifecycle, Auditable {
         var clock = new Clock();
         this.store.save(user);
         greeter.hello(user);
+    }
+
+    void enqueue(List<String> tags) {
+        Map<String, Signup> index = new HashMap<>();
+        this.mailer.send(tags);
     }
 }
 

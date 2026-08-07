@@ -41,16 +41,26 @@ pub struct Service {
     fallback: Box<dyn Store>,
     cache: Rc<Cache>,
     config: &'static Config,
+    journal: Arc<Mutex<Journal>>,
+    bus: Box<dyn Bus<Event>>,
 }
 
 impl Service {
-    pub fn with_store(store: DbStore, shared: Arc<dyn Store>, config: &Config) -> Self {
+    pub fn with_store(
+        store: DbStore,
+        shared: Arc<dyn Store>,
+        config: &Config,
+        journal: Arc<Mutex<Journal>>,
+        bus: Box<dyn Bus<Event>>,
+    ) -> Self {
         Service {
             store,
             shared: shared.clone(),
             fallback: Box::new(DbStore::new()),
             cache: Rc::new(Cache),
             config: leak(config),
+            journal,
+            bus,
         }
     }
 

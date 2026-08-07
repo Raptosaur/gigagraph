@@ -1,0 +1,14 @@
+# Split config: `functions:` as a list mixing a ${file(...)} include with an
+# inline definition.
+service: split-svc
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+
+functions:
+  - ${file(./functions.yml)}
+  - inlineExtra:
+      handler: ../src/handlers/orders.handler
+      events:
+        - http: GET split-inline

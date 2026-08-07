@@ -14,8 +14,14 @@ class OrderStore(BaseStore):
         persist(order)
 
 
+class Payment(events.Recorded):
+    # Dotted base: the whole `events.Recorded` attribute node is captured;
+    # clean_type keeps the last segment.
+    pass
+
+
 class OrderService:
-    def __init__(self, store: OrderStore, logger):
+    def __init__(self, store: OrderStore, logger, bus: infra.EventBus):
         # `self.store = store` captures the ctor PARAM NAME ("store") in type
         # position at extraction; the graph build joins it against the
         # `__init__` param's declared type (OrderStore).
@@ -29,12 +35,14 @@ class OrderService:
     def place(self, order):
         audit = AuditTrail()
         tag: OrderTag = make_tag(order)
+        # Dotted annotated local: `infra.time.Stamp` -> Stamp.
+        stamp: infra.time.Stamp = make_tag(order)
         self.store.save(order)
         audit.record(order)
         return tag
 
 
-def build_service(store: OrderStore = None):
+def build_service(store: OrderStore = None, bus: infra.EventBus = None):
     if store is None:
         store = OrderStore()
-    return OrderService(store, None)
+    return OrderService(store, None, bus)

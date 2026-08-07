@@ -6,6 +6,7 @@ use gigagraph::api::AppState;
 use gigagraph::endpoints::{ApiKind, Endpoint};
 use gigagraph::graph::GigaGraph;
 use gigagraph::indexer::{Index, build_index};
+use gigagraph::types::Confidence;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -294,6 +295,194 @@ fn terraform_legacy_forms() {
     assert_eq!(
         handler_loc(g, zip),
         Some(("src/handlers/report.py".into(), "lambda_handler".into()))
+    );
+}
+
+#[test]
+fn serverless_variable_resolution() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // ${self:custom.basePath} in the path and ${self:custom.handlers.users}
+    // as the handler, both resolved against the same document.
+    let profiles = ep(g, "serverless", "GET", "/v1/profiles");
+    assert_eq!(profiles.path_raw, "/v1/profiles");
+    assert_eq!(profiles.confidence, Confidence::High);
+    assert_eq!(
+        handler_loc(g, profiles),
+        Some(("src/handlers/users.js".into(), "create".into()))
+    );
+
+    // ${opt:stage, 'dev'} -> the default literal.
+    let stage = ep(g, "serverless", "GET", "/stage/dev/info");
+    assert_eq!(stage.path_raw, "/stage/dev/info");
+    assert_eq!(stage.confidence, Confidence::High);
+
+    // Unresolvable self: path stays raw + Heuristic.
+    let raw = ep(g, "serverless", "GET", "/raw/{*}/x");
+    assert_eq!(raw.path_raw, "/raw/${self:custom.missing}/x");
+    assert_eq!(raw.confidence, Confidence::Heuristic);
+
+    // Nested ${..${..}} stays raw + Heuristic, verbatim.
+    let nested = ep(g, "serverless", "GET", "/n/{*}/y");
+    assert_eq!(nested.path_raw, "/n/${self:custom.${opt:k}}/y");
+    assert_eq!(nested.confidence, Confidence::Heuristic);
+}
+
+#[test]
+fn cloudformation_inline_code() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // A route whose integration points at a Code.ZipFile lambda: the source
+    // is inside the template, so the route row survives with handler
+    // honestly None and stays High (the declaration is certain).
+    let inline = ep(g, "cloudformation", "GET", "/inline");
+    assert_eq!(g.files[inline.file_id as usize].path, "cfn_inline.yaml");
+    assert_eq!(inline.handler, None);
+    assert_eq!(inline.confidence, Confidence::High);
+
+    // A route-less ZipFile lambda is still surfaced (not silently dropped),
+    // handler None.
+    let orphan = ep(g, "lambda", "ANY", "/lambda/orphanzip");
+    assert_eq!(orphan.path_raw, "lambda:OrphanZip");
+    assert_eq!(orphan.handler, None);
+    assert_eq!(orphan.confidence, Confidence::Heuristic);
+}
+
+#[test]
+fn terraform_locals_one_hop() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // route_key "GET ${local.base}/users" resolves against same-file locals.
+    let users = ep(g, "terraform", "GET", "/api/users");
+    assert_eq!(g.files[users.file_id as usize].path, "locals.tf");
+    assert_eq!(users.path_raw, "/api/users");
+    assert_eq!(users.confidence, Confidence::High);
+    assert_eq!(
+        handler_loc(g, users),
+        Some(("src/handlers/users.js".into(), "create".into()))
+    );
+
+    // var.* stays unresolved: raw path + Heuristic.
+    let var = ep(g, "terraform", "PUT", "/v/{*}/users");
+    assert_eq!(var.path_raw, "/v/${var.stage}/users");
+    assert_eq!(var.confidence, Confidence::Heuristic);
+}
+
+#[test]
+fn serverless_split_functions() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // Fragment claimed via `functions: - ${file(./functions.yml)}`: routes
+    // attach to the fragment file, handlers resolve with the service's
+    // base_dir + provider runtime.
+    let users = ep(g, "serverless", "GET", "/split-users");
+    assert_eq!(g.files[users.file_id as usize].path, "split/functions.yml");
+    assert_eq!(
+        handler_loc(g, users),
+        Some(("src/handlers/users.js".into(), "create".into()))
+    );
+
+    // Inline {name: def} entries in the same functions list still work.
+    let inline = ep(g, "serverless", "GET", "/split-inline");
+    assert_eq!(g.files[inline.file_id as usize].path, "split/serverless.yml");
+    assert_eq!(
+        handler_loc(g, inline),
+        Some(("src/handlers/orders.js".into(), "handler".into()))
+    );
+
+    // An unclaimed fragment lookalike contributes nothing.
+    assert!(
+        g.endpoints
+            .endpoints
+            .iter()
+            .all(|e| e.path_norm != "/unclaimed-route"),
+        "unclaimed fragment must stay inert"
+    );
+}
+
+/// 1-based inclusive start line and exclusive end line of a YAML block: from
+/// the `<key>:` line to the next sibling at the same or lower indent.
+fn yaml_block_range(src: &str, key: &str) -> (u32, u32) {
+    let lines: Vec<&str> = src.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| {
+            let t = l.trim_start();
+            t.strip_prefix(key).is_some_and(|r| r.starts_with(':'))
+        })
+        .unwrap_or_else(|| panic!("no block {key}"));
+    let indent = lines[start].len() - lines[start].trim_start().len();
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, l)| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with('#') && (l.len() - t.len()) <= indent
+        })
+        .map(|(i, _)| i + 1)
+        .unwrap_or(lines.len() + 1);
+    ((start + 1) as u32, end as u32)
+}
+
+/// 1-based inclusive start and end of an HCL block: header line to the first
+/// `}` at column 0.
+fn tf_block_range(src: &str, header: &str) -> (u32, u32) {
+    let lines: Vec<&str> = src.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with(header))
+        .unwrap_or_else(|| panic!("no block {header}"));
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, l)| l.starts_with('}'))
+        .map(|(i, _)| i + 1)
+        .unwrap_or(lines.len());
+    ((start + 1) as u32, end as u32)
+}
+
+#[test]
+fn line_numbers_land_in_declaring_blocks() {
+    let idx = index();
+    let g = &idx.graph;
+
+    // YAML: the REST method row points inside its logical-id block.
+    let cfn = std::fs::read_to_string(root().join("cfn.yaml")).unwrap();
+    let (start, end) = yaml_block_range(&cfn, "DeleteUserMethod");
+    let del = ep(g, "cloudformation", "DELETE", "/users/{*}");
+    assert!(
+        del.line >= start && del.line < end,
+        "line {} outside DeleteUserMethod block [{start}, {end})",
+        del.line
+    );
+
+    // SAM: routes from events point at the event id line — inside the
+    // declaring function's block but past its header.
+    let sam = std::fs::read_to_string(root().join("template.yaml")).unwrap();
+    let (fstart, fend) = yaml_block_range(&sam, "OrdersFunction");
+    let orders = ep(g, "sam", "GET", "/orders");
+    assert!(
+        orders.line > fstart && orders.line < fend,
+        "line {} outside OrdersFunction event range ({fstart}, {fend})",
+        orders.line
+    );
+
+    // HCL: anchored to the `resource "type" "name"` header even though the
+    // name appears quoted earlier in the file (locals.route_hint).
+    let tf = std::fs::read_to_string(root().join("locals.tf")).unwrap();
+    let (rstart, rend) =
+        tf_block_range(&tf, "resource \"aws_apigatewayv2_route\" \"local_route\"");
+    let users = ep(g, "terraform", "GET", "/api/users");
+    assert!(
+        users.line >= rstart && users.line <= rend,
+        "line {} outside local_route block [{rstart}, {rend}]",
+        users.line
     );
 }
 

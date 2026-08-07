@@ -35,9 +35,16 @@ use crate::types::{ImportStyle, Lang};
 //     type is ever indexed, so this is harmless; the type-argument is NOT
 //     captured (it would wrongly resolve `this.books.add()` to `Book`).
 //     Primitive fields (`int count`, kind `integral_type`) don't match and are
-//     skipped by design.
+//     skipped by design. Qualified fields (`com.acme.Mailer m`, kind
+//     `scoped_type_identifier`, probe-verified) capture the WHOLE scoped node
+//     — its text is dot-joined with no whitespace, so clean_type keeps the
+//     last segment (`Mailer`).
 //   - `formal_parameter type:`/`name:` are named fields; catch params are a
-//     different kind (`catch_formal_parameter`) and stay out.
+//     different kind (`catch_formal_parameter`) and stay out. Generic-typed
+//     params and locals (`List<String> tags`) capture the container's
+//     `type_identifier` exactly like the generic field pattern (a
+//     `java.util.List<T>` generic wraps a `scoped_type_identifier` instead
+//     and stays out, same as everywhere else).
 //   - `local_variable_declaration` carries the declared type; `var` parses as
 //     a `type_identifier` with text "var", so the declared-type pattern is
 //     gated with `#not-eq?` and a value-side pattern recovers the type from
@@ -130,8 +137,17 @@ const QUERY: &str = r#"
   declarator: (variable_declarator
     name: (identifier) @field.name))
 
+(field_declaration
+  type: (scoped_type_identifier) @field.type
+  declarator: (variable_declarator
+    name: (identifier) @field.name))
+
 (formal_parameter
   type: (type_identifier) @local.type
+  name: (identifier) @local.name)
+
+(formal_parameter
+  type: (generic_type (type_identifier) @local.type)
   name: (identifier) @local.name)
 
 ((local_variable_declaration
@@ -139,6 +155,11 @@ const QUERY: &str = r#"
   declarator: (variable_declarator
     name: (identifier) @local.name))
   (#not-eq? @local.type "var"))
+
+(local_variable_declaration
+  type: (generic_type (type_identifier) @local.type)
+  declarator: (variable_declarator
+    name: (identifier) @local.name))
 
 (local_variable_declaration
   declarator: (variable_declarator

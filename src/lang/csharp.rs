@@ -53,6 +53,15 @@ use crate::types::{ImportStyle, Lang};
 //   assignment — not captured; C# fields always have declared types, so the
 //   declaration patterns suffice. Bare-field receivers (`_store.Save()`)
 //   resolve through the field capture (resolver checks locals, then fields).
+// - Call-site type args (probe-verified): `services.AddScoped<I, T>()` is an
+//   `invocation_expression` whose `member_access_expression name:` is a
+//   `generic_name (identifier, type_argument_list)`; the list's children are
+//   bare `identifier`s for simple names, `qualified_name` for dotted ones and
+//   `predefined_type` for primitives. Only bare identifiers are captured (the
+//   quantified `@call.typearg` group stops at the first non-identifier), so
+//   DI detection sees exactly-two-simple-name registrations and nothing else.
+//   The typearg patterns overlap the plain generic ones on purpose — the
+//   extractor's call dedupe merges them and keeps the typearg list.
 const QUERY: &str = r#"
 (method_declaration
   name: (identifier) @func.name
@@ -99,6 +108,20 @@ const QUERY: &str = r#"
   function: (member_access_expression
     expression: _ @call.recv
     name: (generic_name (identifier) @call.name))
+  arguments: (argument_list) @call.args) @call
+
+(invocation_expression
+  function: (member_access_expression
+    expression: _ @call.recv
+    name: (generic_name
+      (identifier) @call.name
+      (type_argument_list ((identifier) @call.typearg)+)))
+  arguments: (argument_list) @call.args) @call
+
+(invocation_expression
+  function: (generic_name
+    (identifier) @call.name
+    (type_argument_list ((identifier) @call.typearg)+))
   arguments: (argument_list) @call.args) @call
 
 (invocation_expression
