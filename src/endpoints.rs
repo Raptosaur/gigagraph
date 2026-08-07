@@ -304,6 +304,27 @@ struct FileCtx {
     /// Confidence caps the endpoints' confidence (fuzzy target resolution =
     /// Heuristic). `None` = mounted at conflicting prefixes.
     go_func_prefix: FxHashMap<u32, Option<(String, Confidence)>>,
+    /// Python web-framework prefix composition, keyed by the file whose
+    /// routes the prefix applies to: Flask blueprint registrations (keyed by
+    /// the blueprint's DEFINING file — route files resolve their `bp` import
+    /// back to it), FastAPI `APIRouter(prefix=)` + `include_router` chains
+    /// (composed transitively), Django `include()` chains between URLconf
+    /// files. Value: (joined prefix, crossed-file?) — cross-file joins are
+    /// Heuristic downstream; a same-file-literal-only prefix keeps High.
+    /// `None` = conflicting registrations (worse than no join).
+    py_mount: FxHashMap<u32, Option<(String, bool)>>,
+    /// DRF `@action` extra routes, keyed by ViewSet class name. Fuels
+    /// `router.register` expansion.
+    drf_actions: FxHashMap<String, Vec<DrfAction>>,
+    /// Python framework a file's router/blueprint constructor belongs to
+    /// ("flask" / "fastapi"): lets route files that import only the
+    /// blueprint (`from app.api import bp` — microblog's tokens.py imports
+    /// no flask symbol at all) inherit the defining file's framework
+    /// evidence through the same binding resolution the mount join uses.
+    py_fw: FxHashMap<u32, &'static str>,
+    /// Python class name -> base-class simple names, from file hierarchy
+    /// edges of Python files. Fuels ViewSet action-set refinement.
+    py_bases: FxHashMap<String, Vec<String>>,
 }
 
 /// Compose a file's transitive mount prefix, outermost first:
@@ -332,6 +353,17 @@ fn file_mount_prefix(ctx: &FileCtx, fid: u32) -> Option<String> {
             .rev()
             .fold(String::new(), |acc, p| join_prefix(&acc, p))
     })
+}
+
+/// One DRF `@action(detail=..., methods=[...])` decorated ViewSet method.
+struct DrfAction {
+    /// URL segment: `url_path` kwarg when given, else the method name.
+    segment: String,
+    detail: bool,
+    methods: Vec<HttpMethod>,
+    func_id: u32,
+    line: u32,
+
 }
 
 /// CDK import evidence: v2 monopackage + v1 scoped packages (JS/TS) and the
@@ -372,6 +404,22 @@ fn upsert_mount_file(
             }
         })
         .or_insert(Some((from, prefix)));
+}
+
+/// Like `upsert_mount`, for arbitrary conflict-degradable facts: a second,
+/// different value for the same key poisons the entry to `None`.
+fn upsert_val<K: std::hash::Hash + Eq, V: PartialEq>(
+    map: &mut FxHashMap<K, Option<V>>,
+    key: K,
+    val: Option<V>,
+) {
+    map.entry(key)
+        .and_modify(|v| {
+            if *v != val {
+                *v = None;
+            }
+        })
+        .or_insert(val);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -432,6 +480,25 @@ pub fn detect(
     // (file id, var) -> internal import path of the package whose constructor
     // produced the var (`adminAPI, _ := admin.NewAPI(db)`).
     let mut go_var_pkg: FxHashMap<(u32, String), String> = FxHashMap::default();
+    // Python prefix-composition scratch, folded into `ctx.py_mount` after the
+    // loop. `py_own`: a file's Blueprint/APIRouter constructor prefix.
+    // `py_edges`: child file -> (parent file, joining prefix, append child's
+    // own prefix?) from register_blueprint / include_router / include().
+    // `None` anywhere = conflicting facts, no join.
+    let mut py_own: FxHashMap<u32, Option<String>> = FxHashMap::default();
+    let mut py_edges: FxHashMap<u32, Option<(u32, String, bool)>> = FxHashMap::default();
+    for f in files {
+        if f.language == Lang::Python {
+            if let Some(edges) = file_hierarchy.get(f.id as usize) {
+                for (ty, base) in edges {
+                    ctx.py_bases
+                        .entry(ty.clone())
+                        .or_default()
+                        .push(base.clone());
+                }
+            }
+        }
+    }
     for func in functions {
         let fid = func.file_id;
         let file = &files[fid as usize];
@@ -728,15 +795,186 @@ pub fn detect(
                     }
                 }
             }
-            Lang::Python if has(fid, CDK_EV_PY) => {
-                collect_cdk_lambdas(
-                    file,
-                    files,
-                    calls,
-                    functions,
-                    name_index,
-                    cdk_decls.entry(fid).or_default(),
-                );
+            Lang::Python => {
+                if has(fid, CDK_EV_PY) {
+                    collect_cdk_lambdas(
+                        file,
+                        files,
+                        calls,
+                        functions,
+                        name_index,
+                        cdk_decls.entry(fid).or_default(),
+                    );
+                }
+                let flask = has(fid, &["flask"]);
+                let fastapi = has(fid, &["fastapi"]);
+                if flask || fastapi {
+                    for call in calls {
+                        match call.name.as_str() {
+                            // A file's own router prefix: applies to routes
+                            // decorated in this file (and rides along when
+                            // the router is included elsewhere). Known limit:
+                            // the constructor's ASSIGNED NAME is not
+                            // harvested, so a file defining both an app and a
+                            // prefixed blueprint attributes the prefix to
+                            // both receivers.
+                            "Blueprint" if flask => {
+                                let p = str_lit_by_key(call, &["url_prefix"]).unwrap_or_default();
+                                upsert_val(&mut py_own, fid, Some(p));
+                                ctx.py_fw.insert(fid, "flask");
+                            }
+                            "APIRouter" if fastapi => {
+                                let p = str_lit_by_key(call, &["prefix"]).unwrap_or_default();
+                                upsert_val(&mut py_own, fid, Some(p));
+                                ctx.py_fw.insert(fid, "fastapi");
+                            }
+                            // `app.register_blueprint(auth_bp, url_prefix=
+                            // '/auth')`: the ident resolves through this
+                            // file's imports to the blueprint's DEFINING
+                            // file; a url_prefix kwarg OVERRIDES the
+                            // blueprint's own (Flask semantics), absence
+                            // falls back to it.
+                            "register_blueprint" if flask => {
+                                let Some(base) = first_ident_base(call) else {
+                                    continue;
+                                };
+                                let target = py_binding_file(file, &base, files);
+                                if target == fid {
+                                    continue;
+                                }
+                                let edge = match str_lit_by_key(call, &["url_prefix"]) {
+                                    Some(p) => (fid, p, false),
+                                    None => (fid, String::new(), true),
+                                };
+                                upsert_val(&mut py_edges, target, Some(edge));
+                            }
+                            // `app.include_router(api_router, prefix=...)` /
+                            // `api_router.include_router(items.router)`:
+                            // chains compose transitively in the fold below.
+                            // A prefix given as an Ident resolves through
+                            // string constants (`settings.API_V1_STR`); an
+                            // unresolvable one poisons the join — a partial
+                            // prefix would be a wrong answer.
+                            "include_router" if fastapi => {
+                                let Some(base) = first_ident_base(call) else {
+                                    continue;
+                                };
+                                let target = py_binding_file(file, &base, files);
+                                if target == fid {
+                                    continue;
+                                }
+                                let pre = match str_lit_by_key(call, &["prefix"]) {
+                                    Some(p) => Some(p),
+                                    None => match ident_by_key(call, "prefix") {
+                                        Some(ident) => resolve_py_const(&ident, file, files),
+                                        None => Some(String::new()),
+                                    },
+                                };
+                                match pre {
+                                    Some(p) => {
+                                        upsert_val(&mut py_edges, target, Some((fid, p, true)));
+                                    }
+                                    None => {
+                                        py_edges.insert(target, None);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Django URLconf `path('api/', include('app.urls'))`: a
+                // cross-file mount edge; the dotted module string resolves
+                // against the indexed tree (exact from the root, then unique
+                // suffix for projects rooted below the index root).
+                if is_py_urls_file(&file.path) {
+                    for call in calls {
+                        if call.name != "include" {
+                            continue;
+                        }
+                        // Module-string includes only: `include(router.urls)`
+                        // and inline lists carry an Ident (and their tuple
+                        // namespace is a bare word) — a real URLconf module
+                        // is dotted ('app.urls').
+                        if call
+                            .arg_lits
+                            .iter()
+                            .any(|l| l.kind == LitKind::Ident && l.key.is_none())
+                        {
+                            continue;
+                        }
+                        let Some(target) = first_str_lit(call)
+                            .filter(|m| m.contains('.'))
+                            .and_then(|module| resolve_py_module(&module, files))
+                            .filter(|t| *t != fid)
+                        else {
+                            continue;
+                        };
+                        let mut pre = String::new();
+                        let mut ok = true;
+                        for enc in enclosing_django_paths(call, calls) {
+                            match first_str_lit(enc)
+                                .and_then(|s| clean_django_pattern(&s, enc.name != "path"))
+                            {
+                                Some(p) => pre = join_prefix(&pre, &p),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok {
+                            upsert_val(&mut py_edges, target, Some((fid, pre, true)));
+                        } else {
+                            py_edges.insert(target, None);
+                        }
+                    }
+                }
+                // DRF `@action(detail=..., methods=[...])` ViewSet methods:
+                // recorded by class name for router.register expansion.
+                if has(fid, &["rest_framework"]) {
+                    if let Some(t) = &func.containing_type {
+                        for d in &decorations[func.id as usize] {
+                            if d.name.rsplit('.').next() != Some("action") {
+                                continue;
+                            }
+                            let Some(detail) = d
+                                .arg_lits
+                                .iter()
+                                .find(|l| l.key.as_deref() == Some("detail"))
+                                .map(|l| l.text == "True")
+                            else {
+                                continue;
+                            };
+                            let mut methods: Vec<HttpMethod> = d
+                                .arg_lits
+                                .iter()
+                                .filter(|l| {
+                                    l.key.as_deref() == Some("methods") && l.kind == LitKind::Str
+                                })
+                                .filter_map(|l| HttpMethod::from_name(&l.text))
+                                .collect();
+                            if methods.is_empty() {
+                                methods.push(HttpMethod::Get);
+                            }
+                            let segment = d
+                                .arg_lits
+                                .iter()
+                                .find(|l| {
+                                    l.key.as_deref() == Some("url_path") && l.kind == LitKind::Str
+                                })
+                                .map(|l| l.text.clone())
+                                .unwrap_or_else(|| func.name.clone());
+                            ctx.drf_actions.entry(t.clone()).or_default().push(DrfAction {
+                                segment,
+                                detail,
+                                methods,
+                                func_id: func.id,
+                                line: d.line,
+                            });
+                        }
+                    }
+                }
             }
             Lang::CSharp => {
                 // Minimal-API groups: `app.MapGroup("/api")`. The `var api =`
@@ -999,6 +1237,14 @@ pub fn detect(
         ctx.cdk_lambda
             .insert(fid, if decls.len() == 1 { decls[0] } else { None });
     }
+    // Fold Python prefix facts into per-file composed mounts.
+    let mut py_keys: Vec<u32> = py_own.keys().chain(py_edges.keys()).copied().collect();
+    py_keys.sort_unstable();
+    py_keys.dedup();
+    for f in py_keys {
+        ctx.py_mount
+            .insert(f, resolve_py_mount(f, &py_own, &py_edges, 0));
+    }
 
     // ASP.NET class-level `[Route]` templates from type_decorations, keyed
     // project-wide by class name (attribute routing inherits across files),
@@ -1076,6 +1322,7 @@ pub fn detect(
         detect_server(
             func,
             file,
+            files,
             calls,
             decos,
             &has,
@@ -1580,6 +1827,7 @@ fn push_rpc_op(
 fn detect_server(
     func: &FunctionInfo,
     file: &FileInfo,
+    files: &[FileInfo],
     calls: &[RawCall],
     decos: &[RawDecoration],
     has: &dyn Fn(u32, &[&str]) -> bool,
@@ -1762,9 +2010,13 @@ fn detect_server(
             if has(fid, CDK_EV_PY) {
                 detect_cdk(func, calls, ctx, idx);
             }
-            // Django URLconf: gated on the `urls.py` naming convention.
-            if file.path.ends_with("urls.py") {
+            // Django URLconf: gated on the urls.py naming convention (or an
+            // app's `urls/` package — djangoproject.com routes from
+            // djangoproject/urls/www.py).
+            if is_py_urls_file(&file.path) {
                 let django = has(fid, &["django"]);
+                let drf = has(fid, &["rest_framework"]);
+                let mount = ctx.py_mount.get(&fid).cloned().flatten();
                 for call in calls {
                     let legacy = matches!(call.name.as_str(), "url" | "re_path");
                     if call.name != "path" && !legacy {
@@ -1773,46 +2025,139 @@ fn detect_server(
                     let Some(raw) = first_str_lit(call) else {
                         continue;
                     };
-                    let mut p = raw;
-                    let conf = if legacy || !django {
+                    let Some(own) = clean_django_pattern(&raw, legacy) else {
+                        continue;
+                    };
+                    // Prefix: cross-file include() mount (pre-pass) + any
+                    // enclosing same-file path(include([...])) nesting.
+                    let mut conf = if legacy || !django {
                         Confidence::Heuristic
                     } else {
                         Confidence::High
                     };
-                    if legacy {
-                        // url(r'^users/$', ...): accept only when, after the
-                        // ^...$ anchors, the pattern is a plain path (no
-                        // regex normalization attempted).
-                        p = p.trim_start_matches('^').trim_end_matches('$').to_string();
-                        if p.contains(|c: char| "\\^$*+?()[]|".contains(c)) {
-                            continue;
+                    let mut prefix = String::new();
+                    if let Some((mp, cross)) = &mount {
+                        prefix = mp.clone();
+                        if *cross {
+                            conf = Confidence::Heuristic;
                         }
                     }
-                    let path = ensure_slash(&p);
+                    let mut ok = true;
+                    for enc in enclosing_django_paths(call, calls) {
+                        match first_str_lit(enc)
+                            .and_then(|s| clean_django_pattern(&s, enc.name != "path"))
+                        {
+                            Some(p) => prefix = join_prefix(&prefix, &p),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    // A path() wrapping include(...) is a mount, not a
+                    // route: the included file's rows carry the composed
+                    // paths (cross-file includes register a mount in the
+                    // pre-pass; inline `include([path(...), ...])` lists
+                    // emit their inner rows via the enclosing chain above).
+                    // A DRF `include(router.urls)` expands the router's
+                    // registrations instead.
+                    if let Some(inc) = calls
+                        .iter()
+                        .filter(|c| {
+                            c.name == "include"
+                                && c.start_byte > call.start_byte
+                                && c.end_byte <= call.end_byte
+                        })
+                        .min_by_key(|c| c.start_byte)
+                    {
+                        if drf {
+                            if let Some(router) = inc
+                                .arg_lits
+                                .iter()
+                                .find(|l| {
+                                    l.kind == LitKind::Ident
+                                        && l.key.is_none()
+                                        && l.text.ends_with(".urls")
+                                })
+                                .and_then(|l| l.text.split('.').next())
+                            {
+                                let base = join_prefix(&prefix, &own);
+                                expand_drf_router(
+                                    idx, router, &base, calls, ctx, functions, name_index, fid,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    let path = ensure_slash(&join_prefix(&prefix, &own));
                     let Some(norm) = normalize_path(&path) else {
                         continue;
                     };
-                    let handler = handler_from_ident(call, func, file, functions, name_index);
-                    idx.endpoints.push(Endpoint {
-                        id: idx.endpoints.len() as u32,
-                        kind: ApiKind::Http,
-                        method: HttpMethod::Any,
-                        path_raw: path,
-                        path_norm: norm,
-                        framework: "django".into(),
-                        file_id: fid,
-                        line: call.line,
-                        handler,
-                        confidence: conf,
-                    });
+                    // Class-based views (`UserApi.as_view()`): the class's
+                    // HTTP-verb methods pin real methods + handlers; plain
+                    // function handlers stay ANY.
+                    let verbs = call
+                        .arg_lits
+                        .iter()
+                        .find(|l| {
+                            l.kind == LitKind::Ident
+                                && l.key.is_none()
+                                && l.text.ends_with(".as_view")
+                        })
+                        .and_then(|l| {
+                            let segs: Vec<&str> = l.text.split('.').collect();
+                            segs.len().checked_sub(2).map(|i| segs[i].to_string())
+                        })
+                        .map(|class| class_verb_methods(&class, functions, name_index))
+                        .filter(|v| !v.is_empty());
+                    match verbs {
+                        Some(vs) => {
+                            for (m, h) in vs {
+                                push_endpoint(
+                                    idx,
+                                    m,
+                                    path.clone(),
+                                    norm.clone(),
+                                    "django",
+                                    func,
+                                    call,
+                                    h,
+                                    Confidence::Heuristic,
+                                );
+                            }
+                        }
+                        None => {
+                            let handler = handler_from_ident(call, func, file, functions, name_index);
+                            push_endpoint(
+                                idx,
+                                HttpMethod::Any,
+                                path,
+                                norm,
+                                "django",
+                                func,
+                                call,
+                                handler,
+                                conf,
+                            );
+                        }
+                    }
                 }
             }
             let flask = has(fid, &["flask"]);
             let fastapi = has(fid, &["fastapi"]);
-            if !flask && !fastapi {
-                return;
-            }
-            let fw = if fastapi { "fastapi" } else { "flask" };
+            let aiohttp = has(fid, &["aiohttp"]);
+            let file_fw: Option<&'static str> = if fastapi {
+                Some("fastapi")
+            } else if flask {
+                Some("flask")
+            } else if aiohttp {
+                Some("aiohttp")
+            } else {
+                None
+            };
             for d in decos {
                 let verb = d.name.rsplit('.').next().unwrap_or(&d.name);
                 let is_route = verb == "route";
@@ -1820,8 +2165,36 @@ fn detect_server(
                 if !is_route && method.is_none() {
                     continue;
                 }
-                let Some(path) = first_deco_str(d) else {
+                let Some(sub) = first_deco_str(d) else {
                     continue;
+                };
+                // Flask/FastAPI/aiohttp rules always start with '/'; this
+                // also keeps verb-named non-route decorators
+                // (`@mock.patch("app.api")`) out.
+                if !sub.starts_with('/') {
+                    continue;
+                }
+                // `@bp.route`: resolve the receiver to the file defining the
+                // blueprint/router (its import, else this file). That file
+                // supplies the composed mount prefix — and, for route
+                // modules importing only the blueprint, the framework
+                // evidence.
+                let bound = deco_receiver_base(&d.name).map(|b| py_binding_file(file, &b, files));
+                let Some(fw) = file_fw.or_else(|| bound.and_then(|b| ctx.py_fw.get(&b).copied()))
+                else {
+                    continue;
+                };
+                let (path, conf) = match bound.and_then(|d| ctx.py_mount.get(&d).cloned().flatten())
+                {
+                    Some((mp, cross)) => (
+                        ensure_slash(&join_prefix(&mp, &sub)),
+                        if cross {
+                            Confidence::Heuristic
+                        } else {
+                            Confidence::High
+                        },
+                    ),
+                    None => (sub, Confidence::High),
                 };
                 let Some(norm) = normalize_path(&path) else {
                     continue;
@@ -1852,8 +2225,170 @@ fn detect_server(
                         file_id: fid,
                         line: d.line,
                         handler: Some(func.id),
-                        confidence: Confidence::High,
+                        confidence: conf,
                     });
+                }
+            }
+            // Flask `add_url_rule('/x', view_func=CounterAPI.as_view(...))`:
+            // MethodView classes dispatch by verb-named methods, exactly
+            // like Django CBVs.
+            if flask {
+                for call in calls {
+                    if call.name != "add_url_rule" {
+                        continue;
+                    }
+                    let Some(raw) = first_str_lit(call) else {
+                        continue;
+                    };
+                    let (path, conf) = match call
+                        .receiver
+                        .as_deref()
+                        .and_then(|r| r.split('.').next())
+                        .map(|b| py_binding_file(file, b, files))
+                        .and_then(|d| ctx.py_mount.get(&d).cloned().flatten())
+                    {
+                        Some((mp, cross)) => (
+                            ensure_slash(&join_prefix(&mp, &raw)),
+                            if cross {
+                                Confidence::Heuristic
+                            } else {
+                                Confidence::High
+                            },
+                        ),
+                        None => (ensure_slash(&raw), Confidence::High),
+                    };
+                    let Some(norm) = normalize_path(&path) else {
+                        continue;
+                    };
+                    let listed: Vec<HttpMethod> = call
+                        .arg_lits
+                        .iter()
+                        .filter(|l| l.key.as_deref() == Some("methods") && l.kind == LitKind::Str)
+                        .filter_map(|l| HttpMethod::from_name(&l.text))
+                        .collect();
+                    let view_verbs = call
+                        .arg_lits
+                        .iter()
+                        .find(|l| l.kind == LitKind::Ident && l.text.ends_with(".as_view"))
+                        .and_then(|l| {
+                            let segs: Vec<&str> = l.text.split('.').collect();
+                            segs.len().checked_sub(2).map(|i| segs[i].to_string())
+                        })
+                        .map(|class| class_verb_methods(&class, functions, name_index))
+                        .filter(|v| !v.is_empty());
+                    if !listed.is_empty() {
+                        let handler = handler_from_ident(call, func, file, functions, name_index);
+                        for m in listed {
+                            push_endpoint(
+                                idx,
+                                m,
+                                path.clone(),
+                                norm.clone(),
+                                "flask",
+                                func,
+                                call,
+                                handler,
+                                conf,
+                            );
+                        }
+                    } else if let Some(vs) = view_verbs {
+                        for (m, h) in vs {
+                            push_endpoint(
+                                idx,
+                                m,
+                                path.clone(),
+                                norm.clone(),
+                                "flask",
+                                func,
+                                call,
+                                h,
+                                Confidence::Heuristic,
+                            );
+                        }
+                    } else {
+                        let handler = handler_from_ident(call, func, file, functions, name_index);
+                        push_endpoint(
+                            idx,
+                            HttpMethod::Get,
+                            path,
+                            norm,
+                            "flask",
+                            func,
+                            call,
+                            handler,
+                            conf,
+                        );
+                    }
+                }
+            }
+            // aiohttp: `app.router.add_get('/x', handler)` /
+            // `router.add_post(...)` / `web.get('/x', h)` rows inside
+            // `app.add_routes([...])` lists / aliased bare
+            // `add_route('GET', '/x', h)`. `add_static` is skipped.
+            // Route modules often take the router as a parameter and import
+            // nothing from aiohttp (`def setup_routes(app, handler)` —
+            // aiohttp-demos' moderator/shortify/motortwit), so
+            // project-level dependency evidence admits the `add_*` shapes
+            // too, at Heuristic.
+            let aio_conf = if aiohttp {
+                Some(Confidence::High)
+            } else if project_evidence.contains("aiohttp") {
+                Some(Confidence::Heuristic)
+            } else {
+                None
+            };
+            if let Some(aio_conf) = aio_conf {
+                for call in calls {
+                    let (method, path) = if call.receiver.as_deref() == Some("web") {
+                        // Server-route table entries, not ClientSession
+                        // calls: those carry a receiver like `session`.
+                        let Some(m) =
+                            HttpMethod::from_name(&call.name).filter(|m| *m != HttpMethod::Any)
+                        else {
+                            continue;
+                        };
+                        let Some(p) = first_path_lit(call) else {
+                            continue;
+                        };
+                        if !call
+                            .arg_lits
+                            .iter()
+                            .any(|l| l.kind == LitKind::Ident && l.key.is_none())
+                        {
+                            continue; // no handler argument -> not a route
+                        }
+                        (m, p)
+                    } else if let Some(verb) = call.name.strip_prefix("add_") {
+                        match verb {
+                            "route" | "view" => {
+                                let m = first_str_lit(call)
+                                    .and_then(|s| HttpMethod::from_name(&s))
+                                    .unwrap_or(HttpMethod::Any);
+                                let Some(p) = path_shaped_lit(call) else {
+                                    continue;
+                                };
+                                (m, p)
+                            }
+                            _ => {
+                                let Some(m) = HttpMethod::from_name(verb) else {
+                                    continue;
+                                };
+                                let Some(p) = first_path_lit(call) else {
+                                    continue;
+                                };
+                                (m, p)
+                            }
+                        }
+                    } else {
+                        continue;
+                    };
+                    let Some(norm) = normalize_path(&path) else {
+                        continue;
+                    };
+                    let handler = handler_from_ident(call, func, file, functions, name_index);
+                    push_endpoint(
+                        idx, method, path, norm, "aiohttp", func, call, handler, aio_conf,
+                    );
                 }
             }
         }
@@ -5354,6 +5889,436 @@ fn resolve_go_target(
         }
     }
     None
+}
+
+/// Django URLconf gate: the classic `urls.py` naming convention, or a module
+/// inside an app's `urls/` package (djangoproject.com's
+/// `djangoproject/urls/www.py`).
+fn is_py_urls_file(path: &str) -> bool {
+    path.ends_with("urls.py") || path.contains("/urls/")
+}
+
+/// `url(r'^users/$', ...)` legacy patterns: accept only when, after the
+/// `^...$` anchors, the pattern is a plain path (no regex normalization
+/// attempted). `path()` strings pass through.
+fn clean_django_pattern(raw: &str, legacy: bool) -> Option<String> {
+    if !legacy {
+        return Some(raw.to_string());
+    }
+    let p = raw.trim_start_matches('^').trim_end_matches('$');
+    if p.contains(|c: char| "\\^$*+?()[]|".contains(c)) {
+        return None;
+    }
+    Some(p.to_string())
+}
+
+/// Route-registration calls strictly enclosing `call` in the same flat call
+/// list (inline `include([path(...), ...])` nesting), outermost first.
+fn enclosing_django_paths<'a>(call: &RawCall, calls: &'a [RawCall]) -> Vec<&'a RawCall> {
+    let mut encl: Vec<&RawCall> = calls
+        .iter()
+        .filter(|p| {
+            matches!(p.name.as_str(), "path" | "url" | "re_path")
+                && p.start_byte < call.start_byte
+                && p.end_byte >= call.end_byte
+        })
+        .collect();
+    encl.sort_by_key(|p| p.start_byte);
+    encl
+}
+
+/// First unkeyed identifier argument's leading segment (`items.router` ->
+/// `items`): the local name a mounted router/blueprint travels under.
+fn first_ident_base(call: &RawCall) -> Option<String> {
+    call.arg_lits
+        .iter()
+        .find(|l| l.kind == LitKind::Ident && l.key.is_none())
+        .and_then(|l| l.text.split('.').next().map(str::to_string))
+        .filter(|s| !s.is_empty())
+}
+
+fn ident_by_key(call: &RawCall, key: &str) -> Option<String> {
+    call.arg_lits
+        .iter()
+        .find(|l| l.kind == LitKind::Ident && l.key.as_deref() == Some(key))
+        .map(|l| l.text.clone())
+}
+
+/// `@bp.route` -> `bp`: the decorator's receiver spelling, whose defining
+/// file keys the composed mount prefix.
+fn deco_receiver_base(name: &str) -> Option<String> {
+    let (recv, _) = name.rsplit_once('.')?;
+    recv.split('.')
+        .next()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+/// Resolve a dotted Python module to an indexed file: exact from the index
+/// root (`a.b` -> a/b.py, a/b/__init__.py), then a UNIQUE path-suffix match
+/// for projects rooted below the index root (`app.api.main` ->
+/// backend/app/api/main.py).
+fn resolve_py_module(dotted: &str, files: &[FileInfo]) -> Option<u32> {
+    let rel = dotted.trim_matches('.').replace('.', "/");
+    if rel.is_empty() || rel.contains(|c: char| !c.is_alphanumeric() && c != '_' && c != '/') {
+        return None;
+    }
+    let cands = [format!("{rel}.py"), format!("{rel}/__init__.py")];
+    for cand in &cands {
+        if let Some(f) = files.iter().find(|f| f.path == *cand) {
+            return Some(f.id);
+        }
+    }
+    for cand in &cands {
+        let suffix = format!("/{cand}");
+        let mut hit = None;
+        for f in files {
+            if f.path.ends_with(&suffix) {
+                if hit.is_some() {
+                    hit = None;
+                    break;
+                }
+                hit = Some(f.id);
+            }
+        }
+        if hit.is_some() {
+            return hit;
+        }
+    }
+    None
+}
+
+/// The file defining local name `base`: an import binding (`from a.b import
+/// base` / `... as base`) resolves to the a/b/base.py submodule when one
+/// exists, else the imported module itself; no binding means `base` is
+/// defined in this very file.
+fn py_binding_file(file: &FileInfo, base: &str, files: &[FileInfo]) -> u32 {
+    for imp in &file.imports {
+        if !imp.names.iter().any(|n| n == base) {
+            continue;
+        }
+        if let Some(rid) = imp.resolved_file {
+            let rpath = &files[rid as usize].path;
+            if let Some(dir) = rpath.strip_suffix("/__init__.py") {
+                for cand in [
+                    format!("{dir}/{base}.py"),
+                    format!("{dir}/{base}/__init__.py"),
+                ] {
+                    if let Some(f) = files.iter().find(|f| f.path == cand) {
+                        return f.id;
+                    }
+                }
+            }
+            return rid;
+        }
+        if let Some(id) = resolve_py_module(&format!("{}.{base}", imp.path), files)
+            .or_else(|| resolve_py_module(&imp.path, files))
+        {
+            return id;
+        }
+    }
+    file.id
+}
+
+/// Resolve an identifier used where a prefix string is expected:
+/// `settings.API_V1_STR` follows the `settings` import to its module and
+/// looks the tail up among that file's string constants; a bare name checks
+/// this file's own constants (keyed kwargs are not covered by the graph
+/// build's `substitute_consts`, which rewrites unkeyed args only).
+fn resolve_py_const(ident: &str, file: &FileInfo, files: &[FileInfo]) -> Option<String> {
+    match ident.rsplit_once('.') {
+        Some((obj, tail)) => {
+            let base = obj.split('.').next().unwrap_or(obj);
+            let target = py_binding_file(file, base, files);
+            files[target as usize]
+                .consts
+                .iter()
+                .find(|(n, _)| n == tail)
+                .map(|(_, v)| v.clone())
+        }
+        None => file
+            .consts
+            .iter()
+            .find(|(n, _)| n == ident)
+            .map(|(_, v)| v.clone()),
+    }
+}
+
+/// Composed mount prefix for routes declared against `fid`'s router:
+/// eff(f) = eff(parent) + edge prefix (+ f's own constructor prefix unless a
+/// Flask registration kwarg overrode it). Roots reduce to the own prefix
+/// alone. Bool = a cross-file edge contributed (Heuristic downstream).
+fn resolve_py_mount(
+    fid: u32,
+    own: &FxHashMap<u32, Option<String>>,
+    edges: &FxHashMap<u32, Option<(u32, String, bool)>>,
+    depth: u8,
+) -> Option<(String, bool)> {
+    if depth > 12 {
+        return None; // cycle or absurd nesting
+    }
+    let own_p = match own.get(&fid) {
+        Some(Some(p)) => p.clone(),
+        Some(None) => return None,
+        None => String::new(),
+    };
+    match edges.get(&fid) {
+        None => Some((own_p, false)),
+        Some(None) => None,
+        Some(Some((parent, pre, append_own))) => {
+            let (base, _) = resolve_py_mount(*parent, own, edges, depth + 1)?;
+            let mut p = join_prefix(&base, pre);
+            if *append_own && !own_p.is_empty() {
+                p = join_prefix(&p, &own_p);
+            }
+            Some((p, true))
+        }
+    }
+}
+
+/// HTTP-verb methods (get/post/...) defined on a class: Django/DRF
+/// class-based views (`X.as_view()`) and Flask MethodViews dispatch by
+/// method name. Handler resolves when the (class, verb) pair is unique.
+fn class_verb_methods(
+    class: &str,
+    functions: &[FunctionInfo],
+    name_index: &FxHashMap<String, Vec<u32>>,
+) -> Vec<(HttpMethod, Option<u32>)> {
+    let mut out = Vec::new();
+    for v in VERBS {
+        let Some(ids) = name_index.get(*v) else {
+            continue;
+        };
+        let hits: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|&id| functions[id as usize].containing_type.as_deref() == Some(class))
+            .collect();
+        if !hits.is_empty() {
+            out.push((
+                HttpMethod::from_name(v).unwrap(),
+                (hits.len() == 1).then(|| hits[0]),
+            ));
+        }
+    }
+    out
+}
+
+/// All (transitive, depth-capped) base-class names of a Python class —
+/// project mixin classes in between still reveal `ModelViewSet` underneath.
+fn transitive_py_bases(class: &str, bases: &FxHashMap<String, Vec<String>>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut queue: Vec<String> = vec![class.to_string()];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for c in queue.drain(..) {
+            if let Some(bs) = bases.get(&c) {
+                for b in bs {
+                    if !out.contains(b) {
+                        out.push(b.clone());
+                        next.push(b.clone());
+                    }
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        queue = next;
+    }
+    out
+}
+
+/// DRF router prefixes and `@action` url_paths may embed regex
+/// (`'merge/(?P<target>[^/.]+)'`): fold any regex-bearing segment to a
+/// parameter so normalization sees `{*}` instead of noise.
+fn sanitize_route_regex(s: &str) -> String {
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in s.split('/').filter(|seg| !seg.is_empty()) {
+        let seg = if seg.contains(|c: char| "\\^$*+?()[]|<".contains(c)) {
+            "<*>"
+        } else {
+            seg
+        };
+        // A '/' inside a regex char class (`(?P<target>[^/.]+)`) splits one
+        // parameter into two: collapse consecutive params.
+        if !(seg == "<*>" && segs.last() == Some(&"<*>")) {
+            segs.push(seg);
+        }
+    }
+    segs.join("/")
+}
+
+/// DRF router expansion: `router.register('food', FoodViewSet)` behind
+/// `path('api/', include(router.urls))` becomes the conventional RESTful
+/// set — list/create on the collection, retrieve/update/partial_update/
+/// destroy on `<pk>` — refined by the ViewSet's transitive bases
+/// (`ReadOnly*` and `*ModelMixin` narrow it, plain ViewSets keep only the
+/// action methods they define) plus one row per recorded `@action`.
+/// Registrations must sit in the same flat call list as the include (module
+/// scope next to urlpatterns — where real projects put them); a router
+/// imported from another module does not expand. Always Heuristic: these
+/// routes are implied by convention, not written in the source.
+#[allow(clippy::too_many_arguments)]
+fn expand_drf_router(
+    idx: &mut EndpointIndex,
+    router: &str,
+    base: &str,
+    calls: &[RawCall],
+    ctx: &FileCtx,
+    functions: &[FunctionInfo],
+    name_index: &FxHashMap<String, Vec<u32>>,
+    fid: u32,
+) {
+    const ACTIONS: &[(&str, HttpMethod, bool)] = &[
+        ("list", HttpMethod::Get, false),
+        ("create", HttpMethod::Post, false),
+        ("retrieve", HttpMethod::Get, true),
+        ("update", HttpMethod::Put, true),
+        ("partial_update", HttpMethod::Patch, true),
+        ("destroy", HttpMethod::Delete, true),
+    ];
+    let in_class = |action: &str, class: &str| {
+        name_index.get(action).is_some_and(|ids| {
+            ids.iter()
+                .any(|&id| functions[id as usize].containing_type.as_deref() == Some(class))
+        })
+    };
+    for reg in calls {
+        if reg.name != "register" || reg.receiver.as_deref() != Some(router) {
+            continue;
+        }
+        let Some(res) = first_str_lit(reg) else {
+            continue;
+        };
+        let res = sanitize_route_regex(&res);
+        let Some(class) = reg
+            .arg_lits
+            .iter()
+            .find(|l| l.kind == LitKind::Ident && l.key.is_none() && l.index > 0)
+            .and_then(|l| l.text.rsplit('.').next())
+        else {
+            continue;
+        };
+        let bases = transitive_py_bases(class, &ctx.py_bases);
+        // The class plus its indexed ancestors: action methods and @actions
+        // defined on project mixins (tandoor's MergeMixin) count for every
+        // ViewSet inheriting them.
+        let lineage: Vec<&str> = std::iter::once(class)
+            .chain(bases.iter().map(String::as_str))
+            .collect();
+        let readonly = bases.iter().any(|b| b.contains("ReadOnly"));
+        let model = bases.iter().any(|b| b.contains("ModelViewSet"));
+        let selected: Vec<&(&str, HttpMethod, bool)> = if readonly {
+            ACTIONS
+                .iter()
+                .filter(|(n, ..)| matches!(*n, "list" | "retrieve"))
+                .collect()
+        } else if model {
+            ACTIONS.iter().collect()
+        } else {
+            let via_mixins: Vec<&(&str, HttpMethod, bool)> = ACTIONS
+                .iter()
+                .filter(|(n, ..)| {
+                    bases.iter().any(|b| match *n {
+                        "list" => b.contains("ListModelMixin"),
+                        "create" => b.contains("CreateModelMixin"),
+                        "retrieve" => b.contains("RetrieveModelMixin"),
+                        "update" | "partial_update" => b.contains("UpdateModelMixin"),
+                        "destroy" => b.contains("DestroyModelMixin"),
+                        _ => false,
+                    })
+                })
+                .collect();
+            let own: Vec<&(&str, HttpMethod, bool)> = ACTIONS
+                .iter()
+                .filter(|(n, ..)| lineage.iter().any(|c| in_class(n, c)))
+                .collect();
+            if !via_mixins.is_empty() {
+                via_mixins
+            } else if !own.is_empty() {
+                own
+            } else if bases.iter().any(|b| b.contains("ViewSet")) {
+                // A plain ViewSet/GenericViewSet defining no standard action
+                // methods binds NO conventional routes (tandoor's
+                // ServerSettingsViewSet serves only its @actions).
+                Vec::new()
+            } else {
+                // Nothing recognizable (bases outside the index): full
+                // conventional set, the honest default for a registered
+                // ViewSet.
+                ACTIONS.iter().collect()
+            }
+        };
+        let stem = join_prefix(base, &res);
+        for (action, method, detail) in selected {
+            let path = if *detail {
+                format!("{stem}/<pk>/")
+            } else {
+                format!("{stem}/")
+            };
+            let Some(norm) = normalize_path(&path) else {
+                continue;
+            };
+            let handler = name_index.get(*action).and_then(|ids| {
+                let hits: Vec<u32> = ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| {
+                        functions[id as usize]
+                            .containing_type
+                            .as_deref()
+                            .is_some_and(|t| lineage.contains(&t))
+                    })
+                    .collect();
+                (hits.len() == 1).then(|| hits[0])
+            });
+            idx.endpoints.push(Endpoint {
+                id: idx.endpoints.len() as u32,
+                kind: ApiKind::Http,
+                method: *method,
+                path_raw: path,
+                path_norm: norm,
+                framework: "drf".into(),
+                file_id: fid,
+                line: reg.line,
+                handler,
+                confidence: Confidence::Heuristic,
+            });
+        }
+        for a in lineage.iter().flat_map(|c| {
+            ctx.drf_actions
+                .get(*c)
+                .into_iter()
+                .flat_map(|v| v.iter())
+        }) {
+            {
+                let seg = sanitize_route_regex(&a.segment);
+                let path = if a.detail {
+                    format!("{stem}/<pk>/{seg}/")
+                } else {
+                    format!("{stem}/{seg}/")
+                };
+                let Some(norm) = normalize_path(&path) else {
+                    continue;
+                };
+                for m in &a.methods {
+                    idx.endpoints.push(Endpoint {
+                        id: idx.endpoints.len() as u32,
+                        kind: ApiKind::Http,
+                        method: *m,
+                        path_raw: path.clone(),
+                        path_norm: norm.clone(),
+                        framework: "drf".into(),
+                        file_id: fid,
+                        line: a.line,
+                        handler: Some(a.func_id),
+                        confidence: Confidence::Heuristic,
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn first_str_lit(call: &RawCall) -> Option<String> {

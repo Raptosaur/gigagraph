@@ -147,8 +147,17 @@ pub fn tree_fingerprint(root: &Path) -> u64 {
     h.write(env!("CARGO_PKG_VERSION").as_bytes());
     // Dependency manifests feed project-level endpoint evidence but are not
     // walked as source files — hash them so edits invalidate too.
-    if let Ok(bytes) = std::fs::read(root.join("composer.json")) {
-        h.write(&bytes);
+    for manifest in [
+        "composer.json",
+        "package.json",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "pyproject.toml",
+        "Pipfile",
+    ] {
+        if let Ok(bytes) = std::fs::read(root.join(manifest)) {
+            h.write(&bytes);
+        }
     }
     for (rel, path) in files {
         h.write(rel.as_bytes());
@@ -291,11 +300,25 @@ pub fn build_index(root: &Path, force: bool) -> Result<Index> {
     };
     // package.json dependency names cover convention-driven plugins with no
     // per-file import trace (@fastify/autoload directory routing).
-    let project_deps = format!(
+    let mut project_deps = format!(
         "{}\n{}",
         manifest_deps("composer.json", &["require", "require-dev"]),
         manifest_deps("package.json", &["dependencies", "devDependencies"])
     );
+    // Python dependency manifests, appended raw (evidence is substring-
+    // matched): route modules routinely take the app/router as a parameter
+    // with no framework import in sight (aiohttp `setup_routes(app, ...)`).
+    for manifest in [
+        "requirements.txt",
+        "requirements-dev.txt",
+        "pyproject.toml",
+        "Pipfile",
+    ] {
+        if let Ok(s) = std::fs::read_to_string(root.join(manifest)) {
+            project_deps.push('\n');
+            project_deps.push_str(&s.to_ascii_lowercase());
+        }
+    }
     let (mut graph, features) = GigaGraph::build(root_str, inputs, &project_deps);
     crate::iac::attach(&mut graph, &iac_files);
     let graph = graph;

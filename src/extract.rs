@@ -898,6 +898,12 @@ fn classify_lit(spec: &LangSpec, node: Node, source: &str) -> Option<(LitKind, S
         || kind == "qualified_name"
         || kind == "selector_expression"
         || kind == "field_access"
+        // Boolean literals ride along as Idents ("True"/"true"/"false"):
+        // flag kwargs like DRF's `@action(detail=True)` are load-bearing for
+        // endpoint detection and otherwise invisible.
+        || kind == "true"
+        || kind == "false"
+        || kind == "boolean_literal"
     {
         let text = node_text(node, source);
         return (text.len() <= MAX_LIT_LEN && !text.contains('\n'))
@@ -1337,9 +1343,15 @@ fn strip_quotes(s: &str) -> String {
     } else {
         0
     };
-    s[start..]
-        .trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == '<' || c == '>')
-        .to_string()
+    let t = s[start..].trim_matches(|c| c == '"' || c == '\'' || c == '`');
+    // C/C++ system includes (`<stdio.h>`): strip the angle pair only when it
+    // encloses the WHOLE string and the inside is not a route parameter
+    // (Django/Flask converters like `<int:pk>` carry a ':'). One-sided angles
+    // (`/users/<int:id>`, `<int:pk>/edit/`) are path text and must survive.
+    if t.len() >= 2 && t.starts_with('<') && t.ends_with('>') && !t.contains(':') {
+        return t[1..t.len() - 1].to_string();
+    }
+    t.to_string()
 }
 
 /// Variable a call's result is assigned to, when the call node sits directly

@@ -149,6 +149,19 @@ const QUERY: &str = r#"
 (class_definition
   name: (identifier) @hier.type
   superclasses: (argument_list (attribute) @hier.base))
+
+(module
+  (expression_statement
+    (assignment
+      left: (identifier) @const.name
+      right: (string) @const.value)))
+
+(class_definition
+  body: (block
+    (expression_statement
+      (assignment
+        left: (identifier) @const.name
+        right: (string) @const.value))))
 "#;
 
 const IDENTIFIER_KINDS: &[&str] = &["identifier"];
