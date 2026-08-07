@@ -207,6 +207,7 @@ src/
   verbs.rs     identifier word-splitting + verb-synonym bucketing
   embed.rs     compiled-in distilled static embeddings (src/embed/, ~2.2 MB)
   indexer.rs   parallel walk (gitignore-aware) -> cached extract -> graph -> vectors
+  lsp.rs       optional LSP enrichment of uncertain edges (tsserver pilot)
   mcp.rs       stdio JSON-RPC MCP server
   api.rs       tool implementations
 ```
@@ -243,3 +244,33 @@ B::class)`) name THE implementation and pre-empt the hierarchy fan-out.
 Remaining method calls through untyped values (`obj.save()`) resolve by
 method name + receiver hints and are labeled `confidence: "heuristic"`.
 Agents should treat `high` as trustworthy and `heuristic` as a strong lead.
+
+### LSP enrichment (TypeScript pilot)
+
+When a real language server is available, gigagraph asks it to settle exactly
+the call sites the static resolver was unsure about. Pilot: TypeScript, via
+the `tsserver` that ships inside the project's own `node_modules` — detected
+automatically when `tsconfig.json` (or `jsconfig.json`) sits at the root,
+`node_modules/typescript/lib/tsserver.js` exists, and `node` is on PATH. No
+configuration; any missing piece means the pass silently never runs and the
+static graph is served as-is.
+
+After each index build, a background pass (never blocking indexing or
+queries, ≤30 s, ≤2000 sites, ambiguous sites first) sends `definition`
+requests at each uncertain call name. Where the server answers, the edge is
+rewritten: confirmed or re-pointed callee, `ambiguous_with` cleared, and
+`confidence: "lsp"` in tool output — strictly stronger than the static
+`high`. Definitions the server places in `node_modules` expose false internal
+edges (e.g. joi's `.validate()` credited to an in-repo `validate`) and are
+rewritten to external package calls. Answers are cached per file content hash
+(`.gigagraph/lsp.bin`), so re-enrichment after edits only re-queries changed
+files; the enriched index is persisted and stamped (`lsp_enriched`) so a
+restart does not redo the work.
+
+Honest limits: the server only answers where the type system does —
+untyped JS (e.g. mongoose models without typings) mostly yields no
+definition, and those edges keep their static `heuristic` label. String-based
+correlation (endpoints, DI containers, CDK, RN bridge) stays fully static.
+The `LspProvider` trait is designed for more servers (pyright next);
+TypeScript 7's native compiler no longer ships `tsserver.js` and is currently
+skipped by detection.

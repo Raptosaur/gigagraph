@@ -8,6 +8,7 @@ pub mod iac;
 pub mod impact;
 pub mod indexer;
 pub mod lang;
+pub mod lsp;
 pub mod mcp;
 pub mod touches;
 pub mod types;

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use gigagraph::{api, indexer, mcp, viz};
+use gigagraph::{api, indexer, lsp, mcp, viz};
 use std::path::PathBuf;
 
 /// gigagraph — semantic code-graph index + MCP server.
@@ -96,7 +96,15 @@ fn main() -> Result<()> {
             mcp::serve(state)
         }
         Command::Index { path, force } => {
-            let index = indexer::build_index(&path, force)?;
+            let mut index = indexer::build_index(&path, force)?;
+            // Optional LSP enrichment (auto-detected, silently skipped when
+            // absent). The CLI is a batch tool, so it runs synchronously here;
+            // the MCP server runs the same pass on a background thread.
+            let mut providers = lsp::detect_providers(&path);
+            if !providers.is_empty() && !index.stats.lsp_enriched {
+                let root = path.canonicalize().unwrap_or(path);
+                lsp::enrich_index(&mut index, &root, &mut providers);
+            }
             println!("{}", serde_json::to_string_pretty(&index.stats)?);
             Ok(())
         }

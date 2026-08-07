@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const MAX_FILE_BYTES: u64 = 2_000_000;
-const CACHE_DIR: &str = ".gigagraph";
+pub(crate) const CACHE_DIR: &str = ".gigagraph";
 
 /// Extensions with no LangSpec that are still collected, for IaC endpoint
 /// scanning. Must go through `collect_files` (not a side channel) so that
@@ -64,6 +64,16 @@ pub struct IndexStats {
     /// re-indexing when nothing changed on disk.
     #[serde(default)]
     pub tree_fingerprint: u64,
+    /// The optional post-index LSP enrichment pass ran for this build; a
+    /// reloaded index does not redo it unless the tree changed.
+    #[serde(default)]
+    pub lsp_enriched: bool,
+    /// Call edges the language server agreed with the static pick on.
+    #[serde(default)]
+    pub lsp_confirmed_calls: u32,
+    /// Call edges the language server re-pointed at a different function.
+    #[serde(default)]
+    pub lsp_corrected_calls: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -373,12 +383,19 @@ fn persist(root: &Path, index: &Index, cache: &ExtractionCache) -> Result<()> {
     // loop can both persist concurrently; a reader must never see a torn
     // file (bincode would reject it and force a silent rebuild).
     atomic_write(&cache_path(root), &bincode::serialize(cache)?)?;
+    persist_index(root, index)
+}
+
+/// Re-persists index.bin only (extraction cache untouched) — the LSP
+/// enrichment pass mutates the graph after the build already persisted.
+pub fn persist_index(root: &Path, index: &Index) -> Result<()> {
+    std::fs::create_dir_all(root.join(CACHE_DIR))?;
     let payload = bincode::serialize(&(&index.graph, &index.vectors, &index.stats))?;
     atomic_write(&index_path(root), &payload)?;
     Ok(())
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;

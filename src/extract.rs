@@ -21,6 +21,13 @@ pub struct RawCall {
     pub arg_count: u16,
     pub start_byte: u32,
     pub end_byte: u32,
+    /// 1-based line/byte-column of the callee NAME token (`bar` in
+    /// `foo.bar()`) — the position a language server wants for definition
+    /// lookups. (0, 0) when unknown.
+    #[serde(default)]
+    pub name_line: u32,
+    #[serde(default)]
+    pub name_col: u32,
     /// Distilled literal/identifier arguments (capped); fuels endpoint and
     /// client-call detection without keeping full argument text.
     pub arg_lits: Vec<ArgLit>,
@@ -232,6 +239,8 @@ struct FuncCand<'t> {
 struct CallCand<'t> {
     node: Node<'t>,
     name: String,
+    /// (1-based line, 1-based byte column) of the callee name token.
+    name_pos: (u32, u32),
     recv: Option<Node<'t>>,
     args: Option<Node<'t>>,
     type_args: Vec<String>,
@@ -347,9 +356,11 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
                     }
                     None => {
                         call_slots.insert(key, calls.len());
+                        let np = name_node.start_position();
                         calls.push(CallCand {
                             node: call_node,
                             name: node_text(name_node, source),
+                            name_pos: (np.row as u32 + 1, np.column as u32 + 1),
                             recv,
                             args: get(caps.call_args),
                             type_args,
@@ -508,6 +519,8 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
             arg_count: c.args.map(|a| count_named(a)).unwrap_or(0),
             start_byte: c.node.start_byte() as u32,
             end_byte: c.node.end_byte() as u32,
+            name_line: c.name_pos.0,
+            name_col: c.name_pos.1,
             arg_lits: c
                 .args
                 .map(|a| harvest_arg_lits(spec, a, source))

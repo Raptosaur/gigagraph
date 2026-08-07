@@ -196,5 +196,13 @@ pub struct CallSite {
     pub receiver: Option<String>,
     pub line: u32,
     pub arg_count: u16,
+    /// 1-based line of the callee NAME token (`bar` in `foo.bar()`), which
+    /// may differ from `line` on chained multi-line calls. 0 = unknown
+    /// (stale extraction cache). Fuels LSP definition lookups.
+    #[serde(default)]
+    pub name_line: u32,
+    /// 1-based byte column of the callee NAME token. 0 = unknown.
+    #[serde(default)]
+    pub name_col: u32,
     pub resolution: Resolution,
 }

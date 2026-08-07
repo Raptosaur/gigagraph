@@ -46,6 +46,11 @@ pub struct GigaGraph {
     /// hierarchy edges inverted (base -> derived); DI container registrations
     /// append here as just more entries.
     pub type_bindings: FxHashMap<String, Vec<String>>,
+    /// Indices into `calls` whose resolution was confirmed or corrected by a
+    /// real language server (LSP enrichment pass). Provenance only — the
+    /// resolution itself is rewritten in place.
+    #[serde(default)]
+    pub lsp_confirmed: FxHashSet<u32>,
     /// Explicit DI container registrations: abstract -> concrete. Sources:
     /// Laravel `$app->bind(A::class, B::class)` / `singleton`; .NET
     /// `services.AddScoped<I, T>()` (and Singleton/Transient) via captured
@@ -346,6 +351,8 @@ impl GigaGraph {
                             receiver: c.receiver.clone(),
                             line: c.line,
                             arg_count: c.arg_count,
+                            name_line: c.name_line,
+                            name_col: c.name_col,
                             resolution,
                         }
                     })

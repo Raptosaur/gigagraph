@@ -18,6 +18,12 @@ pub struct AppState {
     /// The post-handshake background index warm has been kicked off (clients
     /// may send `initialize` more than once; the warm runs once).
     pub warm_started: bool,
+    /// In-flight background LSP enrichment: (tree fingerprint it was started
+    /// for, channel the enriched index arrives on).
+    lsp_pending: Option<(u64, std::sync::mpsc::Receiver<Index>)>,
+    /// Fingerprint for which enrichment already finished (or was found
+    /// unavailable) this process — don't respawn until the tree changes.
+    lsp_done_fp: Option<u64>,
 }
 
 impl AppState {
@@ -26,6 +32,8 @@ impl AppState {
             root,
             index: None,
             warm_started: false,
+            lsp_pending: None,
+            lsp_done_fp: None,
         }
     }
 
@@ -66,7 +74,64 @@ impl AppState {
         if !fresh {
             self.index = Some(indexer::build_index(&self.root, false)?);
         }
+        self.maybe_lsp_enrich(fp);
         Ok(self.index.as_ref().unwrap())
+    }
+
+    /// Optional LSP enrichment, fully asynchronous: when the current index is
+    /// fresh but not yet enriched and a language server is auto-detected,
+    /// spawn one background pass (mirrors `warm_in_background` — it never
+    /// blocks a query). A finished pass is adopted on the next tool call; on
+    /// repos with no detectable server this is two stat calls once per tree
+    /// state, then nothing.
+    fn maybe_lsp_enrich(&mut self, fp: u64) {
+        let Some(ix) = self.index.as_ref() else { return };
+        if ix.stats.tree_fingerprint != fp {
+            return;
+        }
+        if ix.stats.lsp_enriched {
+            self.lsp_pending = None;
+            return;
+        }
+        if let Some((pending_fp, rx)) = &self.lsp_pending {
+            if *pending_fp == fp {
+                match rx.try_recv() {
+                    Ok(enriched) => {
+                        if enriched.stats.tree_fingerprint == fp {
+                            self.index = Some(enriched);
+                        }
+                        self.lsp_pending = None;
+                        self.lsp_done_fp = Some(fp);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Thread ended without a result (no provider after
+                        // all, tree moved, enrichment abandoned).
+                        self.lsp_pending = None;
+                        self.lsp_done_fp = Some(fp);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+                return;
+            }
+            // Pending pass belongs to an older tree; let it finish and be
+            // ignored (its fingerprint check makes adoption safe anyway).
+            self.lsp_pending = None;
+        }
+        if self.lsp_done_fp == Some(fp) {
+            return;
+        }
+        if !crate::lsp::available(&self.root) {
+            self.lsp_done_fp = Some(fp);
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            if let Some(enriched) = crate::lsp::enrich_root(&root, fp) {
+                let _ = tx.send(enriched);
+            }
+        });
+        self.lsp_pending = Some((fp, rx));
     }
 
     pub fn dispatch(&mut self, tool: &str, args: &Value) -> Result<Value> {
@@ -1126,9 +1191,15 @@ fn call_site_json(g: &GigaGraph, call_idx: u32) -> Value {
             v["resolved"] = json!("internal");
             v["callee"] = json!(g.functions[*callee as usize].qualified_name);
             v["callee_id"] = json!(format!("fn:{callee}"));
-            v["confidence"] = json!(match confidence {
-                Confidence::High => "high",
-                Confidence::Heuristic => "heuristic",
+            // "lsp" = a real language server confirmed this edge (strictly
+            // stronger than the static "high").
+            v["confidence"] = json!(if g.lsp_confirmed.contains(&call_idx) {
+                "lsp"
+            } else {
+                match confidence {
+                    Confidence::High => "high",
+                    Confidence::Heuristic => "heuristic",
+                }
             });
             if !ambiguous_with.is_empty() {
                 v["ambiguous_with"] = json!(
