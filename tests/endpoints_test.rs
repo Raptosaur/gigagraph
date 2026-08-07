@@ -599,3 +599,27 @@ fn detects_silex_provider_without_direct_silex_import() {
     let e = find(ep, HttpMethod::Get, "/widget-registry");
     assert_eq!(e.framework, "silex");
 }
+
+#[test]
+fn detects_silex_provider_with_cross_file_mount() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+    use gigagraph::types::Confidence;
+
+    // Zero-`use` provider file: evidence comes from the structural
+    // `implements ControllerProviderInterface` edge, not imports. The
+    // bootstrap's `$app->mount('/api/crates', new CrateControllerProvider())`
+    // prefixes the provider's routes cross-file, and the `''` collection
+    // root maps to the mount prefix itself.
+    let root = find(ep, HttpMethod::Get, "/api/crates");
+    assert_eq!(root.framework, "silex");
+    assert_eq!(root.confidence, Confidence::Heuristic);
+    // Service-controller string 'crate.controller:listCrates' resolves by
+    // unique method name.
+    assert_eq!(
+        g.functions[root.handler.unwrap() as usize].name,
+        "listCrates"
+    );
+    find(ep, HttpMethod::Put, "/api/crates/{*}");
+}

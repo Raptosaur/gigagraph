@@ -186,6 +186,11 @@ struct FileCtx {
     /// Ident at the URL position has no definition to look up, and the call
     /// is skipped exactly as before.
     php_consts: FxHashMap<(u32, String), String>,
+    /// Provider class name -> mount prefix from `$app->mount('/p',
+    /// new XControllerProvider())` — cross-file: routes registered inside
+    /// that class's methods (connect()) join the prefix. `None` = mounted at
+    /// conflicting prefixes.
+    mount_class: FxHashMap<String, Option<String>>,
     /// file id -> the file's single CDK Lambda declaration whose handler
     /// resolved to an indexed function. `Some(fn)` only when the file
     /// declares EXACTLY ONE lambda and it resolved; `None` records "lambdas
@@ -224,10 +229,16 @@ pub fn detect(
     raw_calls: &[Vec<RawCall>],
     decorations: &[Vec<RawDecoration>],
     name_index: &FxHashMap<String, Vec<u32>>,
+    file_hierarchy: &[Vec<(String, String)>],
 ) -> EndpointIndex {
     let mut idx = EndpointIndex::default();
 
-    // Per-file import evidence, lowercased: import paths + attributed packages.
+    // Per-file import evidence, lowercased: import paths + attributed
+    // packages, PLUS structural evidence — the base names each file's types
+    // implement/extend, prefixed "implements:". Zero-`use` files (global-
+    // namespace Silex providers) carry no import evidence at all; a
+    // `class X implements ControllerProviderInterface` clause is just as
+    // strong a signal and survives the missing imports.
     let evidence: Vec<String> = files
         .iter()
         .map(|f| {
@@ -237,6 +248,13 @@ pub fn detect(
                 s.push('\n');
                 if let Some(p) = &imp.external_package {
                     s.push_str(&p.to_ascii_lowercase());
+                    s.push('\n');
+                }
+            }
+            if let Some(edges) = file_hierarchy.get(f.id as usize) {
+                for (_, base) in edges {
+                    s.push_str("implements:");
+                    s.push_str(&base.to_ascii_lowercase());
                     s.push('\n');
                 }
             }
@@ -380,12 +398,16 @@ pub fn detect(
                         }
                     }
                 }
-                // Silex `$app->mount('/prefix', $collection)`: reuse the JS
-                // mount_recv machinery, keyed by receiver spelling. Arg-lit
-                // idents drop the `$` (unlike receivers), so it is re-added.
-                // Known gap: collection routes declared in a different
-                // function (provider classes) key on a different local and
-                // stay unprefixed.
+                // Silex `$app->mount('/prefix', ...)`, two shapes:
+                // - `$app->mount('/p', $collection)` — same-file variable:
+                //   reuse the JS mount_recv machinery keyed by receiver
+                //   spelling (arg-lit idents drop the `$`, so it's re-added).
+                // - `$app->mount('/p', new WidgetControllerProvider())` —
+                //   the object creation is a separate uppercase-named RawCall
+                //   byte-contained in the mount's range (the new-expression
+                //   itself never survives arg-lit classification); map the
+                //   provider CLASS to the prefix so its connect() routes in
+                //   ANY file pick it up.
                 if has(fid, SILEX_EV) {
                     for call in calls {
                         if call.name != "mount" || call.receiver.as_deref() != Some("$app") {
@@ -394,19 +416,35 @@ pub fn detect(
                         let Some(prefix) = first_path_lit(call) else {
                             continue;
                         };
-                        let Some(ident) = call
+                        // An uppercase-initial ident is the provider CLASS
+                        // (the depth-2 harvest surfaces `new X()`'s name as a
+                        // bare Ident); lowercase = a `$collection` variable.
+                        let ident = call
                             .arg_lits
                             .iter()
-                            .find(|l| l.kind == LitKind::Ident && l.key.is_none())
-                        else {
-                            continue;
-                        };
-                        let recv = if ident.text.starts_with('$') {
-                            ident.text.clone()
-                        } else {
-                            format!("${}", ident.text)
-                        };
-                        upsert_mount(&mut ctx.mount_recv, (fid, recv), prefix);
+                            .find(|l| l.kind == LitKind::Ident && l.key.is_none());
+                        match ident {
+                            Some(l) if l.text.chars().next().is_some_and(|c| c.is_uppercase()) => {
+                                upsert_mount(&mut ctx.mount_class, l.text.clone(), prefix);
+                            }
+                            Some(l) => {
+                                let recv = if l.text.starts_with('$') {
+                                    l.text.clone()
+                                } else {
+                                    format!("${}", l.text)
+                                };
+                                upsert_mount(&mut ctx.mount_recv, (fid, recv), prefix);
+                            }
+                            None => {
+                                if let Some(ctor) = calls.iter().find(|c| {
+                                    c.start_byte > call.start_byte
+                                        && c.end_byte <= call.end_byte
+                                        && c.name.chars().next().is_some_and(|ch| ch.is_uppercase())
+                                }) {
+                                    upsert_mount(&mut ctx.mount_class, ctor.name.clone(), prefix);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1348,12 +1386,23 @@ fn detect_server(
             // non-$app receivers are honest Heuristic ($this excluded — that
             // shape is method calls, not routing).
             if silex {
+                // Same-file `$app->mount('/p', $collection)` receiver mounts
+                // win; else a cross-file `$app->mount('/p', new Provider())`
+                // keyed by the enclosing class (connect() lives in the
+                // provider class the bootstrap file mounted).
                 let mount_for = |call: &RawCall| -> Option<String> {
                     call.receiver
                         .as_deref()
                         .and_then(|r| ctx.mount_recv.get(&(fid, r.to_string())))
                         .cloned()
                         .flatten()
+                        .or_else(|| {
+                            func.containing_type
+                                .as_deref()
+                                .and_then(|t| ctx.mount_class.get(t))
+                                .cloned()
+                                .flatten()
+                        })
                 };
                 for call in calls {
                     let Some(recv) = call.receiver.as_deref() else {
@@ -1365,7 +1414,18 @@ fn detect_server(
                     let Some(method) = HttpMethod::from_name(&call.name) else {
                         continue;
                     };
-                    let Some(path) = first_path_lit(call) else {
+                    // First-arg path, tolerating collection roots: `''` and
+                    // `'/'` are the mount root (extremely common in provider
+                    // connect() bodies). The index-0 guard keeps a handler
+                    // string at index 1 from masquerading as the path.
+                    let Some(path) = call
+                        .arg_lits
+                        .iter()
+                        .find(|l| l.kind == LitKind::Str && l.key.is_none() && l.index == 0)
+                        .map(|l| l.text.as_str())
+                        .filter(|t| t.is_empty() || t.starts_with('/'))
+                        .map(|t| if t.is_empty() { "/".to_string() } else { t.to_string() })
+                    else {
                         continue;
                     };
                     let base_conf = if recv == "$app" {
@@ -1398,7 +1458,8 @@ fn detect_server(
                         .and_then(first_str_lit)
                         .map(|s| s.split('|').filter_map(HttpMethod::from_name).collect())
                         .unwrap_or_default();
-                    let handler = class_static_string_handler(call, functions, name_index);
+                    let handler = class_static_string_handler(call, functions, name_index)
+                        .or_else(|| silex_service_handler(call, functions, name_index));
                     for m in if listed.is_empty() {
                         vec![method]
                     } else {
@@ -2897,6 +2958,35 @@ fn class_static_string_handler(
         .iter()
         .copied()
         .filter(|&id| functions[id as usize].containing_type.as_deref() == Some(ctrl))
+        .collect();
+    (hits.len() == 1).then(|| hits[0])
+}
+
+/// Silex service-controller strings: `'widget.controller:index'` — a service
+/// id and a method, single colon. The service id names a container entry, not
+/// a class, so the method resolves by global unique name only (non-toplevel).
+fn silex_service_handler(
+    call: &RawCall,
+    functions: &[FunctionInfo],
+    name_index: &FxHashMap<String, Vec<u32>>,
+) -> Option<u32> {
+    let lit = call.arg_lits.iter().find(|l| {
+        l.kind == LitKind::Str
+            && l.key.is_none()
+            && l.index > 0
+            && l.text.contains(':')
+            && !l.text.contains("::")
+            && !l.text.starts_with('/')
+    })?;
+    let (_, method) = lit.text.rsplit_once(':')?;
+    if method.is_empty() {
+        return None;
+    }
+    let hits: Vec<u32> = name_index
+        .get(method)?
+        .iter()
+        .copied()
+        .filter(|&id| !functions[id as usize].is_toplevel)
         .collect();
     (hits.len() == 1).then(|| hits[0])
 }

@@ -86,6 +86,10 @@ impl GigaGraph {
         let mut fn_locals: Vec<Vec<(String, String)>> = Vec::new();
         // (file_id, start_byte, end_byte) per function for same-file ranking.
         let mut fn_files: Vec<u32> = Vec::new();
+        // Per-file (derived, base) edges, aligned with file ids — endpoint
+        // detection gates on structural evidence (implements X) where import
+        // evidence is absent (zero-`use` Silex providers).
+        let mut file_hierarchy: Vec<Vec<(String, String)>> = Vec::new();
 
         let declared_packages: FxHashSet<String> = inputs
             .iter()
@@ -147,9 +151,13 @@ impl GigaGraph {
                     .or_default()
                     .push(tf.type_name);
             }
-            for (derived, base) in input.extracted.hierarchy {
-                g.type_bindings.entry(base).or_default().push(derived);
+            for (derived, base) in &input.extracted.hierarchy {
+                g.type_bindings
+                    .entry(base.clone())
+                    .or_default()
+                    .push(derived.clone());
             }
+            file_hierarchy.push(input.extracted.hierarchy);
             g.path_index.insert(input.path.clone(), file_id);
             g.files.push(FileInfo {
                 id: file_id,
@@ -393,6 +401,7 @@ impl GigaGraph {
             &raw_calls,
             &decorations,
             &g.name_index,
+            &file_hierarchy,
         );
 
         g.bridge =
