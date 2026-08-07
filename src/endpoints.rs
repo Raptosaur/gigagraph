@@ -230,7 +230,9 @@ pub fn detect(
     decorations: &[Vec<RawDecoration>],
     name_index: &FxHashMap<String, Vec<u32>>,
     file_hierarchy: &[Vec<(String, String)>],
+    project_evidence: &str,
 ) -> EndpointIndex {
+    let project_evidence = project_evidence.to_ascii_lowercase();
     let mut idx = EndpointIndex::default();
 
     // Per-file import evidence, lowercased: import paths + attributed
@@ -408,9 +410,14 @@ pub fn detect(
                 //   itself never survives arg-lit classification); map the
                 //   provider CLASS to the prefix so its connect() routes in
                 //   ANY file pick it up.
-                if has(fid, SILEX_EV) {
+                if has(fid, SILEX_EV) || project_evidence.contains("silex/silex") {
                     for call in calls {
-                        if call.name != "mount" || call.receiver.as_deref() != Some("$app") {
+                        // Silex 2 ControllerCollection::mount means nested
+                        // collections mount on ANY `$` receiver, not just
+                        // `$app` ($controllers->mount('/sub', $inner)).
+                        if call.name != "mount"
+                            || !call.receiver.as_deref().is_some_and(|r| r.starts_with('$'))
+                        {
                             continue;
                         }
                         let Some(prefix) = first_path_lit(call) else {
@@ -474,7 +481,16 @@ pub fn detect(
         let decos = &decorations[func.id as usize];
 
         detect_server(
-            func, file, calls, decos, &has, functions, name_index, &ctx, &mut idx,
+            func,
+            file,
+            calls,
+            decos,
+            &has,
+            functions,
+            name_index,
+            &ctx,
+            &project_evidence,
+            &mut idx,
         );
         detect_client(func, file, calls, decos, &has, &ctx, &mut idx);
         detect_rpc_server(
@@ -977,6 +993,7 @@ fn detect_server(
     functions: &[FunctionInfo],
     name_index: &FxHashMap<String, Vec<u32>>,
     ctx: &FileCtx,
+    project_evidence: &str,
     idx: &mut EndpointIndex,
 ) {
     let fid = func.file_id;
@@ -1347,12 +1364,24 @@ fn detect_server(
                     }
                 }
             }
-            let silex = has(fid, SILEX_EV);
+            // File evidence (imports or an implements edge) unlocks the full
+            // any-`$`-receiver rule; composer.json project evidence alone
+            // covers script-style files (`$app` arrives via `require`) but is
+            // restricted to the `$app` receiver so Guzzle-style `$client`
+            // calls can't masquerade as routes.
+            let silex_file = has(fid, SILEX_EV);
+            // Project evidence never overrides a file's OWN framework
+            // evidence — a Slim-importing file in a repo that also depends on
+            // silex/silex stays Slim.
+            let silex_proj =
+                !silex_file && !has(fid, &["slim"]) && project_evidence.contains("silex/silex");
+            let silex = silex_file || silex_proj;
             // Slim (classic PHP micro-framework): $app->get('/x', ...).
             // Slim's own `$app->group('/p', ...)` prefixes are not joined
             // (different chain shape from Laravel's, no fixture demand yet).
-            // Silex shares the call shape exactly, so its evidence wins.
-            if has(fid, &["slim"]) && !silex {
+            // Silex shares the call shape exactly, so its FILE evidence wins
+            // (project-level silex evidence must not suppress a Slim file).
+            if has(fid, &["slim"]) && !silex_file {
                 for call in calls {
                     if call.receiver.as_deref() != Some("$app") {
                         continue;
@@ -1386,29 +1415,37 @@ fn detect_server(
             // non-$app receivers are honest Heuristic ($this excluded — that
             // shape is method calls, not routing).
             if silex {
-                // Same-file `$app->mount('/p', $collection)` receiver mounts
-                // win; else a cross-file `$app->mount('/p', new Provider())`
-                // keyed by the enclosing class (connect() lives in the
-                // provider class the bootstrap file mounted).
+                // Prefix composition, outermost first: the enclosing class's
+                // cross-file mount ($app->mount('/v2', new Provider()))
+                // wraps a same-file collection mount ($controllers->mount(
+                // '/sub', $inner)) — Silex 2 nested collections. Var-to-var
+                // chains deeper than one level stay uncomposed (known gap).
                 let mount_for = |call: &RawCall| -> Option<String> {
-                    call.receiver
+                    let recv_prefix = call
+                        .receiver
                         .as_deref()
                         .and_then(|r| ctx.mount_recv.get(&(fid, r.to_string())))
                         .cloned()
-                        .flatten()
-                        .or_else(|| {
-                            func.containing_type
-                                .as_deref()
-                                .and_then(|t| ctx.mount_class.get(t))
-                                .cloned()
-                                .flatten()
-                        })
+                        .flatten();
+                    let class_prefix = func
+                        .containing_type
+                        .as_deref()
+                        .and_then(|t| ctx.mount_class.get(t))
+                        .cloned()
+                        .flatten();
+                    match (class_prefix, recv_prefix) {
+                        (Some(c), Some(r)) => Some(join_prefix(&c, &r)),
+                        (c, r) => c.or(r),
+                    }
                 };
                 for call in calls {
                     let Some(recv) = call.receiver.as_deref() else {
                         continue;
                     };
                     if !recv.starts_with('$') || recv == "$this" {
+                        continue;
+                    }
+                    if silex_proj && recv != "$app" {
                         continue;
                     }
                     let Some(method) = HttpMethod::from_name(&call.name) else {
@@ -1459,7 +1496,8 @@ fn detect_server(
                         .map(|s| s.split('|').filter_map(HttpMethod::from_name).collect())
                         .unwrap_or_default();
                     let handler = class_static_string_handler(call, functions, name_index)
-                        .or_else(|| silex_service_handler(call, functions, name_index));
+                        .or_else(|| silex_service_handler(call, functions, name_index))
+                        .or_else(|| array_this_handler(call, func, functions, name_index));
                     for m in if listed.is_empty() {
                         vec![method]
                     } else {
@@ -2987,6 +3025,37 @@ fn silex_service_handler(
         .iter()
         .copied()
         .filter(|&id| !functions[id as usize].is_toplevel)
+        .collect();
+    (hits.len() == 1).then(|| hits[0])
+}
+
+/// Array-callable handlers: `[$this, 'homepage']` — the depth-2 harvest
+/// surfaces the pair as an Ident "this" and a Str sharing an index; the
+/// method lives on the registering function's own class.
+fn array_this_handler(
+    call: &RawCall,
+    func: &FunctionInfo,
+    functions: &[FunctionInfo],
+    name_index: &FxHashMap<String, Vec<u32>>,
+) -> Option<u32> {
+    let owner = func.containing_type.as_deref()?;
+    let this_idx = call
+        .arg_lits
+        .iter()
+        .find(|l| l.kind == LitKind::Ident && l.key.is_none() && l.text == "this")
+        .map(|l| l.index)?;
+    let method = call.arg_lits.iter().find(|l| {
+        l.kind == LitKind::Str
+            && l.key.is_none()
+            && l.index == this_idx
+            && !l.text.contains([':', '/'])
+            && !l.text.is_empty()
+    })?;
+    let hits: Vec<u32> = name_index
+        .get(&method.text)?
+        .iter()
+        .copied()
+        .filter(|&id| functions[id as usize].containing_type.as_deref() == Some(owner))
         .collect();
     (hits.len() == 1).then(|| hits[0])
 }

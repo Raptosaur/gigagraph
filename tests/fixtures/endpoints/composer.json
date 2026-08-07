@@ -1,0 +1,7 @@
+{
+    "name": "fixtures/endpoints",
+    "require": {
+        "php": ">=7.4",
+        "silex/silex": "~2.0"
+    }
+}

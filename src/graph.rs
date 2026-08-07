@@ -69,6 +69,7 @@ impl GigaGraph {
     pub fn build(
         root: String,
         mut inputs: Vec<FileInput>,
+        project_evidence: &str,
     ) -> (GigaGraph, Vec<FxHashMap<String, u32>>) {
         inputs.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -402,6 +403,7 @@ impl GigaGraph {
             &decorations,
             &g.name_index,
             &file_hierarchy,
+            project_evidence,
         );
 
         g.bridge =

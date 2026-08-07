@@ -623,3 +623,70 @@ fn detects_silex_provider_with_cross_file_mount() {
     );
     find(ep, HttpMethod::Put, "/api/crates/{*}");
 }
+
+#[test]
+fn detects_silex_script_routes_via_composer_evidence() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    use gigagraph::types::Confidence;
+
+    // Script-style Silex (Skeleton layout): `$app` arrives via require, the
+    // file imports only Symfony components — composer.json's silex/silex
+    // requirement is the evidence, restricted to the `$app` receiver.
+    let e = find(ep, HttpMethod::Get, "/lanterns");
+    assert_eq!(e.framework, "silex");
+    assert_eq!(e.confidence, Confidence::High);
+    find(ep, HttpMethod::Post, "/lanterns/{*}/light");
+}
+
+#[test]
+fn resolves_silex_array_callable_handlers() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+
+    // Kitchen-Edition idiom: `->post('/{id}/seal', [$this, 'sealCrate'])` —
+    // the method lives on the provider class itself.
+    let e = find(ep, HttpMethod::Post, "/api/crates/{*}/seal");
+    assert_eq!(
+        g.functions[e.handler.unwrap() as usize].name,
+        "sealCrate"
+    );
+}
+
+#[test]
+fn detects_silex_2_1_api_surface() {
+    let index = index();
+    let ep = &index.graph.endpoints;
+    let g = &index.graph;
+
+    // Silex 2.1: Silex\Api namespace provider, full Controller chain
+    // (assert/convert/value/bind/secure/before), cross-file $app->mount.
+    let show = find(ep, HttpMethod::Get, "/v2/ledgers/{*}");
+    assert_eq!(show.framework, "silex");
+    assert_eq!(
+        g.functions[show.handler.unwrap() as usize].name,
+        "showLedger"
+    );
+
+    // ->method('POST|DELETE') restriction replaces match's ANY.
+    find(ep, HttpMethod::Post, "/v2/ledgers/{*}/close");
+    find(ep, HttpMethod::Delete, "/v2/ledgers/{*}/close");
+    assert!(
+        !ep.endpoints
+            .iter()
+            .any(|e| e.method == HttpMethod::Any && e.path_norm == "/v2/ledgers/{*}/close"),
+        "method restriction must replace the ANY row"
+    );
+
+    // options() is a first-class verb.
+    find(ep, HttpMethod::Options, "/v2/ledgers");
+
+    // Silex 2 nested collection: $controllers->mount('/nested', $sub)
+    // composes with the class's own /v2 mount.
+    let deep = find(ep, HttpMethod::Get, "/v2/nested/entries");
+    assert_eq!(
+        g.functions[deep.handler.unwrap() as usize].name,
+        "listEntries"
+    );
+}

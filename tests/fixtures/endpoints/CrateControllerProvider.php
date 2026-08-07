@@ -19,6 +19,15 @@ class CrateControllerProvider implements ControllerProviderInterface
             return ['crate' => $id];
         })->bind('crate_update');
 
+        $controllers
+            ->post('/{id}/seal', [$this, 'sealCrate'])
+            ->bind('crate_seal');
+
         return $controllers;
+    }
+
+    public function sealCrate($id)
+    {
+        return ['sealed' => $id];
     }
 }

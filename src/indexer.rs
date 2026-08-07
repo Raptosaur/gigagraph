@@ -145,6 +145,11 @@ pub fn tree_fingerprint(root: &Path) -> u64 {
     // an upgrade must invalidate persisted indexes even when the tree is
     // unchanged — otherwise new detectors silently serve stale results.
     h.write(env!("CARGO_PKG_VERSION").as_bytes());
+    // Dependency manifests feed project-level endpoint evidence but are not
+    // walked as source files — hash them so edits invalidate too.
+    if let Ok(bytes) = std::fs::read(root.join("composer.json")) {
+        h.write(&bytes);
+    }
     for (rel, path) in files {
         h.write(rel.as_bytes());
         if let Ok(meta) = std::fs::metadata(&path) {
@@ -268,7 +273,22 @@ pub fn build_index(root: &Path, force: bool) -> Result<Index> {
         .collect();
 
     let root_str = root.to_string_lossy().to_string();
-    let (mut graph, features) = GigaGraph::build(root_str, inputs);
+    // Project-level endpoint evidence: composer.json dependency names cover
+    // script-style files (Silex `src/controllers.php`) that route on an
+    // `$app` arriving via `require` with no framework import in sight.
+    let project_deps = std::fs::read_to_string(root.join("composer.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| {
+            ["require", "require-dev"]
+                .iter()
+                .filter_map(|k| v.get(k)?.as_object().cloned())
+                .flat_map(|m| m.keys().map(|k| k.to_ascii_lowercase()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let (mut graph, features) = GigaGraph::build(root_str, inputs, &project_deps);
     crate::iac::attach(&mut graph, &iac_files);
     let graph = graph;
     let vectors = VectorIndex::build(&features);
