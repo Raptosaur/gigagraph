@@ -179,10 +179,13 @@ struct FileCtx {
     /// outbound requests, so detect_spring/detect_jaxrs route them to
     /// `client_calls` instead of `endpoints`.
     client_iface: FxHashSet<(u32, String)>,
-    /// Target file id -> mount prefix from `app.use("/api", importedRouter)`
-    /// in ANOTHER file, applied to endpoints declared in the target file.
-    /// `None` = conflicting prefixes seen (ambiguous — no join).
-    mount_file: FxHashMap<u32, Option<String>>,
+    /// Target file id -> (mounting file id, mount prefix) from
+    /// `app.use("/api", importedRouter)` / `fastify.register(routes,
+    /// { prefix })` in ANOTHER file, applied to endpoints declared in the
+    /// target file. The mounting file id lets `file_mount_prefix` compose
+    /// nested mounts (`app.use('/api/v1', routes)` -> routes file mounts
+    /// deeper routers). `None` = conflicting prefixes seen (ambiguous).
+    mount_file: FxHashMap<u32, Option<(u32, String)>>,
     /// (file id, local router ident) -> mount prefix from a same-file
     /// `app.use("/api", router)`, applied to endpoints registered on that
     /// receiver. `None` = ambiguous.
@@ -209,6 +212,38 @@ struct FileCtx {
     /// file-scope binding for its routes — always Heuristic, because
     /// single-lambda-per-file is an assumption, not knowledge.
     cdk_lambda: FxHashMap<u32, Option<u32>>,
+    /// NestJS `app.setGlobalPrefix("api")` (main.ts): a PROJECT-wide URI
+    /// prefix joined onto every nestjs route. Outer `None` = never seen;
+    /// `Some(None)` = conflicting prefixes across files (no join).
+    nest_prefix: Option<Option<String>>,
+}
+
+/// Compose a file's transitive mount prefix, outermost first:
+/// `app.use('/v1', routes)` (app.js) + routes file re-exporting deeper
+/// mounts. Depth-capped, cycle-safe; any ambiguous (`None`) link kills the
+/// whole join — a partial prefix is worse than none.
+fn file_mount_prefix(ctx: &FileCtx, fid: u32) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut cur = fid;
+    for _ in 0..4 {
+        match ctx.mount_file.get(&cur) {
+            Some(Some((from, p))) => {
+                parts.push(p);
+                if *from == cur {
+                    break;
+                }
+                cur = *from;
+            }
+            Some(None) => return None,
+            None => break,
+        }
+    }
+    (!parts.is_empty()).then(|| {
+        parts
+            .iter()
+            .rev()
+            .fold(String::new(), |acc, p| join_prefix(&acc, p))
+    })
 }
 
 /// CDK import evidence: v2 monopackage + v1 scoped packages (JS/TS) and the
@@ -230,6 +265,24 @@ fn upsert_mount<K: std::hash::Hash + Eq>(
             }
         })
         .or_insert(Some(prefix));
+}
+
+/// `mount_file` variant of `upsert_mount`: same ambiguity degradation, but
+/// the value carries the mounting file so nested mounts can compose. Two
+/// mounts agreeing on the prefix keep the first origin file.
+fn upsert_mount_file(
+    map: &mut FxHashMap<u32, Option<(u32, String)>>,
+    target: u32,
+    from: u32,
+    prefix: String,
+) {
+    map.entry(target)
+        .and_modify(|v| {
+            if v.as_ref().map(|(_, p)| p.as_str()) != Some(prefix.as_str()) {
+                *v = None;
+            }
+        })
+        .or_insert(Some((from, prefix)));
 }
 
 pub fn detect(
@@ -339,6 +392,19 @@ pub fn detect(
                 }
                 if has(fid, &["express", "@koa/router", "koa-router"]) {
                     for call in calls {
+                        // Koa `new Router({ prefix: '/api' })`: the ctor's
+                        // options object surfaces as an Ident-key/Str-value
+                        // window and `assigned_to` names the router variable,
+                        // so routes registered on that receiver join the
+                        // prefix exactly like a same-file mount.
+                        if call.name == "Router" {
+                            if let (Some(prefix), Some(var)) =
+                                (str_lit_by_key(call, &["prefix"]), &call.assigned_to)
+                            {
+                                upsert_mount(&mut ctx.mount_recv, (fid, var.clone()), prefix);
+                            }
+                            continue;
+                        }
                         if call.name != "use" {
                             continue;
                         }
@@ -364,12 +430,61 @@ pub fn detect(
                         {
                             Some(imp) => {
                                 if let Some(target) = imp.resolved_file {
-                                    upsert_mount(&mut ctx.mount_file, target, prefix);
+                                    upsert_mount_file(&mut ctx.mount_file, target, fid, prefix);
                                 }
                             }
                             None => {
                                 upsert_mount(&mut ctx.mount_recv, (fid, base.to_string()), prefix);
                             }
+                        }
+                    }
+                }
+                // Fastify plugin prefixes: `fastify.register(routes,
+                // { prefix: '/v1' })` — an import-bound plugin ident mounted
+                // at a prefix maps the plugin's defining file, exactly like
+                // an Express cross-file `app.use` mount.
+                if has(fid, &["fastify"]) {
+                    for call in calls {
+                        if call.name != "register" {
+                            continue;
+                        }
+                        let Some(prefix) = str_lit_by_key(call, &["prefix"]) else {
+                            continue;
+                        };
+                        let Some(target) = call
+                            .arg_lits
+                            .iter()
+                            .find(|l| l.kind == LitKind::Ident && l.key.is_none())
+                            .and_then(|l| {
+                                let base = l.text.split('.').next()?;
+                                file.imports
+                                    .iter()
+                                    .find(|i| i.names.iter().any(|n| n == base))
+                                    .and_then(|i| i.resolved_file)
+                            })
+                        else {
+                            continue;
+                        };
+                        upsert_mount_file(&mut ctx.mount_file, target, fid, prefix);
+                    }
+                }
+                // NestJS `app.setGlobalPrefix('api')` (main.ts): a global URI
+                // prefix every controller route joins. Cross-file by nature,
+                // so it lives on the ctx, not a per-file map.
+                if has(fid, &["@nestjs"]) {
+                    for call in calls {
+                        if call.name != "setGlobalPrefix" {
+                            continue;
+                        }
+                        let Some(p) = first_str_lit(call) else {
+                            continue;
+                        };
+                        match &ctx.nest_prefix {
+                            None => ctx.nest_prefix = Some(Some(p)),
+                            Some(Some(existing)) if *existing != p => {
+                                ctx.nest_prefix = Some(None);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -689,7 +804,7 @@ fn detect_rpc_server(
                 // The public name is the string arg when present, else the
                 // identifier's own name.
                 if call.name == "register_function" && has(fid, &["xmlrpc"]) {
-                    let handler = handler_from_ident(call, func, functions, name_index);
+                    let handler = handler_from_ident(call, func, file, functions, name_index);
                     let op = first_str_lit(call).or_else(|| {
                         call.arg_lits
                             .iter()
@@ -883,7 +998,7 @@ fn detect_rpc_server(
                 // json-rpc-2.0 / jayson: server.addMethod("name", fn).
                 if jsonrpc && call.name == "addMethod" {
                     if let Some(op) = first_str_lit(call) {
-                        let handler = handler_from_ident(call, func, functions, name_index);
+                        let handler = handler_from_ident(call, func, file, functions, name_index);
                         push_rpc_op(
                             idx,
                             ApiKind::JsonRpc,
@@ -1077,6 +1192,12 @@ fn detect_server(
                         Some(p) => (join_prefix(p, &sub), Confidence::High),
                         None => (ensure_slash(&sub), Confidence::Heuristic),
                     };
+                    // Global `app.setGlobalPrefix('api')` join (cross-file
+                    // assumption; `exclude:` options invisible) -> Heuristic.
+                    let (path, conf) = match ctx.nest_prefix.clone().flatten() {
+                        Some(gp) => (join_prefix(&gp, &path), Confidence::Heuristic),
+                        None => (path, conf),
+                    };
                     let Some(norm) = normalize_path(&path) else {
                         continue;
                     };
@@ -1125,19 +1246,51 @@ fn detect_server(
                 "express"
             };
             // Mount prefixes (pre-pass): a same-file `app.use("/p", router)`
-            // keyed by the endpoint call's receiver wins; else a cross-file
-            // `app.use("/p", importedRouter)` targeting this file applies to
-            // every endpoint declared here (over-broad when one file holds
-            // several routers — hence Heuristic). `use()` ordering, nested
-            // mounts, and `Router({ prefix })` options are not modeled.
-            let mount_for = |call: &RawCall| -> Option<String> {
-                call.receiver
-                    .as_deref()
+            // / `new Router({ prefix })` keyed by the endpoint call's
+            // receiver, composed under the file's own (transitive) cross-file
+            // mount prefix when both exist. A bare cross-file mount applies
+            // to every endpoint declared here (over-broad when one file
+            // holds several routers — hence Heuristic). `use()` ordering is
+            // not modeled.
+            let file_prefix = file_mount_prefix(ctx, fid).or_else(|| {
+                // @fastify/autoload convention: files under a `routes/` dir
+                // register at a prefix derived from their directory path
+                // (routes/api/tasks/index.ts -> /api/tasks). Gated on the
+                // plugin appearing in package.json (project evidence).
+                (fw == "fastify" && project_evidence.contains("@fastify/autoload"))
+                    .then(|| {
+                        let rel = file
+                            .path
+                            .rfind("/routes/")
+                            .map(|i| &file.path[i + 8..])
+                            .or_else(|| file.path.strip_prefix("routes/"))?;
+                        let dir = rel.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                        (!dir.is_empty()).then(|| format!("/{dir}"))
+                    })
+                    .flatten()
+            });
+            let mount_for = |recv: Option<&str>| -> Option<String> {
+                let rp = recv
                     .and_then(|r| ctx.mount_recv.get(&(fid, r.to_string())))
                     .cloned()
-                    .flatten()
-                    .or_else(|| ctx.mount_file.get(&fid).cloned().flatten())
+                    .flatten();
+                match (file_prefix.clone(), rp) {
+                    (Some(f), Some(r)) => Some(join_prefix(&f, &r)),
+                    (f, r) => f.or(r),
+                }
             };
+            // Express `router.route('/x').get(h).post(h)` chains: the
+            // route() call defines the path; the chained verb calls arrive
+            // receiver-less but share the chain's start byte (the same
+            // containment trick Laravel prefix->group uses).
+            let route_spans: Vec<(u32, u32, String, Option<&str>)> = calls
+                .iter()
+                .filter(|c| c.name == "route" && c.receiver.is_some())
+                .filter_map(|c| {
+                    first_path_lit(c)
+                        .map(|p| (c.start_byte, c.end_byte, p, c.receiver.as_deref()))
+                })
+                .collect();
             for call in calls {
                 let Some(method) = HttpMethod::from_name(&call.name) else {
                     continue;
@@ -1148,7 +1301,7 @@ fn detect_server(
                         .and_then(|m| HttpMethod::from_name(&m))
                         .unwrap_or(HttpMethod::Any);
                     if let Some(path) = str_lit_by_key(call, &["url", "path"]) {
-                        let (path, conf) = match mount_for(call) {
+                        let (path, conf) = match mount_for(call.receiver.as_deref()) {
                             Some(mp) => (join_prefix(&mp, &path), Confidence::Heuristic),
                             None => (path, Confidence::High),
                         };
@@ -1158,17 +1311,32 @@ fn detect_server(
                     }
                     continue;
                 }
-                let Some(path) = first_path_lit(call) else {
-                    continue;
+                // Chained verb: bind to the route() span sharing this
+                // chain's start byte. The span's receiver keys the mount.
+                let chain = call
+                    .receiver
+                    .is_none()
+                    .then(|| {
+                        route_spans
+                            .iter()
+                            .find(|(s, e, _, _)| *s == call.start_byte && *e < call.end_byte)
+                    })
+                    .flatten();
+                let (path, recv) = match chain {
+                    Some((_, _, p, r)) => (p.clone(), *r),
+                    None => match first_path_lit(call) {
+                        Some(p) => (p, call.receiver.as_deref()),
+                        None => continue,
+                    },
                 };
-                let (path, conf) = match mount_for(call) {
+                let (path, conf) = match mount_for(recv) {
                     Some(mp) => (join_prefix(&mp, &path), Confidence::Heuristic),
                     None => (path, Confidence::High),
                 };
                 let Some(norm) = normalize_path(&path) else {
                     continue;
                 };
-                let handler = handler_from_ident(call, func, functions, name_index);
+                let handler = handler_from_ident(call, func, file, functions, name_index);
                 push_endpoint(idx, method, path, norm, fw, func, call, handler, conf);
             }
         }
@@ -1207,7 +1375,7 @@ fn detect_server(
                     let Some(norm) = normalize_path(&path) else {
                         continue;
                     };
-                    let handler = handler_from_ident(call, func, functions, name_index);
+                    let handler = handler_from_ident(call, func, file, functions, name_index);
                     idx.endpoints.push(Endpoint {
                         id: idx.endpoints.len() as u32,
                         kind: ApiKind::Http,
@@ -1777,7 +1945,7 @@ fn detect_server(
                     let handler = class_static_string_handler(call, functions, name_index)
                         .or_else(|| silex_service_handler(call, functions, name_index))
                         .or_else(|| array_this_handler(call, func, functions, name_index))
-                        .or_else(|| handler_from_ident(call, func, functions, name_index));
+                        .or_else(|| handler_from_ident(call, func, file, functions, name_index));
                     for m in methods {
                         push_endpoint(
                             idx,
@@ -1968,7 +2136,7 @@ fn detect_server(
                 let Some(mut path) = first_str_lit(call) else {
                     continue;
                 };
-                let handler = handler_from_ident(call, func, functions, name_index);
+                let handler = handler_from_ident(call, func, file, functions, name_index);
                 // gorilla/mux: r.HandleFunc("/x", h).Methods("GET", ...) —
                 // the chained Methods() call is a separate RawCall whose
                 // byte range encloses the HandleFunc call.
@@ -2171,7 +2339,7 @@ fn detect_server(
                     .and_then(|c| HttpMethod::from_name(&c.name))
                     .unwrap_or(HttpMethod::Any);
                 let handler =
-                    inner.and_then(|c| handler_from_ident(c, func, functions, name_index));
+                    inner.and_then(|c| handler_from_ident(c, func, file, functions, name_index));
                 push_endpoint(
                     idx,
                     method,
@@ -2499,12 +2667,63 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
             None => (None, base),
         }
     };
-    // addResource chains carry no dataflow either: when every addResource in
-    // this function has a distinct receiver and a distinct segment they form
-    // at most one linear chain, and the byte-ordered join of the segments
-    // declared BEFORE an addMethod is that method's path. Anything else
-    // (branching trees, reused receivers, receiver-less calls) degrades to
-    // /{*} rather than fabricating a path.
+    // Resource paths ARE trackable dataflow now: `assigned_to` names the
+    // variable a `const items = api.root.addResource('items')` lands in, and
+    // receivers name the variable later `items.addResource('{id}')` /
+    // `items.addMethod(...)` calls go through. A byte-ordered walk therefore
+    // rebuilds the resource tree exactly for the dominant real-world shape
+    // (variables + root-anchored chains). `resolved` keeps every resolved
+    // addResource/resourceForPath span so chained `.addMethod(...)` (same
+    // chain-start byte) binds to its accumulated path. Anything that escapes
+    // the walk (resources passed between functions, dynamic segments) falls
+    // back to the old linear-chain heuristic, then to /{*}.
+    let root_ish = |r: &str| r == "root" || r.ends_with(".root");
+    let mut bound: FxHashMap<String, String> = FxHashMap::default();
+    let mut resolved: Vec<(u32, u32, String)> = Vec::new();
+    {
+        let mut order: Vec<&RawCall> = calls
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.name.as_str(),
+                    "addResource" | "add_resource" | "resourceForPath" | "resource_for_path"
+                )
+            })
+            .collect();
+        order.sort_by_key(|c| (c.start_byte, c.end_byte));
+        for c in order {
+            let Some(seg) = first_str_lit(c) else {
+                continue;
+            };
+            let path = match c.name.as_str() {
+                "resourceForPath" | "resource_for_path" => Some(ensure_slash(&seg)),
+                _ => {
+                    // Chain tails (`root.addResource('a').addResource('b')`)
+                    // arrive receiver-less but share the chain's start byte
+                    // with their (already resolved) predecessor.
+                    let base = match c.receiver.as_deref() {
+                        Some(r) if root_ish(r) => Some(String::new()),
+                        Some(r) => bound.get(r).cloned(),
+                        None => resolved
+                            .iter()
+                            .filter(|(s, e, _)| *s == c.start_byte && *e < c.end_byte)
+                            .max_by_key(|(_, e, _)| *e)
+                            .map(|(_, _, p)| p.clone()),
+                    };
+                    base.map(|b| join_prefix(&b, &seg))
+                }
+            };
+            if let Some(path) = path {
+                resolved.push((c.start_byte, c.end_byte, path.clone()));
+                if let Some(v) = &c.assigned_to {
+                    bound.insert(v.clone(), path);
+                }
+            }
+        }
+    }
+    // Legacy fallback for unresolved receivers: distinct receivers + distinct
+    // segments form at most one linear chain; the byte-ordered join of the
+    // segments declared BEFORE an addMethod approximates its path.
     let mut resources: Vec<(u32, Option<&str>, String)> = calls
         .iter()
         .filter(|c| matches!(c.name.as_str(), "addResource" | "add_resource"))
@@ -2526,6 +2745,28 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
         .filter(|c| matches!(c.name.as_str(), "resourceForPath" | "resource_for_path"))
         .filter_map(|c| first_str_lit(c).map(|p| (c.start_byte, c.end_byte, p)))
         .collect();
+    // `proxy: false` LambdaRestApi stacks add explicit resources/methods ON
+    // THE API VARIABLE; the boolean itself is unharvestable (not a string),
+    // so a resource-ish call whose receiver chain starts at the API's
+    // assigned variable is the honest signal to suppress the proxy-all row.
+    // An unassigned LambdaRestApi (nothing to hang routes on) always keeps
+    // its row.
+    let explicit_routes_on = |var: &str| {
+        calls.iter().any(|c| {
+            matches!(
+                c.name.as_str(),
+                "addResource"
+                    | "add_resource"
+                    | "addMethod"
+                    | "add_method"
+                    | "resourceForPath"
+                    | "resource_for_path"
+            ) && c
+                .receiver
+                .as_deref()
+                .is_some_and(|r| r == var || r.starts_with(&format!("{var}.")))
+        })
+    };
 
     for call in calls {
         match call.name.as_str() {
@@ -2534,14 +2775,25 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                 else {
                     continue;
                 };
-                // Chained `resourceForPath('/x').addMethod(...)`: the inner
-                // call shares the chain's start byte (same shape Laravel
-                // prefix->group containment relies on) — exact path.
-                let chained = for_paths
+                // Resolution ladder: (1) chained `X.addResource('s')
+                // .addMethod(...)` / `resourceForPath('/x').addMethod(...)`
+                // — the inner call shares the chain's start byte and its
+                // accumulated path is exact; (2) receiver is the API root;
+                // (3) receiver is a tracked resource variable; then the
+                // legacy fallbacks.
+                let chained = resolved
                     .iter()
-                    .find(|(s, e, _)| *s == call.start_byte && *e < call.end_byte)
+                    .filter(|(s, e, _)| *s == call.start_byte && *e < call.end_byte)
+                    .max_by_key(|(_, e, _)| *e)
                     .map(|(_, _, p)| p.clone());
-                let (path, base_conf) = if let Some(p) = chained {
+                let tracked = call.receiver.as_deref().and_then(|r| {
+                    if root_ish(r) {
+                        Some("/".to_string())
+                    } else {
+                        bound.get(r).cloned()
+                    }
+                });
+                let (path, base_conf) = if let Some(p) = chained.or(tracked) {
                     (ensure_slash(&p), Confidence::High)
                 } else if resources.is_empty() && for_paths.len() == 1 {
                     // Sole resourceForPath stored in a variable: the only
@@ -2573,8 +2825,78 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                 let (handler, conf) = bind(base_conf);
                 push_endpoint(idx, method, path, norm, "cdk", func, call, handler, conf);
             }
-            // addProxy() -> ANY /{proxy+}; greedy by definition.
+            // addProxy() -> ANY {base}/{proxy+}; greedy by definition. RDS
+            // `instance.addProxy('id', {...})` shares the name — its
+            // positional id string is the discriminator (API GW addProxy
+            // takes only an options object).
             "addProxy" | "add_proxy" => {
+                if first_str_lit(call).is_some() {
+                    continue; // rds.DatabaseInstance.addProxy — not a route
+                }
+                let base = call
+                    .receiver
+                    .as_deref()
+                    .filter(|r| !root_ish(r))
+                    .and_then(|r| bound.get(r).cloned())
+                    .unwrap_or_default();
+                let path = join_prefix(&base, "{proxy+}");
+                let Some(norm) = normalize_path(&path) else {
+                    continue;
+                };
+                let (handler, _) = bind(Confidence::Heuristic);
+                push_endpoint(
+                    idx,
+                    HttpMethod::Any,
+                    path,
+                    norm,
+                    "cdk",
+                    func,
+                    call,
+                    handler,
+                    Confidence::Heuristic,
+                );
+            }
+            // LambdaRestApi proxies EVERY method+path to one lambda. Both
+            // Python constructions and TS new-expressions (bare and
+            // `new apigateway.LambdaRestApi(...)` member form) surface; the
+            // `handler:` prop is an ident (dataflow), so the handler is the
+            // borrowed file-scope lambda either way. `proxy: false` stacks
+            // (explicit addResource/addMethod in the same function) suppress
+            // the proxy-all row — the explicit routes carry the truth.
+            "LambdaRestApi" => {
+                if call
+                    .assigned_to
+                    .as_deref()
+                    .is_some_and(&explicit_routes_on)
+                {
+                    continue;
+                }
+                let (handler, conf) = bind(Confidence::High);
+                push_endpoint(
+                    idx,
+                    HttpMethod::Any,
+                    "/{proxy+}".to_string(),
+                    "/{*}".to_string(),
+                    "cdk",
+                    func,
+                    call,
+                    handler,
+                    conf,
+                );
+            }
+            // Explicit ProxyResource construct: `new ProxyResource(this, id,
+            // { parent, anyMethod })` — a greedy {proxy+} under a parent
+            // resource that arrives as an unharvestable ident, so the base
+            // is unknown and the method (anyMethod / later addMethod with a
+            // dynamic ident) is unknowable -> ANY /{proxy+} Heuristic.
+            "ProxyResource" => {
+                if !call
+                    .arg_lits
+                    .iter()
+                    .any(|l| l.kind == LitKind::Ident && l.text == "parent")
+                {
+                    continue;
+                }
                 let (handler, _) = bind(Confidence::Heuristic);
                 push_endpoint(
                     idx,
@@ -2588,17 +2910,41 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                     Confidence::Heuristic,
                 );
             }
-            // LambdaRestApi proxies EVERY method+path to one lambda. Both
-            // Python constructions and TS new-expressions (bare and
-            // `new apigateway.LambdaRestApi(...)` member form) surface; the
-            // `handler:` prop is an ident (dataflow), so the handler is the
-            // borrowed file-scope lambda either way.
-            "LambdaRestApi" => {
+            // StepFunctionsRestApi: ANY on the API root proxying to the
+            // state machine (plus whatever explicit resources follow, which
+            // the addResource/addMethod arms emit on their own).
+            "StepFunctionsRestApi" => {
+                let (handler, _) = bind(Confidence::Heuristic);
+                push_endpoint(
+                    idx,
+                    HttpMethod::Any,
+                    "/".to_string(),
+                    "/".to_string(),
+                    "cdk",
+                    func,
+                    call,
+                    handler,
+                    Confidence::Heuristic,
+                );
+            }
+            // HTTP API v2 with a default catch-all integration:
+            // `new HttpApi(this, 'x', { defaultIntegration: ... })` -> the
+            // $default route (ANY, every path). The prop value is a
+            // construction (not harvestable), but the KEY ident surfacing is
+            // proof enough. Python kwarg spelling included.
+            "HttpApi" => {
+                let has_default = call.arg_lits.iter().any(|l| {
+                    l.kind == LitKind::Ident
+                        && matches!(l.text.as_str(), "defaultIntegration" | "default_integration")
+                });
+                if !has_default {
+                    continue;
+                }
                 let (handler, conf) = bind(Confidence::High);
                 push_endpoint(
                     idx,
                     HttpMethod::Any,
-                    "/{proxy+}".to_string(),
+                    "$default".to_string(),
                     "/{*}".to_string(),
                     "cdk",
                     func,
@@ -2606,6 +2952,84 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                     handler,
                     conf,
                 );
+            }
+            // WebSocket API v2 L2: route options passed at construction
+            // ($connect / $disconnect / $default) and `addRoute('key', ...)`
+            // custom routes. Route keys are operation names, not HTTP paths;
+            // the norm keeps them literal so rows stay distinct.
+            "WebSocketApi" => {
+                for (prop, key) in [
+                    ("connectRouteOptions", "$connect"),
+                    ("disconnectRouteOptions", "$disconnect"),
+                    ("defaultRouteOptions", "$default"),
+                    ("connect_route_options", "$connect"),
+                    ("disconnect_route_options", "$disconnect"),
+                    ("default_route_options", "$default"),
+                ] {
+                    if call.arg_lits.iter().any(|l| {
+                        l.kind == LitKind::Ident
+                            && l.key.is_none()
+                            && l.text == prop
+                            || l.key.as_deref() == Some(prop)
+                    }) {
+                        let (handler, _) = bind(Confidence::High);
+                        push_endpoint(
+                            idx,
+                            HttpMethod::Any,
+                            key.to_string(),
+                            format!("/{}", key.to_ascii_lowercase()),
+                            "cdk-websocket",
+                            func,
+                            call,
+                            handler,
+                            Confidence::High,
+                        );
+                    }
+                }
+            }
+            "addRoute" | "add_route" => {
+                let Some(key) = first_str_lit(call) else {
+                    continue;
+                };
+                let (handler, conf) = bind(Confidence::High);
+                let norm = format!("/{}", key.to_ascii_lowercase());
+                push_endpoint(
+                    idx,
+                    HttpMethod::Any,
+                    key,
+                    norm,
+                    "cdk-websocket",
+                    func,
+                    call,
+                    handler,
+                    conf,
+                );
+            }
+            // HttpRoute L2 route keys: `HttpRouteKey.with('/books',
+            // HttpMethod.GET)` — the path and method ride on the `with` call
+            // itself, receiver-gated on the HttpRouteKey class.
+            "with" => {
+                if !call
+                    .receiver
+                    .as_deref()
+                    .is_some_and(|r| r.ends_with("HttpRouteKey"))
+                {
+                    continue;
+                }
+                let Some(path) = first_path_lit(call) else {
+                    continue;
+                };
+                let Some(norm) = normalize_path(&path) else {
+                    continue;
+                };
+                let method = call
+                    .arg_lits
+                    .iter()
+                    .filter(|l| l.kind == LitKind::Ident)
+                    .find_map(|l| l.text.rsplit('.').next().and_then(HttpMethod::from_name))
+                    .unwrap_or(HttpMethod::Any);
+                let (handler, conf) = bind(Confidence::High);
+                push_endpoint(idx, method, path, norm, "cdk", func, call, handler, conf);
             }
             // HTTP API v2: addRoutes({ path, methods, integration }).
             "addRoutes" | "add_routes" => {
@@ -2693,22 +3117,27 @@ fn detect_cdk(func: &FunctionInfo, calls: &[RawCall], ctx: &FileCtx, idx: &mut E
                     continue;
                 };
                 let rk = rk.trim().to_string();
-                let (method, path) = if rk == "$default" {
-                    (HttpMethod::Any, "$default".to_string())
-                } else {
-                    let Some((m, p)) = rk.split_once(' ') else {
-                        continue;
-                    };
-                    let Some(method) = HttpMethod::from_name(m) else {
-                        continue;
-                    };
-                    (method, ensure_slash(p.trim()))
-                };
-                let Some(norm) = normalize_path(&path) else {
-                    continue;
+                // Spaceless route keys are WebSocket routes ($connect /
+                // $disconnect / $default / custom actions): operation names,
+                // kept literal in the norm like the L2 WebSocketApi rows.
+                let (method, path, norm, fw) = match rk.split_once(' ') {
+                    None => {
+                        let norm = format!("/{}", rk.to_ascii_lowercase());
+                        (HttpMethod::Any, rk, norm, "cdk-websocket")
+                    }
+                    Some((m, p)) => {
+                        let Some(method) = HttpMethod::from_name(m) else {
+                            continue;
+                        };
+                        let path = ensure_slash(p.trim());
+                        let Some(norm) = normalize_path(&path) else {
+                            continue;
+                        };
+                        (method, path, norm, "cdk")
+                    }
                 };
                 let (handler, conf) = bind(Confidence::High);
-                push_endpoint(idx, method, path, norm, "cdk", func, call, handler, conf);
+                push_endpoint(idx, method, path, norm, fw, func, call, handler, conf);
             }
             // AppSync resolvers: ds.createResolver('id', { typeName,
             // fieldName }) / options-only arity / Python create_resolver
@@ -3508,22 +3937,56 @@ fn array_this_handler(
 fn handler_from_ident(
     call: &RawCall,
     func: &FunctionInfo,
+    file: &FileInfo,
     functions: &[FunctionInfo],
     name_index: &FxHashMap<String, Vec<u32>>,
 ) -> Option<u32> {
-    for lit in call.arg_lits.iter().filter(|l| l.kind == LitKind::Ident) {
+    // Unique non-toplevel function named `name` declared in `fid`.
+    let fn_in_file = |fid: u32, name: &str| -> Option<u32> {
+        let hits: Vec<u32> = name_index
+            .get(name)?
+            .iter()
+            .copied()
+            .filter(|&id| {
+                functions[id as usize].file_id == fid && !functions[id as usize].is_toplevel
+            })
+            .collect();
+        (hits.len() == 1).then(|| hits[0])
+    };
+    // The handler is by convention the LAST argument (`router.post('/x',
+    // validate(v), controller.create)`), so only idents at the highest
+    // argument index are candidates — resolving an earlier middleware ident
+    // instead would be confidently wrong.
+    let max_idx = call
+        .arg_lits
+        .iter()
+        .filter(|l| l.kind == LitKind::Ident && l.key.is_none())
+        .map(|l| l.index)
+        .max()?;
+    for lit in call
+        .arg_lits
+        .iter()
+        .filter(|l| l.kind == LitKind::Ident && l.key.is_none() && l.index == max_idx)
+    {
         let name = lit.text.rsplit(['.', ':']).next().unwrap_or(&lit.text);
-        if let Some(ids) = name_index.get(name) {
-            let same_file: Vec<u32> = ids
-                .iter()
-                .copied()
-                .filter(|&id| {
-                    functions[id as usize].file_id == func.file_id
-                        && !functions[id as usize].is_toplevel
-                })
-                .collect();
-            if same_file.len() == 1 {
-                return Some(same_file[0]);
+        // Same-file first: `app.get("/x", listUsers)`.
+        if let Some(id) = fn_in_file(func.file_id, name) {
+            return Some(id);
+        }
+        // Import-following: `router.get('/', userController.list)` — the
+        // dotted base (or the plain ident itself) bound by an import whose
+        // module resolved to an indexed file; the method resolves there.
+        let base = lit.text.split(['.', ':']).next().unwrap_or(&lit.text);
+        if let Some(target) = file
+            .imports
+            .iter()
+            .find(|i| i.names.iter().any(|n| n == base))
+            .and_then(|i| i.resolved_file)
+        {
+            if target != func.file_id {
+                if let Some(id) = fn_in_file(target, name) {
+                    return Some(id);
+                }
             }
         }
     }

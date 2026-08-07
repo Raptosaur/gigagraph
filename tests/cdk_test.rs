@@ -255,6 +255,54 @@ fn detects_python_l1_cfn_constructs() {
 }
 
 #[test]
+fn detects_variable_tracked_resources() {
+    let idx = index();
+    let ep = &idx.graph.endpoints;
+
+    // Variable-held resources: assigned_to tracking rebuilds the tree.
+    let widgets = find(&idx, HttpMethod::Get, "/widgets", "varres.ts");
+    assert_eq!(widgets.framework, "cdk");
+    assert_eq!(widgets.confidence, Confidence::High);
+    find(&idx, HttpMethod::Patch, "/widgets/{*}", "varres.ts");
+    // Root method with other resources present (my-widget-service shape).
+    find(&idx, HttpMethod::Head, "/", "varres.ts");
+    // Chained addResource().addMethod() (the-dynamo-streamer shape).
+    let orders = find(&idx, HttpMethod::Post, "/orders", "varres.ts");
+    assert_eq!(orders.confidence, Confidence::High);
+
+    // proxy:false LambdaRestApi: explicit routes on the API variable
+    // suppress the proxy-all row; the explicit route carries the truth.
+    find(&idx, HttpMethod::Get, "/vhello", "varres.ts");
+    assert!(
+        !ep.endpoints.iter().any(|e| {
+            e.path_raw == "/{proxy+}"
+                && idx.graph.files[e.file_id as usize].path.ends_with("varres.ts")
+        }),
+        "proxy:false LambdaRestApi must not emit a proxy-all row"
+    );
+
+    // StepFunctionsRestApi -> ANY on the API root.
+    let sfn = find(&idx, HttpMethod::Any, "/", "varres.ts");
+    assert_eq!(sfn.confidence, Confidence::Heuristic);
+    // HttpApi with defaultIntegration -> the $default catch-all.
+    let dflt = find(&idx, HttpMethod::Any, "/{*}", "varres.ts");
+    assert_eq!(dflt.path_raw, "$default");
+
+    // WebSocket routes: L2 ctor options, addRoute, and L1 CfnRoute keys —
+    // operation names kept literal in the norm.
+    assert_eq!(
+        find(&idx, HttpMethod::Any, "/$connect", "varres.ts").framework,
+        "cdk-websocket"
+    );
+    find(&idx, HttpMethod::Any, "/sendmessage", "varres.ts");
+    find(&idx, HttpMethod::Any, "/$disconnect", "varres.ts");
+
+    // HttpRouteKey.with('/v2books', HttpMethod.PUT) L2 route key.
+    let books = find(&idx, HttpMethod::Put, "/v2books", "varres.ts");
+    assert_eq!(books.confidence, Confidence::High);
+}
+
+#[test]
 fn multi_lambda_file_gets_no_binding() {
     let idx = index();
 

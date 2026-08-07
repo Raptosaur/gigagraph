@@ -30,6 +30,13 @@ pub struct RawCall {
     /// DI-binding detection in graph.rs.
     #[serde(default)]
     pub type_args: Vec<String>,
+    /// Variable the call's result was assigned to (`const items =
+    /// api.root.addResource('items')` -> "items"; `this.api = new RestApi()`
+    /// -> "this.api"). Only the OUTERMOST call of a chain sits directly under
+    /// the declarator/assignment, so chain tails never carry it. Fuels CDK
+    /// resource-tree tracking and Koa `new Router({prefix})` binding.
+    #[serde(default)]
+    pub assigned_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,6 +482,7 @@ pub fn extract(spec: &LangSpec, source: &str) -> Option<ExtractedFile> {
                 .map(|a| harvest_arg_lits(spec, a, source))
                 .unwrap_or_default(),
             type_args: c.type_args.clone(),
+            assigned_to: assigned_ident(c.node, source),
         };
         // Walk backwards from the last function starting at/before `pos`;
         // the first one whose range contains the call is the innermost.
@@ -1291,6 +1299,40 @@ fn strip_quotes(s: &str) -> String {
     s[start..]
         .trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == '<' || c == '>')
         .to_string()
+}
+
+/// Variable a call's result is assigned to, when the call node sits directly
+/// under a `variable_declarator` (JS/TS `const x = f()`), an
+/// `assignment_expression` (JS/TS `this.x = f()`), or a Python `assignment`
+/// (`x = f()`). Wrapper nodes that keep the value position transparent
+/// (`await`, parens, TS `as`/`!`) are skipped. Chain tails (`a.b().c()`)
+/// never match: only the outermost call is the declarator's value.
+fn assigned_ident(node: Node, source: &str) -> Option<String> {
+    let mut n = node;
+    let mut parent = n.parent()?;
+    while matches!(
+        parent.kind(),
+        "await_expression" | "parenthesized_expression" | "as_expression" | "non_null_expression"
+    ) {
+        n = parent;
+        parent = n.parent()?;
+    }
+    match parent.kind() {
+        "variable_declarator" => {
+            if parent.child_by_field_name("value")?.id() != n.id() {
+                return None;
+            }
+            let name = parent.child_by_field_name("name")?;
+            (name.kind() == "identifier").then(|| node_text(name, source))
+        }
+        "assignment_expression" | "assignment" => {
+            if parent.child_by_field_name("right")?.id() != n.id() {
+                return None;
+            }
+            sanitize_receiver(&node_text(parent.child_by_field_name("left")?, source))
+        }
+        _ => None,
+    }
 }
 
 fn sanitize_receiver(s: &str) -> Option<String> {
