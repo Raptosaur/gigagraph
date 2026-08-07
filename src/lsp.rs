@@ -247,10 +247,13 @@ struct TsSession {
 
 impl TsSession {
     fn spawn(node: &Path, server_js: &Path, cwd: &Path) -> Result<TsSession> {
+        // node cannot load \\?\-verbatim script paths (module loader rejects
+        // them), and a verbatim cwd leaks into the fake server's answer
+        // computation — de-verbatim everything that reaches the child.
         let mut child = Command::new(node)
-            .arg(server_js)
+            .arg(wire_path(server_js))
             .arg("--disableAutomaticTypingAcquisition")
-            .current_dir(cwd)
+            .current_dir(wire_path(cwd))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
