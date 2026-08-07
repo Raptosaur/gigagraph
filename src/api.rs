@@ -374,14 +374,19 @@ impl AppState {
         let index = self.ensure_index()?;
         let g = &index.graph;
 
-        let (query_vec, exclude, subject) = if let Some(target) = function {
+        let (query_vec, sem_vec, exclude, subject) = if let Some(target) = function {
             let id = resolve_function_ref(g, &target)?;
             let v = index
                 .vectors
                 .vector_of(id)
                 .ok_or_else(|| anyhow!("no vector for function {id}"))?
                 .to_vec();
-            (v, Some(id), json!({ "function": function_summary(g, id) }))
+            let s = index
+                .vectors
+                .sem_vector_of(id)
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
+            (v, s, Some(id), json!({ "function": function_summary(g, id) }))
         } else if let Some(code) = snippet {
             let lang_name =
                 language.ok_or_else(|| anyhow!("`language` is required with `snippet`"))?;
@@ -398,8 +403,14 @@ impl AppState {
                 .find(|f| !f.is_toplevel)
                 .or_else(|| extracted.functions.first())
                 .ok_or_else(|| anyhow!("no function found in snippet"))?;
+            // The same Tier-1 enrichment the index build applies (verb
+            // buckets, subwords, typed locals) — the snippet must be embedded
+            // in the same feature space as the indexed functions.
+            let mut bag = func.features.clone();
+            crate::verbs::augment_bag(&mut bag, &func.locals);
             (
-                index.vectors.embed(&func.features),
+                index.vectors.embed(&bag),
+                crate::vector::semantic_embed_bag(&bag),
                 None,
                 json!({ "snippet_function": func.name }),
             )
@@ -407,7 +418,7 @@ impl AppState {
             bail!("provide either `function` or `snippet` (+`language`)");
         };
 
-        let hits = index.vectors.top_k(&query_vec, limit + 10, exclude);
+        let hits = index.vectors.top_k(&query_vec, &sem_vec, limit + 10, exclude);
         let results: Vec<Value> = hits
             .into_iter()
             .filter(|&(id, _)| !g.functions[id as usize].is_toplevel)

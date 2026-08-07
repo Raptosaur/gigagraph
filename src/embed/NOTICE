@@ -1,0 +1,22 @@
+potion-base-2M.bin — provenance and license
+===========================================
+
+This artifact is an int8-quantized conversion (see distill.py in this
+directory) of the static embedding matrix and WordPiece vocabulary of:
+
+  Model:    minishlab/potion-base-2M
+  Source:   https://huggingface.co/minishlab/potion-base-2M
+  Authors:  The Minish Lab (MinishLab)
+  License:  MIT, as declared by the model card's front matter
+            (`license: mit`) at the time of download (2026-08-07).
+  Files:    model.safetensors (29528 x 64 f32), tokenizer.json
+
+potion-base-2M is a Model2Vec model pre-trained with Tokenlearn, distilled
+from the baai/bge-base-en-v1.5 sentence transformer.
+
+Conversion: per-token int8 quantization (scale = max|x| / 127), mean per-row
+cosine similarity against the f32 original 0.99998 (worst row 0.99992).
+Total artifact size: 2,257,134 bytes.
+
+The MIT license permits use, copy, modification, and redistribution of the
+model weights, provided this notice is retained.

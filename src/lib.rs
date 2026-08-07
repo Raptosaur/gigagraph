@@ -1,5 +1,6 @@
 pub mod api;
 pub mod bridge;
+pub mod embed;
 pub mod endpoints;
 pub mod extract;
 pub mod graph;
@@ -11,4 +12,5 @@ pub mod mcp;
 pub mod touches;
 pub mod types;
 pub mod vector;
+pub mod verbs;
 pub mod viz;

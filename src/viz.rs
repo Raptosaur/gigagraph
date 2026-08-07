@@ -194,11 +194,15 @@ fn build_payload(index: &Index) -> Value {
                 }
             }
         }
-        // Top similar functions via the existing vector index.
+        // Top similar functions via the existing vector index (blended
+        // structural + semantic, same scoring as find_similar).
         let sim: Vec<u32> = index
             .vectors
             .vector_of(id)
-            .map(|v| index.vectors.top_k(v, SIMILAR_K + 15, Some(id)))
+            .map(|v| {
+                let sem = index.vectors.sem_vector_of(id).unwrap_or(&[]);
+                index.vectors.top_k(v, sem, SIMILAR_K + 15, Some(id))
+            })
             .unwrap_or_default()
             .into_iter()
             .filter(|&(sid, _)| kept_set.contains(&sid))

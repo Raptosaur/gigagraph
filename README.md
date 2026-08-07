@@ -24,12 +24,28 @@ For every function in the tree:
 - **Package edges**: calls that leave the project are attributed to external
   packages via import analysis (`express`, `java.util`, `stdio.h`,
   `Foundation`, `builtin:console`, …)
-- **Semantic vector**: a 256-dim structural embedding built by feature-hashing
-  the function's *semantics* — callee names, identifier bag, AST node-type
-  histogram, control-flow shape (loops/branches/nesting), arity, size, external
-  packages — IDF-weighted and L2-normalized. Similarity search is brute-force
-  cosine over the in-memory matrix, parallelized. No ML model, no network, no
-  text embeddings: two functions are similar when they're built the same way.
+- **Semantic vector**: two always-on signals per function, blended at query
+  time (0.6/0.4, fixed — no configuration):
+  - *structural* (256 dims): feature-hashing the function's build — callee
+    names, identifier bag, AST node-type histogram, control-flow shape
+    (loops/branches/nesting), arity, size, external packages — enriched with
+    verb-synonym buckets (`fetch`/`load`/`get` → one READ feature),
+    camelCase/snake_case subwords, typed-local types, and depth-weighted
+    *transitive effect* features (the helpers a function reaches and the
+    external packages it ultimately touches, 3 calls deep) — IDF-weighted,
+    L2-normalized;
+  - *semantic* (64 dims): the function's identifier/callee/type/doc words
+    embedded with a distilled static embedding model compiled into the binary
+    (int8-quantized [potion-base-2M], ~2.2 MB, MIT — see `src/embed/NOTICE`);
+    static table lookup + mean-pool, microseconds per function, no network,
+    no runtime downloads.
+
+  Similarity search is brute-force blended cosine over the in-memory
+  matrices, parallelized and fully deterministic: two functions are similar
+  when they're built the same way *and* named/documented with the same
+  meaning.
+
+[potion-base-2M]: https://huggingface.co/minishlab/potion-base-2M
 
 - **API endpoint map**: routes the code publishes (Express/Koa/Fastify/Hono/
   restify, NestJS, Flask/FastAPI/Django, Laravel/Symfony/Slim, Spring,
@@ -187,7 +203,9 @@ src/
   lang/        one tree-sitter query + metadata per language (docs/QUERY_CONTRACT.md)
   extract.rs   generic query-driven extraction: functions, calls, imports, features
   graph.rs     id assignment, import classification, heuristic call resolution
-  vector.rs    feature-hashed structural vectors + parallel cosine top-k
+  vector.rs    feature-hashed structural vectors + parallel blended cosine top-k
+  verbs.rs     identifier word-splitting + verb-synonym bucketing
+  embed.rs     compiled-in distilled static embeddings (src/embed/, ~2.2 MB)
   indexer.rs   parallel walk (gitignore-aware) -> cached extract -> graph -> vectors
   mcp.rs       stdio JSON-RPC MCP server
   api.rs       tool implementations

@@ -1,6 +1,10 @@
-//! In-memory semantic vector index. Feature bags are hashed into fixed-size
-//! signed vectors (feature-hashing trick), IDF-weighted, L2-normalized, and
-//! searched by brute-force cosine similarity in parallel.
+//! In-memory semantic vector index. Two signals per function, both always on:
+//! - structural: feature bags hashed into fixed-size signed vectors
+//!   (feature-hashing trick), IDF-weighted, L2-normalized;
+//! - semantic: the bag's identifier/callee/type/doc words embedded with the
+//!   compiled-in distilled static model (see `crate::embed`).
+//!
+//! Search is brute-force blended cosine over both, in parallel.
 
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -8,6 +12,14 @@ use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
 pub const DIMS: usize = 256;
+pub const SEM_DIMS: usize = crate::embed::DIMS;
+
+/// Fixed blend for top-k scoring: structural cosine dominates (call shape,
+/// AST, control flow are the primary signal), the distilled semantic cosine
+/// pulls synonym-named twins together. Deliberately not configurable — every
+/// index everywhere scores identically.
+pub const STRUCTURAL_WEIGHT: f32 = 0.6;
+pub const SEMANTIC_WEIGHT: f32 = 0.4;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct VectorIndex {
@@ -18,6 +30,10 @@ pub struct VectorIndex {
     /// (rare features get the default IDF).
     pub df: FxHashMap<u64, u32>,
     pub n_docs: u32,
+    /// Row-major semantic matrix, functions * SEM_DIMS, each row
+    /// L2-normalized (or all-zero). Serialized with the index.
+    #[serde(default)]
+    pub sem: Vec<f32>,
 }
 
 fn feature_hash(feat: &str) -> u64 {
@@ -52,6 +68,7 @@ impl VectorIndex {
             data: vec![0.0; feature_bags.len() * DIMS],
             df,
             n_docs,
+            sem: vec![0.0; feature_bags.len() * SEM_DIMS],
         };
 
         let df_ref = &index.df;
@@ -61,6 +78,13 @@ impl VectorIndex {
             .collect();
         for (i, row) in rows.into_iter().enumerate() {
             index.data[i * DIMS..(i + 1) * DIMS].copy_from_slice(&row);
+        }
+        let sem_rows: Vec<Vec<f32>> = feature_bags
+            .par_iter()
+            .map(semantic_embed_bag)
+            .collect();
+        for (i, row) in sem_rows.into_iter().enumerate() {
+            index.sem[i * SEM_DIMS..(i + 1) * SEM_DIMS].copy_from_slice(&row);
         }
         index
     }
@@ -74,12 +98,29 @@ impl VectorIndex {
         self.data.get(start..start + DIMS)
     }
 
-    /// Top-k cosine similarity against all rows; `exclude` is dropped from
-    /// results (usually the query function itself).
-    pub fn top_k(&self, query: &[f32], k: usize, exclude: Option<u32>) -> Vec<(u32, f32)> {
+    /// Semantic row for a function; `None` when out of range (or when the
+    /// index predates the semantic matrix — callers pass `&[]` then).
+    pub fn sem_vector_of(&self, id: u32) -> Option<&[f32]> {
+        let start = id as usize * SEM_DIMS;
+        self.sem.get(start..start + SEM_DIMS)
+    }
+
+    /// Top-k blended similarity against all rows:
+    /// `STRUCTURAL_WEIGHT * structural_cosine + SEMANTIC_WEIGHT *
+    /// semantic_cosine`. A `sem_query` of the wrong length (e.g. `&[]`)
+    /// scores the semantic term as zero. `exclude` is dropped from results
+    /// (usually the query function itself).
+    pub fn top_k(
+        &self,
+        query: &[f32],
+        sem_query: &[f32],
+        k: usize,
+        exclude: Option<u32>,
+    ) -> Vec<(u32, f32)> {
         if query.len() != DIMS || self.n_docs == 0 {
             return Vec::new();
         }
+        let use_sem = sem_query.len() == SEM_DIMS && self.sem.len() == self.data.len() / DIMS * SEM_DIMS;
         let mut scored: Vec<(u32, f32)> = self
             .data
             .par_chunks(DIMS)
@@ -88,7 +129,17 @@ impl VectorIndex {
                 if exclude == Some(i as u32) {
                     return None;
                 }
-                let score: f32 = row.iter().zip(query).map(|(a, b)| a * b).sum();
+                let structural: f32 = row.iter().zip(query).map(|(a, b)| a * b).sum();
+                let semantic: f32 = if use_sem {
+                    self.sem[i * SEM_DIMS..(i + 1) * SEM_DIMS]
+                        .iter()
+                        .zip(sem_query)
+                        .map(|(a, b)| a * b)
+                        .sum()
+                } else {
+                    0.0
+                };
+                let score = STRUCTURAL_WEIGHT * structural + SEMANTIC_WEIGHT * semantic;
                 (score > 0.0).then_some((i as u32, score))
             })
             .collect();
@@ -104,6 +155,24 @@ impl VectorIndex {
         scored.sort_by(cmp);
         scored
     }
+}
+
+/// Semantic document for a function: the human-word-bearing feature-bag keys
+/// (identifiers, callee names, typed-local types, doc words), embedded with
+/// the compiled-in static model. Keys are sorted so the mean-pool order — and
+/// thus the floating-point result — is deterministic.
+pub fn semantic_embed_bag(bag: &FxHashMap<String, u32>) -> Vec<f32> {
+    let mut words: Vec<&str> = bag
+        .keys()
+        .filter_map(|k| {
+            k.strip_prefix("id:")
+                .or_else(|| k.strip_prefix("call:"))
+                .or_else(|| k.strip_prefix("ty:"))
+                .or_else(|| k.strip_prefix("doc:"))
+        })
+        .collect();
+    words.sort_unstable();
+    crate::embed::embed(&words.join(" "))
 }
 
 fn embed_bag(bag: &FxHashMap<String, u32>, df: &FxHashMap<u64, u32>, n_docs: u32) -> Vec<f32> {

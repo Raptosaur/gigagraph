@@ -375,6 +375,75 @@ impl GigaGraph {
             }
         }
 
+        // ---- Similarity feature enrichment (always on, no configuration) ----
+        // Verb-bucket (`vb:`), subword (`w:`), and typed-local (`ty:`)
+        // features derive from the finished bags + locals; doing it here
+        // (not in extract.rs) keeps the extraction cache format and its
+        // cached entries valid.
+        features
+            .par_iter_mut()
+            .zip(fn_locals.par_iter())
+            .for_each(|(bag, locals)| crate::verbs::augment_bag(bag, locals));
+
+        // Depth-weighted transitive effect features over RESOLVED edges: what
+        // a function ultimately does (the helpers it reaches, bucketed by
+        // verb) and ultimately touches (external packages at any depth <= 3)
+        // is its effect signature. Depth weights 4/2/1; fan-out capped at 32
+        // expanded nodes per level; synthetic toplevels skipped.
+        let effect_feats: Vec<Vec<(String, u32)>> = (0..g.functions.len())
+            .into_par_iter()
+            .map(|fid| {
+                if g.functions[fid].is_toplevel {
+                    return Vec::new();
+                }
+                const DEPTH_WEIGHTS: [u32; 3] = [4, 2, 1];
+                const MAX_EXPAND_PER_LEVEL: usize = 32;
+                let mut acc: FxHashMap<String, u32> = FxHashMap::default();
+                let mut visited: FxHashSet<u32> = FxHashSet::default();
+                visited.insert(fid as u32);
+                let mut frontier: Vec<u32> = vec![fid as u32];
+                for weight in DEPTH_WEIGHTS {
+                    let mut next: Vec<u32> = Vec::new();
+                    for &f in &frontier {
+                        for &ci in &g.calls_by_caller[f as usize] {
+                            match &g.calls[ci as usize].resolution {
+                                Resolution::Internal { callee, .. } => {
+                                    let cf = &g.functions[*callee as usize];
+                                    if cf.is_toplevel {
+                                        continue;
+                                    }
+                                    let feat = match crate::verbs::bucket_for_name(&cf.name) {
+                                        Some(b) => format!("eff:{b}"),
+                                        None => format!("eff:{}", cf.name),
+                                    };
+                                    *acc.entry(feat).or_insert(0) += weight;
+                                    if next.len() < MAX_EXPAND_PER_LEVEL
+                                        && visited.insert(*callee)
+                                    {
+                                        next.push(*callee);
+                                    }
+                                }
+                                Resolution::External { package } => {
+                                    acc.entry(format!("effpkg:{package}")).or_insert(4);
+                                }
+                                Resolution::Unresolved => {}
+                            }
+                        }
+                    }
+                    frontier = next;
+                    if frontier.is_empty() {
+                        break;
+                    }
+                }
+                acc.into_iter().collect()
+            })
+            .collect();
+        for (fid, feats) in effect_feats.into_iter().enumerate() {
+            for (key, w) in feats {
+                *features[fid].entry(key).or_insert(0) += w;
+            }
+        }
+
         // Resolve single-assignment string constants into call/decoration
         // arguments: `fetch(API)` gains a Str lit carrying API's value, so
         // every downstream detector sees the literal path. Done once here

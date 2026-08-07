@@ -213,7 +213,8 @@ fn similarity_finds_structural_twin() {
     let evens = resolve_function_ref(g, "sumEvens").unwrap();
     let odds = resolve_function_ref(g, "sumOdds").unwrap();
     let v = index.vectors.vector_of(evens).unwrap().to_vec();
-    let hits = index.vectors.top_k(&v, 3, Some(evens));
+    let sem = index.vectors.sem_vector_of(evens).unwrap().to_vec();
+    let hits = index.vectors.top_k(&v, &sem, 3, Some(evens));
     assert!(!hits.is_empty(), "no similarity hits for sumEvens");
     assert_eq!(
         hits[0].0, odds,

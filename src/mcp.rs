@@ -214,7 +214,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "find_similar",
-            "description": format!("Semantically similar functions via structural vectors (callee names, identifiers, AST shape, control flow — not text embeddings). Query by indexed function or by raw snippet. Not answerable with grep at all; use for duplicate-logic hunting, convention discovery, refactor targets. {fn_ref}"),
+            "description": format!("Semantically similar functions via blended vectors: structural (callee names, identifiers, AST shape, control flow, transitive effects) + distilled static name/doc embeddings, so fetchUser and loadAccount can match on meaning as well as shape. Query by indexed function or by raw snippet. Not answerable with grep at all; use for duplicate-logic hunting, convention discovery, refactor targets. {fn_ref}"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
