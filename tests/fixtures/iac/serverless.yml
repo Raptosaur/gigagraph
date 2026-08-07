@@ -70,6 +70,23 @@ functions:
           path: /n/${self:custom.${opt:k}}/y
           method: get
 
+  # WebSocket events: shorthand action and object route form.
+  wsBroadcast:
+    handler: src/handlers/users.create
+    events:
+      - websocket: broadcast
+  wsConnect:
+    handler: src/handlers/users.create
+    events:
+      - websocket:
+          route: $connect
+  # In a websocket event, $default is a ws route (protocol is proven by the
+  # event name), not an HTTP catch-all.
+  wsDefault:
+    handler: src/handlers/users.create
+    events:
+      - websocket: $default
+
 custom:
   basePath: /v1
   handlers:

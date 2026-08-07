@@ -46,6 +46,19 @@ resource "aws_apigatewayv2_route" "old_route" {
   target    = "integrations/${aws_apigatewayv2_integration.old_int.id}"
 }
 
+# WebSocket API: bare route_key is a wss:// action, not an HTTP route key.
+resource "aws_apigatewayv2_api" "ws" {
+  name                       = "ws-api"
+  protocol_type              = "WEBSOCKET"
+  route_selection_expression = "$request.body.action"
+}
+
+resource "aws_apigatewayv2_route" "ws_disconnect" {
+  api_id    = "${aws_apigatewayv2_api.ws.id}"
+  route_key = "$disconnect"
+  target    = "integrations/${aws_apigatewayv2_integration.old_int.id}"
+}
+
 # HCL1-quoted REST chain (futurice terraform-examples shape): resource_id /
 # parent_id written as "${...}" interpolation strings rather than bare
 # traversals — root method on root_resource_id plus a greedy proxy resource.

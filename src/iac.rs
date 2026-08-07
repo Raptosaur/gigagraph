@@ -435,6 +435,21 @@ fn parse_route_key(rk: &str) -> Option<(HttpMethod, String)> {
     Some((HttpMethod::from_name(m)?, p.trim().to_string()))
 }
 
+/// WebSocket route key: `$connect` / `$disconnect` / a bare action token
+/// (`sendmessage`). HTTP route keys always carry "METHOD /path" (or
+/// $default, handled by parse_route_key first), so a bare key means the API
+/// is a WebSocket API. Returns the key as written.
+fn ws_route_key(rk: &str) -> Option<String> {
+    let rk = rk.trim();
+    if rk.is_empty() || rk == "$default" || rk.contains([' ', '/']) {
+        return None;
+    }
+    let body = rk.strip_prefix('$').unwrap_or(rk);
+    body.chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        .then(|| rk.to_string())
+}
+
 fn path_conf(path: &str) -> Confidence {
     // Unexpanded template variables stay raw; normalize folds them to {*}.
     if path.contains("${") {
@@ -788,11 +803,17 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
             continue;
         }
         let Some(props) = res.props else { continue };
-        let Some((method, path)) = get(props, "RouteKey")
-            .and_then(as_str)
-            .and_then(parse_route_key)
-        else {
+        let Some(rk) = get(props, "RouteKey").and_then(as_str) else {
             continue;
+        };
+        // Bare route key = WebSocket API route (wss:// action, not an HTTP
+        // path): still a real endpoint with a lambda behind it.
+        let (method, path, framework) = match parse_route_key(rk) {
+            Some((m, p)) => (m, p, "cloudformation"),
+            None => match ws_route_key(rk) {
+                Some(k) => (HttpMethod::Any, k, "websocket"),
+                None => continue,
+            },
         };
         let lambda = get(props, "Target")
             .and_then(logical_target)
@@ -810,7 +831,7 @@ fn scan_cloudformation(dir: &str, source: &str) -> Vec<IacFinding> {
             method,
             confidence: path_conf(&path),
             path_raw: path,
-            framework: "cloudformation",
+            framework,
             line: res_line(name),
             handler: href,
             require_handler: false,
@@ -1121,19 +1142,47 @@ fn sls_functions(
                 let hit = get(ev, "http")
                     .or_else(|| get(ev, "httpApi"))
                     .and_then(|v| sls_http_event(v, doc));
-                let Some((method, path)) = hit else { continue };
-                out.push(IacFinding {
-                    kind: ApiKind::Http,
-                    method,
-                    confidence: path_conf(&path),
-                    path_raw: path,
-                    framework: "serverless",
-                    line,
-                    handler: href.clone(),
-                    require_handler: false,
-                    sls: sls.clone(),
+                if let Some((method, path)) = hit {
+                    out.push(IacFinding {
+                        kind: ApiKind::Http,
+                        method,
+                        confidence: path_conf(&path),
+                        path_raw: path,
+                        framework: "serverless",
+                        line,
+                        handler: href.clone(),
+                        require_handler: false,
+                        sls: sls.clone(),
+                    });
+                    had_http = true;
+                    continue;
+                }
+                // `websocket: $connect` shorthand or `{route: $connect}`:
+                // a wss:// action route on the function. Unlike a bare CFN
+                // RouteKey, the event name already proves the protocol, so
+                // `$default` is a ws route here, not an HTTP catch-all.
+                let ws_key = |s: &str| {
+                    ws_route_key(s).or_else(|| (s.trim() == "$default").then(|| "$default".into()))
+                };
+                let ws = get(ev, "websocket").map(untag).and_then(|v| match v {
+                    Y::String(s) => ws_key(s),
+                    Y::Mapping(_) => get(v, "route").and_then(as_str).and_then(|s| ws_key(s)),
+                    _ => None,
                 });
-                had_http = true;
+                if let Some(key) = ws {
+                    out.push(IacFinding {
+                        kind: ApiKind::Http,
+                        method: HttpMethod::Any,
+                        path_raw: key,
+                        framework: "websocket",
+                        line,
+                        confidence: Confidence::High,
+                        handler: href.clone(),
+                        require_handler: false,
+                        sls: sls.clone(),
+                    });
+                    had_http = true;
+                }
             }
         }
         // Lambda function URL: a real catch-all endpoint.
@@ -1697,11 +1746,28 @@ fn scan_terraform(dir: &str, source: &str) -> Vec<IacFinding> {
         };
 
     for (rk, target, line) in routes {
-        let Some((method, path)) = parse_route_key(&rk) else {
-            continue;
-        };
         let lam = target.and_then(|t| integrations.get(&t).cloned());
-        push_http(&mut out, &mut routed, method, path, Confidence::High, line, lam);
+        if let Some((method, path)) = parse_route_key(&rk) {
+            push_http(&mut out, &mut routed, method, path, Confidence::High, line, lam);
+            continue;
+        }
+        // Bare route key = WebSocket API action route.
+        let Some(key) = ws_route_key(&rk) else { continue };
+        let href = href_for(&lam);
+        if let Some(l) = lam {
+            routed.insert(l);
+        }
+        out.push(IacFinding {
+            kind: ApiKind::Http,
+            method: HttpMethod::Any,
+            path_raw: key,
+            framework: "websocket",
+            line,
+            confidence: Confidence::High,
+            handler: href,
+            require_handler: false,
+            sls: None,
+        });
     }
     for (rk, lam, line) in quick {
         let Some((method, path)) = parse_route_key(&rk) else {
@@ -1853,6 +1919,17 @@ pub fn attach(graph: &mut GigaGraph, files: &[(String, Vec<IacFinding>)]) {
                     // blast_radius still gains the handler edge.
                     let name = f.path_raw["lambda:".len()..].to_ascii_lowercase();
                     let Some(n) = endpoints::normalize_path(&format!("/lambda/{name}")) else {
+                        continue;
+                    };
+                    (f.path_raw.clone(), n)
+                }
+                // WebSocket action routes get their own first segment, like
+                // lambda: rows: "$connect" -> /ws/connect. Never unifies
+                // with real HTTP client paths; blast_radius still gains the
+                // handler edge.
+                _ if f.framework == "websocket" => {
+                    let action = f.path_raw.trim_start_matches('$').to_ascii_lowercase();
+                    let Some(n) = endpoints::normalize_path(&format!("/ws/{action}")) else {
                         continue;
                     };
                     (f.path_raw.clone(), n)

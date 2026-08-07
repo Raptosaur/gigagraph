@@ -357,6 +357,78 @@ fn terraform_quoted_rest_chain() {
 }
 
 #[test]
+fn websocket_routes() {
+    let idx = index();
+    let g = &idx.graph;
+
+    let find = |file: &str, norm: &str| {
+        g.endpoints
+            .endpoints
+            .iter()
+            .find(|e| {
+                e.framework == "websocket"
+                    && e.path_norm == norm
+                    && g.files[e.file_id as usize].path == file
+            })
+            .unwrap_or_else(|| panic!("missing websocket route {norm} in {file}"))
+    };
+
+    // CFN: bare RouteKey ($connect + custom action) -> /ws/<action> rows,
+    // lambda resolved through Target -> Integration -> !Sub IntegrationUri.
+    let connect = find("websocket.yaml", "/ws/connect");
+    assert_eq!(connect.path_raw, "$connect");
+    assert_eq!(connect.confidence, Confidence::High);
+    assert_eq!(
+        handler_loc(g, connect),
+        Some(("src/handlers/report.py".into(), "lambda_handler".into()))
+    );
+    let send = find("websocket.yaml", "/ws/sendmessage");
+    assert_eq!(send.path_raw, "sendMessage");
+    assert_eq!(
+        handler_loc(g, send),
+        Some(("src/handlers/report.py".into(), "lambda_handler".into()))
+    );
+    // The routed function must not double as a lambda: entry-point row.
+    assert!(
+        !g.endpoints
+            .endpoints
+            .iter()
+            .any(|e| e.path_raw == "lambda:WsHandlerFunction"),
+        "ws-routed function must not emit a lambda: row"
+    );
+
+    // Terraform: bare route_key on aws_apigatewayv2_route.
+    let disc = find("legacy.tf", "/ws/disconnect");
+    assert_eq!(disc.path_raw, "$disconnect");
+    assert_eq!(
+        handler_loc(g, disc),
+        Some(("src/handlers/orders.js".into(), "handler".into()))
+    );
+
+    // serverless.yml: shorthand action and object route form.
+    let bc = find("serverless.yml", "/ws/broadcast");
+    assert_eq!(bc.path_raw, "broadcast");
+    assert_eq!(
+        handler_loc(g, bc),
+        Some(("src/handlers/users.js".into(), "create".into()))
+    );
+    let sc = find("serverless.yml", "/ws/connect");
+    assert_eq!(sc.path_raw, "$connect");
+    assert_eq!(
+        handler_loc(g, sc),
+        Some(("src/handlers/users.js".into(), "create".into()))
+    );
+
+    // `websocket: $default` is a ws route, not an HTTP catch-all.
+    let sd = find("serverless.yml", "/ws/default");
+    assert_eq!(sd.path_raw, "$default");
+    assert_eq!(
+        handler_loc(g, sd),
+        Some(("src/handlers/users.js".into(), "create".into()))
+    );
+}
+
+#[test]
 fn serverless_variable_resolution() {
     let idx = index();
     let g = &idx.graph;
