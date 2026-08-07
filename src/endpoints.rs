@@ -11,7 +11,7 @@
 //! or a file naming convention (Django `urls.py`, Rails `config/routes.rb`),
 //! and carries an honest `Confidence`.
 
-use crate::extract::{LitKind, RawCall, RawDecoration};
+use crate::extract::{ArgLit, LitKind, RawCall, RawDecoration};
 use crate::types::{Confidence, FileInfo, FunctionInfo, Lang};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -151,6 +151,56 @@ pub struct EndpointIndex {
 
 const VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
 
+/// Go router/mux API surface — never a user register-function, so calls with
+/// these names are excluded from the cross-function prefix-flow scan.
+const GO_ROUTER_API: &[&str] = &[
+    "Group",
+    "Route",
+    "Mount",
+    "Use",
+    "With",
+    "Subrouter",
+    "PathPrefix",
+    "Handle",
+    "HandleFunc",
+    "HandlerFunc",
+    "Handler",
+    "Methods",
+    "Name",
+    "Host",
+    "Schemes",
+    "Queries",
+    "Static",
+    "StaticFile",
+    "StaticFS",
+    "Any",
+    "All",
+    "Match",
+    "NoRoute",
+    "NoMethod",
+    "Run",
+    "Listen",
+    "ListenAndServe",
+    "New",
+    "Default",
+    "NewRouter",
+    "NewServeMux",
+    "GET",
+    "POST",
+    "PUT",
+    "DELETE",
+    "PATCH",
+    "HEAD",
+    "OPTIONS",
+    "Get",
+    "Post",
+    "Put",
+    "Delete",
+    "Patch",
+    "Head",
+    "Options",
+];
+
 /// Silex evidence: the framework import itself, or any `*ControllerProvider`
 /// import — provider classes routinely extend a project base provider and
 /// never import Silex directly (the interface import lives in the base). A
@@ -240,6 +290,20 @@ struct FileCtx {
     /// `.service(handler)` registration elsewhere. `None` = registered under
     /// conflicting scopes.
     actix_scope: FxHashMap<u32, Option<String>>,
+    /// (file id, receiver spelling) -> composed Go router-group prefix:
+    /// `v1 := r.Group("/api")` (gin/echo/fiber), nested `v2 := v1.Group(..)`,
+    /// gorilla `s := r.PathPrefix("/api").Subrouter()`, and chained
+    /// `g := app.Group("/x").Use(mw)`. Keyed by the bound name so endpoints
+    /// registered on that receiver join the prefix. `None` = same name bound
+    /// at conflicting prefixes.
+    go_group: FxHashMap<(u32, String), Option<String>>,
+    /// Go function id -> (prefix, confidence) flowing IN from cross-function
+    /// mount/register call sites: gin-style `users.Register(v1.Group("/u"))`
+    /// and chi-style `r.Mount("/admin", adminAPI.Router())`, composed
+    /// transitively (a mounted router's own mounts extend the chain).
+    /// Confidence caps the endpoints' confidence (fuzzy target resolution =
+    /// Heuristic). `None` = mounted at conflicting prefixes.
+    go_func_prefix: FxHashMap<u32, Option<(String, Confidence)>>,
 }
 
 /// Compose a file's transitive mount prefix, outermost first:
@@ -362,6 +426,12 @@ pub fn detect(
     // file id -> one entry per CDK Lambda declaration seen (resolved or not);
     // folded into `ctx.cdk_lambda` after the loop.
     let mut cdk_decls: FxHashMap<u32, Vec<Option<u32>>> = FxHashMap::default();
+    // Go cross-function prefix flow: (source func, target func, mounted
+    // prefix or None = ambiguous, target-resolution confidence).
+    let mut go_edges: Vec<(u32, u32, Option<String>, Confidence)> = Vec::new();
+    // (file id, var) -> internal import path of the package whose constructor
+    // produced the var (`adminAPI, _ := admin.NewAPI(db)`).
+    let mut go_var_pkg: FxHashMap<(u32, String), String> = FxHashMap::default();
     for func in functions {
         let fid = func.file_id;
         let file = &files[fid as usize];
@@ -748,6 +818,178 @@ pub fn detect(
                     }
                 }
             }
+            Lang::Go => {
+                // Router-group prefix tracking (gin/echo/fiber `Group`,
+                // gorilla `PathPrefix().Subrouter()`, chi `Route`/`Mount`).
+                if !has(
+                    fid,
+                    &["gin-gonic", "labstack/echo", "go-chi", "gofiber", "gorilla/mux"],
+                ) {
+                    continue;
+                }
+                for call in calls {
+                    if let Some(var) = call.assigned_to.as_deref() {
+                        // Constructor bindings: remember the source package
+                        // for later target disambiguation.
+                        if let Some(recv) = call.receiver.as_deref() {
+                            if !recv.contains('.') {
+                                if let Some(imp) = file.imports.iter().find(|i| {
+                                    i.names.iter().any(|n| n == recv)
+                                        || i.path.rsplit('/').next() == Some(recv)
+                                }) {
+                                    go_var_pkg
+                                        .entry((fid, var.to_string()))
+                                        .or_insert_with(|| imp.path.clone());
+                                }
+                            }
+                        }
+                        // Group-producing bindings: `v1 := r.Group("/api")`,
+                        // `s := r.PathPrefix("/x").Subrouter()`, chained
+                        // `g := app.Group("/x").Use(mw)`. Whitelisted outer
+                        // names keep `h := NewHandler(app.Group(..))` from
+                        // marking `h` as a router.
+                        if matches!(
+                            call.name.as_str(),
+                            "Group" | "PathPrefix" | "Subrouter" | "Use" | "With" | "Name"
+                        ) && let Some(prefix) = go_compose_group(fid, call, calls, &ctx.go_group)
+                        {
+                            match prefix {
+                                Some(p) => {
+                                    upsert_mount(&mut ctx.go_group, (fid, var.to_string()), p)
+                                }
+                                None => {
+                                    ctx.go_group.insert((fid, var.to_string()), None);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    // Cross-function edges come only from production code:
+                    // tests re-mount the same routers at arbitrary prefixes
+                    // (`UsersRegister(r.Group("/users"))` in a _test.go) and
+                    // would poison the real composition.
+                    if func.is_test {
+                        continue;
+                    }
+                    // chi `r.Mount("/admin", adminAPI.Router())` — prefix the
+                    // endpoints DECLARED in the mounted router's builder.
+                    if call.name == "Mount" {
+                        let Some(seg) = first_str_lit(call) else {
+                            continue;
+                        };
+                        let mut poisoned = false;
+                        let mut base = String::new();
+                        if let Some(r) = call.receiver.as_deref() {
+                            match ctx.go_group.get(&(fid, r.to_string())) {
+                                Some(Some(g)) => base = g.clone(),
+                                Some(None) => poisoned = true,
+                                None => {}
+                            }
+                        }
+                        let route_pre = go_route_containment(call, calls);
+                        if !route_pre.is_empty() {
+                            base = if base.is_empty() {
+                                route_pre
+                            } else {
+                                join_prefix(&base, &route_pre)
+                            };
+                        }
+                        let full = if base.is_empty() {
+                            ensure_slash(&seg)
+                        } else {
+                            join_prefix(&base, &seg)
+                        };
+                        let full = (!poisoned).then_some(full);
+                        // Target: first resolvable call inside the argument
+                        // list (`a.Accounts.router()`), else a bare local
+                        // router variable (`r.Mount("/sub", subRouter)`).
+                        let mut resolved = None;
+                        for c in calls.iter().filter(|c| {
+                            c.start_byte > call.start_byte && c.end_byte <= call.end_byte
+                        }) {
+                            if let Some(hit) = resolve_go_target(
+                                &c.name,
+                                c.receiver.as_deref(),
+                                fid,
+                                files,
+                                functions,
+                                name_index,
+                                &go_var_pkg,
+                            ) {
+                                resolved = Some(hit);
+                                break;
+                            }
+                        }
+                        match resolved {
+                            Some((tgt, conf)) if tgt != func.id => {
+                                go_edges.push((func.id, tgt, full, conf));
+                            }
+                            Some(_) => {}
+                            None => {
+                                if let Some(l) = call.arg_lits.iter().find(|l| {
+                                    l.kind == LitKind::Ident
+                                        && l.key.is_none()
+                                        && l.index >= 1
+                                        && !l.text.contains('.')
+                                }) {
+                                    match full {
+                                        Some(p) => upsert_mount(
+                                            &mut ctx.go_group,
+                                            (fid, l.text.clone()),
+                                            p,
+                                        ),
+                                        None => {
+                                            ctx.go_group.insert((fid, l.text.clone()), None);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    // Register-function pattern: a group expression (or bare
+                    // group variable) passed INTO a function that declares the
+                    // routes — `users.UsersRegister(v1.Group("/users"))`,
+                    // `misc.NewMiscHandler(app.Group("/api/v1"))`,
+                    // `articles.Register(v1)`.
+                    if GO_ROUTER_API.contains(&call.name.as_str()) {
+                        continue;
+                    }
+                    let inner: Vec<&RawCall> = calls
+                        .iter()
+                        .filter(|c| {
+                            c.start_byte > call.start_byte
+                                && c.end_byte <= call.end_byte
+                                && c.name == "Group"
+                                && first_str_lit(c).is_some()
+                        })
+                        .collect();
+                    let prefix: Option<Option<String>> = if inner.len() == 1 {
+                        go_compose_group(fid, inner[0], calls, &ctx.go_group)
+                    } else if inner.is_empty() {
+                        call.arg_lits
+                            .iter()
+                            .filter(|l| l.kind == LitKind::Ident && l.key.is_none())
+                            .find_map(|l| ctx.go_group.get(&(fid, l.text.clone())).cloned())
+                    } else {
+                        None
+                    };
+                    if let Some(p) = prefix
+                        && let Some((tgt, conf)) = resolve_go_target(
+                            &call.name,
+                            call.receiver.as_deref(),
+                            fid,
+                            files,
+                            functions,
+                            name_index,
+                            &go_var_pkg,
+                        )
+                        && tgt != func.id
+                    {
+                        go_edges.push((func.id, tgt, p, conf));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -778,6 +1020,52 @@ pub fn detect(
                 bases.push(base.clone());
             }
         }
+    }
+
+    // Go mount/register edges -> transitive per-function prefixes. Each round
+    // recomputes every target from the previous round's sources, so chains
+    // (`main -> app.Router -> account.router`) settle in depth rounds; the
+    // cap bounds pathological cycles.
+    if !go_edges.is_empty() {
+        let worse = |a: Confidence, b: Confidence| {
+            if a == Confidence::Heuristic || b == Confidence::Heuristic {
+                Confidence::Heuristic
+            } else {
+                Confidence::High
+            }
+        };
+        let mut fp: FxHashMap<u32, Option<(String, Confidence)>> = FxHashMap::default();
+        for _ in 0..8 {
+            let mut next: FxHashMap<u32, Option<(String, Confidence)>> = FxHashMap::default();
+            for (src, tgt, seg, conf) in &go_edges {
+                let val = match (fp.get(src), seg) {
+                    (Some(None), _) | (_, None) => None,
+                    (Some(Some((base, bc))), Some(s)) => {
+                        Some((join_prefix(base, s), worse(*bc, *conf)))
+                    }
+                    (None, Some(s)) => Some((s.clone(), *conf)),
+                };
+                match val {
+                    Some((p, c)) => {
+                        let slot = next.entry(*tgt).or_insert_with(|| Some((p.clone(), c)));
+                        let conflict = matches!(slot, Some((vp, _)) if *vp != p);
+                        if conflict {
+                            *slot = None;
+                        } else if let Some((_, vc)) = slot {
+                            *vc = worse(*vc, c);
+                        }
+                    }
+                    None => {
+                        next.insert(*tgt, None);
+                    }
+                }
+            }
+            if next == fp {
+                break;
+            }
+            fp = next;
+        }
+        ctx.go_func_prefix = fp;
     }
 
     for func in functions {
@@ -2307,8 +2595,9 @@ fn detect_server(
             let gin = has(fid, &["gin-gonic"]);
             let echo = has(fid, &["labstack/echo"]);
             let chi = has(fid, &["go-chi"]);
+            let fiber = has(fid, &["gofiber"]);
             let gorilla = has(fid, &["gorilla/mux"]);
-            let router = gin || echo || chi;
+            let router = gin || echo || chi || fiber;
             if !net_http && !router && !gorilla {
                 return;
             }
@@ -2316,17 +2605,33 @@ fn detect_server(
                 "gin"
             } else if echo {
                 "echo"
+            } else if fiber {
+                "fiber"
             } else {
                 "chi"
             };
+            // Cross-function inbound prefix (mount/register flow); its
+            // confidence caps the endpoints'.
+            let (func_pre, func_conf) = match ctx.go_func_prefix.get(&func.id) {
+                Some(Some((p, c))) => (p.as_str(), *c),
+                _ => ("", Confidence::High),
+            };
             for call in calls {
-                let (mut method, is_handle) = match call.name.as_str() {
-                    "HandleFunc" | "Handle" if net_http || gorilla => (HttpMethod::Any, true),
+                let (mut method, is_handle, wrapper) = match call.name.as_str() {
+                    "HandleFunc" | "Handle" if net_http || gorilla => {
+                        (HttpMethod::Any, true, false)
+                    }
                     "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS" if router => {
-                        (HttpMethod::from_name(&call.name).unwrap(), false)
+                        (HttpMethod::from_name(&call.name).unwrap(), false, false)
                     }
                     "Get" | "Post" | "Put" | "Delete" | "Patch" if router => {
-                        (HttpMethod::from_name(&call.name).unwrap(), false)
+                        (HttpMethod::from_name(&call.name).unwrap(), false, false)
+                    }
+                    // User wrapper convention over gorilla (`a.Get("/x", h)`
+                    // forwarding to HandleFunc(..).Methods("GET") inside a
+                    // helper) — real routes, but a convention, not API.
+                    "Get" | "Post" | "Put" | "Delete" | "Patch" if gorilla => {
+                        (HttpMethod::from_name(&call.name).unwrap(), false, true)
                     }
                     _ => continue,
                 };
@@ -2334,13 +2639,59 @@ fn detect_server(
                     continue;
                 };
                 let handler = handler_from_ident(call, func, file, functions, name_index);
+                // Go 1.22 patterns: "GET /users/{id}"
+                if is_handle {
+                    if let Some((m, rest)) = path.split_once(' ') {
+                        if let Some(parsed) = HttpMethod::from_name(m) {
+                            method = parsed;
+                            path = rest.to_string();
+                        }
+                    }
+                }
+                // Composed static prefix: cross-function inbound + receiver-
+                // tracked group (`v1.GET(..)`) + enclosing `Route` closures
+                // (chi/fiber). An ambiguously-bound receiver contributes
+                // nothing (same as before prefix tracking existed).
+                let mut pre = func_pre.to_string();
+                if let Some(Some(g)) = call
+                    .receiver
+                    .as_deref()
+                    .and_then(|r| ctx.go_group.get(&(fid, r.to_string())))
+                {
+                    pre = if pre.is_empty() {
+                        g.clone()
+                    } else {
+                        join_prefix(&pre, g)
+                    };
+                }
+                if chi || fiber {
+                    let route_pre = go_route_containment(call, calls);
+                    if !route_pre.is_empty() {
+                        pre = if pre.is_empty() {
+                            route_pre
+                        } else {
+                            join_prefix(&pre, &route_pre)
+                        };
+                    }
+                }
+                if !pre.is_empty() {
+                    // Also admits prefix-relative registrations with an empty
+                    // or slash-less path (`router.POST("", h)`, gin's "" vs
+                    // "/" pair; fiber's Group("api")).
+                    path = join_prefix(&pre, &path);
+                }
+                if !path.starts_with('/') {
+                    continue;
+                }
+                let confidence = if wrapper || func_conf == Confidence::Heuristic {
+                    Confidence::Heuristic
+                } else {
+                    Confidence::High
+                };
                 // gorilla/mux: r.HandleFunc("/x", h).Methods("GET", ...) —
                 // the chained Methods() call is a separate RawCall whose
                 // byte range encloses the HandleFunc call.
                 if is_handle && gorilla && call.receiver.as_deref() != Some("http") {
-                    if !path.starts_with('/') {
-                        continue;
-                    }
                     let Some(norm) = normalize_path(&path) else {
                         continue;
                     };
@@ -2374,38 +2725,22 @@ fn detect_server(
                             file_id: fid,
                             line: call.line,
                             handler,
-                            confidence: Confidence::High,
+                            confidence,
                         });
                     }
-                    continue;
-                }
-                // Go 1.22 patterns: "GET /users/{id}"
-                if is_handle {
-                    if let Some((m, rest)) = path.split_once(' ') {
-                        if let Some(parsed) = HttpMethod::from_name(m) {
-                            method = parsed;
-                            path = rest.to_string();
-                        }
-                    }
-                }
-                if !path.starts_with('/') {
                     continue;
                 }
                 let Some(norm) = normalize_path(&path) else {
                     continue;
                 };
-                let fw = if is_handle { "net/http" } else { router_fw };
-                push_endpoint(
-                    idx,
-                    method,
-                    path,
-                    norm,
-                    fw,
-                    func,
-                    call,
-                    handler,
-                    Confidence::High,
-                );
+                let fw = if wrapper {
+                    "gorilla"
+                } else if is_handle {
+                    "net/http"
+                } else {
+                    router_fw
+                };
+                push_endpoint(idx, method, path, norm, fw, func, call, handler, confidence);
             }
         }
         Lang::Ruby => {
@@ -4760,18 +5095,28 @@ fn handler_from_ident(
     };
     // The handler is by convention the LAST argument (`router.post('/x',
     // validate(v), controller.create)`), so only idents at the highest
-    // argument index are candidates — resolving an earlier middleware ident
-    // instead would be confidently wrong.
-    let max_idx = call
-        .arg_lits
-        .iter()
-        .filter(|l| l.kind == LitKind::Ident && l.key.is_none())
-        .map(|l| l.index)
-        .max()?;
+    // ELIGIBLE argument index are candidates — resolving an earlier
+    // middleware ident would be confidently wrong. An ident sharing its
+    // top-level index with a string literal is a path-builder callee
+    // harvested from a nested call (`HandleFunc(s.prefixedPath("/x"),
+    // s.echoHandler)`), never the handler — ineligible.
+    let eligible = |l: &&ArgLit| {
+        l.kind == LitKind::Ident
+            && !call
+                .arg_lits
+                .iter()
+                .any(|s| s.kind == LitKind::Str && s.index == l.index)
+    };
+    let max_idx = call.arg_lits.iter().filter(eligible).map(|l| l.index).max()?;
+    // Within the last argument, rightmost ident first: a wrapper call
+    // (`a.handleRequest(handler.GetAllProjects)`) surfaces the wrapper name
+    // before the wrapped handler at the same index.
     for lit in call
         .arg_lits
         .iter()
-        .filter(|l| l.kind == LitKind::Ident && l.key.is_none() && l.index == max_idx)
+        .filter(eligible)
+        .filter(|l| l.index == max_idx)
+        .rev()
     {
         let name = lit.text.rsplit(['.', ':']).next().unwrap_or(&lit.text);
         // Same-file first: `app.get("/x", listUsers)`.
@@ -4792,6 +5137,219 @@ fn handler_from_ident(
                 if let Some(id) = fn_in_file(target, name) {
                     return Some(id);
                 }
+            }
+        }
+        // Go: a handler routinely lives in a sibling file of the same
+        // package (`s.versionHandler` in version.go, wired in server.go).
+        // qualified_name's leading scope is the package declaration, so a
+        // unique same-package candidate is safe; last rung is a globally
+        // unique Go function (register-table style `handler.GetAllProjects`
+        // from another package).
+        if func.language == Lang::Go {
+            if let Some(ids) = name_index.get(name) {
+                let scope = |id: u32| {
+                    let q = &functions[id as usize].qualified_name;
+                    q.split("::").next().unwrap_or(q).to_string()
+                };
+                let here = scope(func.id);
+                let same_pkg: Vec<u32> = ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| !functions[id as usize].is_toplevel && scope(id) == here)
+                    .collect();
+                if same_pkg.len() == 1 {
+                    return Some(same_pkg[0]);
+                }
+                let global: Vec<u32> = ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| {
+                        !functions[id as usize].is_toplevel
+                            && functions[id as usize].language == Lang::Go
+                    })
+                    .collect();
+                if global.len() == 1 {
+                    return Some(global[0]);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Compose the prefix a Go group-producing call chain denotes:
+/// `r.Group("/api")`, `v1.Group("/users")` (inheriting v1's recorded prefix),
+/// `r.PathPrefix("/api").Subrouter()`, `a.Group("/x").Group("/y")`. `outer`
+/// is the whole bound/argument expression's outermost call; the chain is the
+/// set of `Group`/`PathPrefix` calls byte-contained in it. Returns `None` if
+/// the expression carries no static group segment, `Some(None)` when an
+/// upstream binding is ambiguous.
+fn go_compose_group(
+    fid: u32,
+    outer: &RawCall,
+    calls: &[RawCall],
+    groups: &FxHashMap<(u32, String), Option<String>>,
+) -> Option<Option<String>> {
+    let mut chain: Vec<&RawCall> = calls
+        .iter()
+        .filter(|c| {
+            c.start_byte >= outer.start_byte
+                && c.end_byte <= outer.end_byte
+                && matches!(c.name.as_str(), "Group" | "PathPrefix")
+                && first_str_lit(c).is_some()
+        })
+        .collect();
+    if chain.is_empty() {
+        return None;
+    }
+    chain.sort_by_key(|c| (c.start_byte, c.end_byte));
+    // A genuine method chain nests: every later link contains the earlier
+    // ones. Sibling groups in one expression are ambiguous — bail.
+    for w in chain.windows(2) {
+        if !(w[1].start_byte <= w[0].start_byte && w[1].end_byte >= w[0].end_byte) {
+            return Some(None);
+        }
+    }
+    let mut prefix = match chain[0].receiver.as_deref() {
+        Some(r) => match groups.get(&(fid, r.to_string())) {
+            Some(Some(p)) => p.clone(),
+            Some(None) => return Some(None),
+            None => String::new(),
+        },
+        None => String::new(),
+    };
+    for c in &chain {
+        let lit = first_str_lit(c).unwrap_or_default();
+        prefix = if prefix.is_empty() {
+            ensure_slash(&lit)
+        } else {
+            join_prefix(&prefix, &lit)
+        };
+    }
+    Some(Some(prefix))
+}
+
+/// Concatenated path segments of every chi/fiber `Route("/seg", func(r) {..})`
+/// call whose byte range encloses `call` — closure nesting becomes prefix
+/// nesting (func literals attribute their calls to the enclosing named
+/// function, so containment is visible within one call list).
+fn go_route_containment(call: &RawCall, calls: &[RawCall]) -> String {
+    let mut pre = String::new();
+    for m in calls {
+        if m.name == "Route" && m.start_byte < call.start_byte && m.end_byte >= call.end_byte {
+            if let Some(seg) = first_str_lit(m) {
+                pre = if pre.is_empty() {
+                    ensure_slash(&seg)
+                } else {
+                    join_prefix(&pre, &seg)
+                };
+            }
+        }
+    }
+    pre
+}
+
+/// Resolve the Go function a mount/register call targets. Ladder: unique
+/// name; package-qualified call (`users.UsersRegister`) or constructor-bound
+/// receiver (`adminAPI := admin.NewAPI(..); adminAPI.Router()`) matched
+/// against the import path's directory tail; unique same-directory sibling;
+/// receiver-segment ~ receiver-type fuzz (`a.Account.router()` ->
+/// `AccountResource::router`, Heuristic).
+fn resolve_go_target(
+    name: &str,
+    receiver: Option<&str>,
+    fid: u32,
+    files: &[FileInfo],
+    functions: &[FunctionInfo],
+    name_index: &FxHashMap<String, Vec<u32>>,
+    var_pkg: &FxHashMap<(u32, String), String>,
+) -> Option<(u32, Confidence)> {
+    let mut cands: Vec<u32> = name_index
+        .get(name)?
+        .iter()
+        .copied()
+        .filter(|&id| {
+            let f = &functions[id as usize];
+            f.language == Lang::Go && !f.is_toplevel && !f.is_test
+        })
+        .collect();
+    if cands.is_empty() {
+        return None;
+    }
+    if cands.len() == 1 {
+        return Some((cands[0], Confidence::High));
+    }
+    let dir_of = |id: u32| -> &str {
+        let p = &files[functions[id as usize].file_id as usize].path;
+        p.rsplit_once('/').map(|(d, _)| d).unwrap_or("")
+    };
+    if let Some(recv) = receiver {
+        if !recv.contains('.') {
+            let imp_path = files[fid as usize]
+                .imports
+                .iter()
+                .find(|i| {
+                    i.names.iter().any(|n| n == recv) || i.path.rsplit('/').next() == Some(recv)
+                })
+                .map(|i| i.path.clone())
+                .or_else(|| var_pkg.get(&(fid, recv.to_string())).cloned());
+            if let Some(ip) = imp_path {
+                let filt: Vec<u32> = cands
+                    .iter()
+                    .copied()
+                    .filter(|&id| {
+                        let d = dir_of(id);
+                        !d.is_empty() && (ip == d || ip.ends_with(&format!("/{d}")))
+                    })
+                    .collect();
+                if filt.len() == 1 {
+                    return Some((filt[0], Confidence::High));
+                }
+                if !filt.is_empty() {
+                    cands = filt;
+                }
+            }
+        }
+    }
+    let here = files[fid as usize]
+        .path
+        .rsplit_once('/')
+        .map(|(d, _)| d)
+        .unwrap_or("");
+    let same: Vec<u32> = cands
+        .iter()
+        .copied()
+        .filter(|&id| dir_of(id) == here)
+        .collect();
+    if same.len() == 1 {
+        return Some((same[0], Confidence::High));
+    }
+    if !same.is_empty() {
+        cands = same;
+    }
+    if let Some(recv) = receiver {
+        let seg = recv.rsplit('.').next().unwrap_or(recv).to_ascii_lowercase();
+        // Composite-literal receivers (`todosResource{}.Routes()`) carry
+        // brace suffixes; strip non-alphanumerics before matching, and the
+        // plural 's' of field names like `a.Accounts`.
+        let seg = seg.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        let seg = seg.trim_end_matches('s');
+        if !seg.is_empty() {
+            let filt: Vec<u32> = cands
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    functions[id as usize]
+                        .containing_type
+                        .as_deref()
+                        .is_some_and(|t| {
+                            let t = t.to_ascii_lowercase();
+                            t.starts_with(seg) || seg.ends_with(t.as_str())
+                        })
+                })
+                .collect();
+            if filt.len() == 1 {
+                return Some((filt[0], Confidence::Heuristic));
             }
         }
     }

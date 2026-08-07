@@ -18,9 +18,13 @@ fn extracts_go_functions_and_methods() {
     // Go files declare their package; it feeds qualified names.
     assert_eq!(file.package.as_deref(), Some("mypkg"));
 
-    // Known limitation: a method's receiver type is a sibling field of the
-    // declaration, not an ancestor node, so TYPE_KINDS can't resolve it.
-    assert_eq!(func(&file, "Run").containing_type, None);
+    // A method's receiver type is a sibling field of the declaration (not an
+    // ancestor node), captured explicitly as `@func.recv_type`; plain
+    // functions have no containing type.
+    assert_eq!(
+        func(&file, "Run").containing_type.as_deref(),
+        Some("Server")
+    );
     assert_eq!(func(&file, "NewServer").containing_type, None);
 
     // Param counts (receiver is not a parameter).
