@@ -98,7 +98,7 @@ impl LangSpec {
     }
 }
 
-fn registry() -> &'static Vec<LangSpec> {
+pub fn registry() -> &'static Vec<LangSpec> {
     static REG: OnceLock<Vec<LangSpec>> = OnceLock::new();
     REG.get_or_init(|| {
         vec![

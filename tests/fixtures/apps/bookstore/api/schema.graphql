@@ -1,0 +1,24 @@
+type Author {
+  id: ID!
+  name: String!
+  books: [Book!]!
+}
+
+type Book {
+  id: ID!
+  isbn: String!
+  title: String!
+  priceCents: Int!
+  author: Author!
+}
+
+type Query {
+  book(isbn: String!): Book
+  searchBooks(term: String!, limit: Int): [Book!]!
+  cartTotal(cartId: ID!): Int!
+}
+
+type Mutation {
+  addToCart(cartId: ID!, isbn: String!, quantity: Int): Boolean!
+  removeFromCart(cartId: ID!, isbn: String!): Boolean!
+}

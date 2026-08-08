@@ -43,8 +43,15 @@ use crate::types::{ImportStyle, Lang};
 //   `containing_type` (same ride-along trick java.rs uses for Spring
 //   class-level `@RequestMapping`; same known limit: a routed class with no
 //   methods leaks the comment-decoration to the next function in the file).
-//   Method-level docblocks are untouched: they precede `method_declaration`,
-//   not `class_declaration`, so the anchored pattern never matches them.
+//   Method-level docblocks are untouched by THAT pattern: they precede
+//   `method_declaration`, not `class_declaration`, so the anchored pattern
+//   never matches them.
+// - `/** @test */` above a method is the dominant PHPUnit-in-Laravel style
+//   (it frees the method to be named `it_returns_a_token` instead of
+//   `testItReturnsAToken`), and the annotation lives only in a comment. Same
+//   trick, anchored to `method_declaration`: the comment becomes a decoration
+//   whose name is its raw text, which `src/tests.rs` matches on. `\b` keeps
+//   `@testWith` (a PHPUnit data-provider annotation, not a case marker) out.
 // - `use A\B\C;` binds its last segment as `@import.name`; the trailing anchor
 //   keeps aliased declarations out of that pattern so `use X as Y;` binds only
 //   `Y`. Grouped `use A\{B, C};` captures the shared `namespace_name` prefix as
@@ -181,6 +188,11 @@ const QUERY: &str = r#"
   .
   (class_declaration)
   (#match? @deco.name "@Route\\("))
+
+((comment) @deco @deco.name
+  .
+  (method_declaration)
+  (#match? @deco.name "@test\\b"))
 
 (assignment_expression
   left: (variable_name (name) @local.name)

@@ -7,7 +7,7 @@ use crate::lang;
 use crate::vector::VectorIndex;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
@@ -58,6 +58,17 @@ pub struct IndexStats {
     pub parsed_files: u32,
     pub cached_files: u32,
     pub skipped_files: u32,
+    /// Candidate files that produced no `FileInfo` — unreadable, an extension
+    /// with no `LangSpec`, or a parse the extractor rejected. Capped; the
+    /// count above is exact. A file listed here is INVISIBLE to every tool,
+    /// so this is the first thing to check when an answer looks incomplete.
+    #[serde(default)]
+    pub skipped_paths: Vec<String>,
+    /// Endpoints whose handler resolved to an indexed function. Compared with
+    /// the endpoint total this is the handler-link rate — a health metric for
+    /// route detection, not just a count.
+    #[serde(default)]
+    pub endpoints_with_handler: u32,
     pub elapsed_ms: u64,
     pub functions_by_language: FxHashMap<String, u32>,
     /// Stat-level tree fingerprint at build time; lets a fresh process skip
@@ -261,6 +272,19 @@ pub fn build_index(root: &Path, force: bool) -> Result<Index> {
     let cached_files = processed.iter().filter(|p| p.reused).count() as u32;
     let parsed_files = processed.len() as u32 - cached_files;
 
+    // Which candidates fell out of the parallel pass above (unreadable, no
+    // LangSpec for the extension, extraction refused). Capped: the point is
+    // to make the shape of the loss visible, not to dump a build log.
+    const SKIPPED_SAMPLE: usize = 50;
+    let kept: FxHashSet<&str> = processed.iter().map(|p| p.rel.as_str()).collect();
+    let skipped_paths: Vec<String> = files
+        .iter()
+        .map(|(rel, _)| rel)
+        .filter(|rel| !kept.contains(rel.as_str()))
+        .take(SKIPPED_SAMPLE)
+        .cloned()
+        .collect();
+
     let new_cache = ExtractionCache {
         entries: processed
             .iter()
@@ -341,6 +365,13 @@ pub fn build_index(root: &Path, force: bool) -> Result<Index> {
         parsed_files,
         cached_files,
         skipped_files: total_candidates - graph.files.len() as u32,
+        skipped_paths,
+        endpoints_with_handler: graph
+            .endpoints
+            .endpoints
+            .iter()
+            .filter(|e| e.handler.is_some())
+            .count() as u32,
         external_packages: graph.package_calls.len() as u32,
         elapsed_ms: started.elapsed().as_millis() as u64,
         tree_fingerprint: fingerprint,

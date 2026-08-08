@@ -28,6 +28,9 @@ pub struct GigaGraph {
     pub package_calls: FxHashMap<String, Vec<u32>>,
     /// Detected API endpoints, outbound HTTP calls, and their correlation.
     pub endpoints: crate::endpoints::EndpointIndex,
+    /// Named test cases, suites and hooks, per framework.
+    #[serde(default)]
+    pub tests: crate::tests::TestIndex,
     /// Every callee name that appears at any call site, resolved or not.
     /// A function whose name is here is reachable by some dynamic dispatch we
     /// could not resolve — never a dead-code candidate.
@@ -490,6 +493,16 @@ impl GigaGraph {
         g.bridge =
             crate::bridge::detect(&g.files, &g.functions, &raw_calls, &decorations, &ret_strs);
 
+        // Test discovery reads the same raw calls: BDD cases are string
+        // literals at call sites, which CallSite does not keep.
+        g.tests = crate::tests::detect(
+            &g.files,
+            &g.functions,
+            &raw_calls,
+            &decorations,
+            &file_hierarchy,
+        );
+
         // ---- Reference inventory for dead-code analysis ----
         // Every callee name, resolved or not: dynamic dispatch we couldn't
         // resolve still names its target.
@@ -619,8 +632,11 @@ fn is_test_decoration(name: &str) -> bool {
             | "TestFixture"
             | "ParameterizedTest"
             | "RepeatedTest"
+            | "TestFactory"
+            | "TestTemplate"
             | "Fact"
             | "Theory"
+            | "bench"
             | "fixture"
     )
 }
@@ -628,22 +644,29 @@ fn is_test_decoration(name: &str) -> bool {
 /// Name conventions strong enough on their own: Python/Ruby `test_*`;
 /// Go `TestXxx`/`BenchmarkXxx` (the compiler enforces the shape only in
 /// `_test.go` files, which `is_test_file` already catches — the name check
-/// covers helpers referenced across test packages).
+/// covers helpers referenced across test packages); the camelCase `testXxx`
+/// that PHPUnit, XCTest and shunit2 all collect by reflection.
+///
+/// The prefix must end a word (`TestFoo`, `test_foo`, `testFoo`) so ordinary
+/// names like `Testing`, `tested` or `testable` do not match.
 fn is_test_name(name: &str, language: Lang) -> bool {
     match language {
-        Lang::Python | Lang::Ruby | Lang::Php => name.starts_with("test_"),
-        Lang::Go => {
-            for prefix in ["Test", "Benchmark", "Fuzz"] {
-                if let Some(rest) = name.strip_prefix(prefix) {
-                    if rest.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-                        return true;
-                    }
-                }
-            }
-            false
+        Lang::Python | Lang::Ruby => name.starts_with("test_"),
+        Lang::Php | Lang::Swift | Lang::ObjC | Lang::Bash => {
+            name.starts_with("test_") || starts_new_word_after(name, "test")
         }
+        Lang::Go => ["Test", "Benchmark", "Fuzz", "Example"]
+            .iter()
+            .any(|p| starts_new_word_after(name, p)),
         _ => false,
     }
+}
+
+/// `name` starts with `prefix` and the next character begins a new word.
+fn starts_new_word_after(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 fn strip_extension(path: &str) -> &str {

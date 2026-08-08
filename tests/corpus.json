@@ -1,0 +1,246 @@
+{
+  "comment": [
+    "Real-world applications the indexer is validated against. Fixtures prove a",
+    "construct is handled; this corpus proves the handling survives contact with",
+    "code nobody wrote for us — vendored directories, generated files, dialects,",
+    "and scale.",
+    "",
+    "`rev` pins an exact commit so a run is reproducible; bump it deliberately.",
+    "Expectations are FLOORS, not equalities: a corpus repo that grows must not",
+    "break the build, but one where detection collapses must. Count floors sit at",
+    "roughly 70% of the values measured at the pinned commit; `min_resolution_pct`",
+    "sits 10 points under its measured value. They are REGRESSION detectors, not",
+    "quality bars — a repo whose architecture defeats static resolution (Rails",
+    "autoloading, MediatR indirection) carries an honestly low floor with the",
+    "reason recorded in `why`.",
+    "",
+    "scripts/fetch-corpus.sh --report prints the current measurements and the",
+    "floors they suggest.",
+    "",
+    "Fetch with scripts/fetch-corpus.sh, then:",
+    "cargo test --test corpus_test -- --ignored --nocapture"
+  ],
+  "dir": "validation/corpus",
+  "repos": [
+    {
+      "name": "express-realworld",
+      "repo": "https://github.com/gothinkster/node-express-realworld-example-app",
+      "rev": "30b68e1e881462b2f4164ea09ab4c4f5699c7b0b",
+      "why": "Express + Prisma REST API in TypeScript, with a Jest suite. Resolution is low (27%) because the handlers are thin wrappers over Prisma's generated client, which is not in the tree.",
+      "languages": [
+        "typescript",
+        "prisma"
+      ],
+      "min_files": 30,
+      "min_functions": 45,
+      "min_endpoints": 14,
+      "min_test_cases": 20,
+      "frameworks": [
+        "jest"
+      ],
+      "min_resolution_pct": 17
+    },
+    {
+      "name": "django-realworld",
+      "repo": "https://github.com/gothinkster/django-realworld-example-app",
+      "rev": "29c9d42831fa0cfc5a4aa7561f674396eacf20a2",
+      "why": "Django REST Framework: class-based views, routers, urls.py routing. Ships no tests — a zero here is correct, and guards against a detector that invents them.",
+      "languages": [
+        "python"
+      ],
+      "min_files": 30,
+      "min_functions": 60,
+      "min_endpoints": 3,
+      "min_test_cases": 0,
+      "frameworks": [],
+      "min_resolution_pct": 44
+    },
+    {
+      "name": "gin-realworld",
+      "repo": "https://github.com/gothinkster/golang-gin-realworld-example-app",
+      "rev": "626c372d259472148d93303f74aa9b9a1cdcef24",
+      "why": "Gin router groups plus a real _test.go suite.",
+      "languages": [
+        "go"
+      ],
+      "min_files": 16,
+      "min_functions": 120,
+      "min_endpoints": 20,
+      "min_test_cases": 45,
+      "frameworks": [
+        "go-test"
+      ],
+      "min_resolution_pct": 42
+    },
+    {
+      "name": "spring-petclinic",
+      "repo": "https://github.com/spring-projects/spring-petclinic",
+      "rev": "88e37c15cf6fc8490b01bc3e8e2c800cec1ac272",
+      "why": "The canonical Spring Boot app: @GetMapping controllers, JUnit 5.",
+      "languages": [
+        "java"
+      ],
+      "min_files": 40,
+      "min_functions": 175,
+      "min_endpoints": 12,
+      "min_test_cases": 50,
+      "frameworks": [
+        "junit"
+      ],
+      "min_resolution_pct": 41
+    },
+    {
+      "name": "laravel-realworld",
+      "repo": "https://github.com/gothinkster/laravel-realworld-example-app",
+      "rev": "e45c37c8a5f57131c9d239f1fc104c227e66b6ee",
+      "why": "Laravel routing + Eloquent. Its PHPUnit suite is written in the docblock style (`/** @test */` over snake_case methods), so it also guards the comment-annotation path — and its bundled public/js/app.js guards against reading RegExp `.test()` as a Jest case.",
+      "languages": [
+        "php"
+      ],
+      "min_files": 75,
+      "min_functions": 1200,
+      "min_endpoints": 12,
+      "min_test_cases": 40,
+      "frameworks": [
+        "phpunit"
+      ],
+      "min_resolution_pct": 55
+    },
+    {
+      "name": "rails-realworld",
+      "repo": "https://github.com/gothinkster/rails-realworld-example-app",
+      "rev": "a2ae4fff78b3337683cea988c023281dcb5551b9",
+      "why": "Rails routes.rb + controllers. Its test/ tree is untouched scaffolding (every case commented out), so zero cases is the correct answer here too. KNOWN GAP: with Zeitwerk autoloading there are no imports to follow, so only ~3% of Ruby call sites resolve and no route links to a controller action; the floor records the gap rather than hiding it.",
+      "languages": [
+        "ruby"
+      ],
+      "min_files": 40,
+      "min_functions": 65,
+      "min_endpoints": 12,
+      "min_test_cases": 0,
+      "frameworks": [],
+      "min_resolution_pct": 1
+    },
+    {
+      "name": "aspnetcore-realworld",
+      "repo": "https://github.com/gothinkster/aspnetcore-realworld-example-app",
+      "rev": "93f225a258125fda2eea60d459b4fe55de783fcd",
+      "why": "ASP.NET Core attribute routing + MediatR, xUnit suite (16 [Fact]s, all found at the pinned commit). Resolution is low (19%) by design of the app: nearly every call goes through MediatR's `_mediator.Send(command)` indirection, which no static resolver can follow.",
+      "languages": [
+        "csharp"
+      ],
+      "min_files": 55,
+      "min_functions": 90,
+      "min_endpoints": 13,
+      "min_test_cases": 12,
+      "frameworks": [
+        "xunit"
+      ],
+      "min_resolution_pct": 9
+    },
+    {
+      "name": "axum",
+      "repo": "https://github.com/tokio-rs/axum",
+      "rev": "c9a911b7999de50e9e5023942ca072e9725ae943",
+      "why": "Large Rust workspace: #[test]/#[tokio::test] at scale, plus routes declared across hundreds of examples.",
+      "languages": [
+        "rust"
+      ],
+      "min_files": 210,
+      "min_functions": 1500,
+      "min_endpoints": 280,
+      "min_test_cases": 290,
+      "frameworks": [
+        "rust-test"
+      ],
+      "min_resolution_pct": 45
+    },
+    {
+      "name": "googletest",
+      "repo": "https://github.com/google/googletest",
+      "rev": "d89aac5f0dd4021198d903d39de16f896726de21",
+      "why": "The gtest macros in their native habitat — thousands of TEST/TEST_F, plus Python unittest runner scripts alongside them.",
+      "languages": [
+        "cpp"
+      ],
+      "min_files": 130,
+      "min_functions": 3800,
+      "min_endpoints": 0,
+      "min_test_cases": 1800,
+      "frameworks": [
+        "gtest",
+        "unittest"
+      ],
+      "min_resolution_pct": 33
+    },
+    {
+      "name": "bats-core",
+      "repo": "https://github.com/bats-core/bats-core",
+      "rev": "ae4b94d7cc35f62468297791aa4ab8c3af7377ba",
+      "why": "Bash at scale plus a large .bats suite — the bats detection's home turf.",
+      "languages": [
+        "bash"
+      ],
+      "min_files": 190,
+      "min_functions": 880,
+      "min_endpoints": 0,
+      "min_test_cases": 540,
+      "frameworks": [
+        "bats"
+      ],
+      "min_resolution_pct": 26
+    },
+    {
+      "name": "vapor",
+      "repo": "https://github.com/vapor/vapor",
+      "rev": "4024681926e6bbff05e413eeb3e0ddfc6901aa45",
+      "why": "Server-side Swift: protocol-heavy code, and a suite mid-migration from XCTest to Swift Testing — both idioms live in the same tree.",
+      "languages": [
+        "swift"
+      ],
+      "min_files": 165,
+      "min_functions": 1000,
+      "min_endpoints": 0,
+      "min_test_cases": 290,
+      "frameworks": [
+        "swift-testing",
+        "xctest"
+      ],
+      "min_resolution_pct": 31
+    },
+    {
+      "name": "afnetworking",
+      "repo": "https://github.com/AFNetworking/AFNetworking",
+      "rev": "d9f589cc2c1fe9d55eb5eea00558010afea7a41e",
+      "why": "Objective-C at scale: categories, blocks, XCTest.",
+      "languages": [
+        "objc"
+      ],
+      "min_files": 58,
+      "min_functions": 500,
+      "min_endpoints": 0,
+      "min_test_cases": 175,
+      "frameworks": [
+        "xctest"
+      ],
+      "min_resolution_pct": 21
+    },
+    {
+      "name": "ktor-samples",
+      "repo": "https://github.com/ktorio/ktor-samples",
+      "rev": "69dcff3fa81daa85f936cfb7f17007761363c303",
+      "why": "Kotlin DSL routing across many small apps — Ktor route detection, and a polyglot tree (Kotlin, Swift, JS, Bash) that must not bleed between languages.",
+      "languages": [
+        "kotlin"
+      ],
+      "min_files": 150,
+      "min_functions": 3000,
+      "min_endpoints": 65,
+      "min_test_cases": 110,
+      "frameworks": [
+        "junit"
+      ],
+      "min_resolution_pct": 71
+    }
+  ]
+}

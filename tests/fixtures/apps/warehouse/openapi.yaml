@@ -1,0 +1,31 @@
+openapi: 3.0.3
+info:
+  title: Warehouse API
+  version: 1.2.0
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      responses:
+        "200":
+          description: ok
+  /v1/items/{sku}:
+    get:
+      operationId: getItem
+      parameters:
+        - name: sku
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: item
+  /v1/items/{sku}/reserve:
+    post:
+      operationId: reserveItem
+      responses:
+        "204":
+          description: reserved
+        "409":
+          description: out of stock

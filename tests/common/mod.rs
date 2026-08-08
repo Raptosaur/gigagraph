@@ -39,6 +39,43 @@ pub fn assert_calls(f: &ExtractedFunction, callees: &[&str]) {
     }
 }
 
+/// Every extracted function name, in source order, minus the synthetic
+/// `(toplevel)` holder.
+#[allow(dead_code)]
+pub fn function_names(file: &ExtractedFile) -> Vec<&str> {
+    file.functions
+        .iter()
+        .filter(|f| !f.is_toplevel)
+        .map(|f| f.name.as_str())
+        .collect()
+}
+
+/// Assert the extractor found EXACTLY this set of functions — no misses, no
+/// phantoms. Order-insensitive but multiplicity-sensitive: two methods named
+/// `latest` on different types must be listed twice.
+///
+/// Spot-check assertions (`assert!(names.contains(..))`) cannot catch a
+/// regression that stops extracting something; set equality can. Use it on
+/// fixtures whose contents you control.
+#[allow(dead_code)]
+pub fn assert_exact_functions(file: &ExtractedFile, expected: &[&str]) {
+    let mut got: Vec<&str> = function_names(file);
+    let mut want: Vec<&str> = expected.to_vec();
+    got.sort_unstable();
+    want.sort_unstable();
+    if got == want {
+        return;
+    }
+    let missing: Vec<&&str> = want.iter().filter(|n| !got.contains(n)).collect();
+    let extra: Vec<&&str> = got.iter().filter(|n| !want.contains(n)).collect();
+    // Same names, different counts: report the whole list rather than an
+    // empty diff.
+    panic!(
+        "function set mismatch\n  missing (defined but not extracted): {missing:?}\n  \
+         unexpected (extracted but not defined): {extra:?}\n  got:  {got:?}\n  want: {want:?}"
+    );
+}
+
 pub fn import_paths(file: &ExtractedFile) -> Vec<&str> {
     file.imports.iter().map(|i| i.path.as_str()).collect()
 }

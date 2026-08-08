@@ -18,13 +18,28 @@ use crate::types::{ImportStyle, Lang};
 /// while the `#not-any-of?` guard on the call pattern keeps them from also
 /// being emitted as `source`/`.` calls. The `.` anchor pins `@import.path` to
 /// the argument immediately following the command name.
+///
+/// Bats (`@test "name" { ... }`) is not bash syntax: tree-sitter-bash parses
+/// the header as a plain `command` named `@test` whose arguments are the
+/// description string and a bare `{`, and the body statements land as
+/// *siblings*, not children. So the `@test` pattern below yields a function
+/// named after the description that spans the header line only — enough for
+/// test discovery (`list_tests`) and for `file_overview`, but the body's calls
+/// are attributed to the file's top-level function rather than to the case.
+/// The `#not-any-of?` guard on the call pattern keeps `@test` from also being
+/// emitted as a call to a command named `@test`.
 const QUERY: &str = r#"
 (function_definition
   name: (word) @func.name) @func.def
 
 (command
+  name: (command_name (word) @_bats)
+  argument: (string (string_content) @func.name)
+  (#eq? @_bats "@test")) @func.def
+
+(command
   name: (command_name (word) @call.name)
-  (#not-any-of? @call.name "source" ".")) @call
+  (#not-any-of? @call.name "source" "." "@test")) @call
 
 (command
   name: (command_name (word) @_src)
@@ -52,7 +67,7 @@ pub fn spec() -> LangSpec {
     LangSpec::new(
         Lang::Bash,
         tree_sitter_bash::LANGUAGE.into(),
-        &["sh", "bash"],
+        &["sh", "bash", "bats"],
         QUERY,
         IDENTIFIER_KINDS,
         STRING_KINDS,

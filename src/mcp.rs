@@ -104,7 +104,7 @@ fn handle_msg(state: &mut AppState, msg: Value) -> Option<Value> {
                         "name": "gigagraph",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "instructions": "Semantic code graph over this repo. Use these tools instead of grep/reading files for STRUCTURAL questions: who calls X (get_callers), what does X call (get_callees), where is X defined (search_functions), how do A and B connect (call_path), what is built like X (find_similar), what API surface exists and who calls it (list_endpoints/find_endpoint_callers — REST routes plus SOAP/XML-RPC/JSON-RPC operations, gRPC services, GraphQL/AppSync resolvers, and routes declared in IaC: CloudFormation/SAM templates, serverless.yml, Terraform, CDK — with Lambda handlers linked to the indexed functions they run), what code is dead/unused (unreferenced_functions), who calls a React Native module from JS (bridge_map). BEFORE modifying a function, compute its blast radius pre-emptively: blast_radius shows everything that transitively reaches it (callers, endpoints, cross-service HTTP/RPC consumers, bridge call sites) so you can judge a change's reach BEFORE making it, and affected_tests tells you which tests a change can dirty — run those first after editing. Answers carry signatures + exact file:line, so a follow-up file read is usually unnecessary. Prefer plain grep/file reads instead when: (1) hunting exact literal text — string constants, comments, log messages, config keys; (2) the code is in an unsupported language or generated/minified; (3) you need dynamic/reflective dispatch that static resolution can't see (edges labeled confidence:heuristic are strong leads, not proof — verify load-bearing conclusions); (4) you need file content itself, not structure. Index refreshes automatically on every call; results always reflect the current tree. TOUCH DISCIPLINE (important — there is NO automatic edit logging; the shared history is exactly what agents record): (a) BEFORE modifying any file you did not just create, call recent_touches for it — another agent may have changed it minutes ago for reasons git can't show yet; (b) AFTER every substantive edit (new feature, bug fix, refactor, config/behavior change — not typo-level tweaks), call record_touch with the edited files and a one-line WHY. Treat record_touch as part of finishing the edit, like saving the file: an edit you didn't record is invisible to every other agent and future session working in this repo. When several files change for one reason, record them in ONE call with that reason."
+                    "instructions": "Semantic code graph over this repo. Answers carry signatures and exact file:line, so a follow-up file read is usually unnecessary.\n\nROUTE BY QUESTION:\n- Where is X defined? search_functions\n- Who calls X / what does X call? get_callers / get_callees\n- How does A reach B? call_path\n- What breaks if I change X? blast_radius (call BEFORE editing)\n- What must I re-run after editing? affected_tests, then test_command for the command\n- What tests exist / is X tested? list_tests\n- What routes do we publish, and who calls them? list_endpoints / find_endpoint_callers\n- What outbound HTTP do we make? list_client_calls\n- What else is built like X? find_similar\n- What is in this file or package? file_overview (pass `dir` for a whole package)\n- What looks dead? unreferenced_functions / unreferenced_endpoints\n- Who calls this native module from JS? bridge_map\n- Why is my code missing from an answer? extract_file, then supported_languages, then index_stats.skipped_paths\n\nUSE GREP INSTEAD when you need literal text (strings, comments, config keys), file content rather than structure, an unsupported or generated/minified language, or an exhaustive sweep including dynamic dispatch. Edges marked confidence:heuristic are strong leads, not proof — verify anything load-bearing.\n\nThe index refreshes itself on every call; you do not need index_project.\n\nTOUCH DISCIPLINE — nothing logs edits automatically, so this shared history is exactly what agents record:\n- BEFORE editing a file you did not just create, call recent_touches for it.\n- AFTER a substantive edit, call record_touch with the files and a one-line WHY. Treat it as part of saving the file; an unrecorded edit is invisible to every other agent. Group files changed for one reason into one call."
                 }
             })
         }
@@ -150,30 +150,15 @@ fn handle_msg(state: &mut AppState, msg: Value) -> Option<Value> {
 }
 
 fn tool_definitions() -> Value {
-    let fn_ref = "Function reference: `fn:<id>`, a qualified name (`path::Type::name`), or an unambiguous simple name.";
+    let fn_ref = "Accepts `fn:<id>`, a qualified name (`path::Type::name`), or an unambiguous simple name.";
     json!([
         {
-            "name": "index_project",
-            "description": "Index (or re-index) the project's source tree. Incremental: unchanged files are served from cache. Run after significant code changes.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "force": { "type": "boolean", "description": "Ignore the extraction cache and re-parse everything." }
-                }
-            }
-        },
-        {
-            "name": "index_stats",
-            "description": "Summary of the current index: file/function/call counts, resolution rates, per-language breakdown.",
-            "inputSchema": { "type": "object", "properties": {} }
-        },
-        {
             "name": "search_functions",
-            "description": "Find functions by name (exact, prefix, substring, or fuzzy). Returns ids usable with the other tools. Finds only function DEFINITIONS — for arbitrary literal text (strings, comments, variables, config), plain grep is better and cheaper.",
+            "description": "Where is this function defined? Name search (exact, prefix, substring, fuzzy) over every function in the repo. Start here when you have a name and need the code. Returns ids the other tools take. Definitions only — for literal text (strings, comments, config keys) use grep.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string" },
+                    "query": { "type": "string", "description": "Function name or part of one." },
                     "limit": { "type": "integer" }
                 },
                 "required": ["query"]
@@ -181,7 +166,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "get_function",
-            "description": format!("Full card for one function: location, signature, every call it makes (resolved to internal functions or external packages), the external packages it uses, and its callers. {fn_ref}"),
+            "description": format!("What does this function do and how does it connect? One card: location, signature, what it calls, what packages it uses, who calls it. {fn_ref}"),
             "inputSchema": {
                 "type": "object",
                 "properties": { "function": { "type": "string" } },
@@ -190,7 +175,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "get_callers",
-            "description": format!("Who calls this function, with call sites (file:line). Includes ambiguous matches, flagged. Unlike grep, returns only real resolved call sites (no comments/strings/shadowed names) — but dynamic dispatch, reflection, and callbacks passed by value can be missed; grep for the name if an exhaustive textual sweep matters. {fn_ref}"),
+            "description": format!("Who calls this function? Resolved call sites with file:line — no comment/string/shadowed-name noise that grep returns. Misses dynamic dispatch and callbacks passed by value; grep the name too when you need an exhaustive sweep. {fn_ref}"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -202,7 +187,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "get_callees",
-            "description": format!("Every call this function makes: internal callees, external package calls, and unresolved names. {fn_ref}"),
+            "description": format!("What does this function call? Internal callees, external package calls, and names that stayed unresolved. {fn_ref}"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -213,21 +198,8 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "find_similar",
-            "description": format!("Semantically similar functions via blended vectors: structural (callee names, identifiers, AST shape, control flow, transitive effects) + distilled static name/doc embeddings, so fetchUser and loadAccount can match on meaning as well as shape. Query by indexed function or by raw snippet. Not answerable with grep at all; use for duplicate-logic hunting, convention discovery, refactor targets. {fn_ref}"),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "function": { "type": "string", "description": "Indexed function to match against." },
-                    "snippet": { "type": "string", "description": "Raw code to vectorize instead of an indexed function." },
-                    "language": { "type": "string", "description": "Snippet language (c, javascript, typescript, tsx, java, kotlin, swift). Required with `snippet`." },
-                    "limit": { "type": "integer" }
-                }
-            }
-        },
-        {
             "name": "call_path",
-            "description": format!("Shortest call chain from one function to another over resolved internal edges (BFS). {fn_ref}"),
+            "description": format!("How does A reach B? Shortest call chain between two functions. {fn_ref}"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -239,93 +211,21 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "file_overview",
-            "description": "One file's imports (classified internal/external) and every function defined in it. Accepts a relative path or unique path suffix.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"]
-            }
-        },
-        {
-            "name": "list_packages",
-            "description": "External packages the codebase calls into, ranked by call-site count.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "limit": { "type": "integer" } }
-            }
-        },
-        {
-            "name": "list_endpoints",
-            "description": "API surface this codebase publishes: REST routes (Express/Fastify, Flask/FastAPI, Laravel/Symfony, Spring, ASP.NET, gin/echo/net-http, Sinatra/Rails, axum) plus RPC-style operations — SOAP (JAX-WS, WCF/ASMX, spyne, PHP SoapServer), XML-RPC, JSON-RPC, and gRPC service registrations (service-level; individual proto methods are not indexed). HTTP paths are normalized so /users/:id and /users/{id} compare equal; RPC rows carry the operation name in the path field with kind soap/xml-rpc/json-rpc/grpc.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "method": { "type": "string", "description": "Filter: GET/POST/PUT/DELETE/PATCH/ANY (RPC rows are ANY)." },
-                    "path": { "type": "string", "description": "Filter: substring of the raw or normalized path / operation name." },
-                    "framework": { "type": "string" },
-                    "kind": { "type": "string", "description": "Filter: http, soap, xml-rpc, json-rpc, grpc, or graphql." },
-                    "limit": { "type": "integer" }
-                }
-            }
-        },
-        {
-            "name": "find_endpoint_callers",
-            "description": "Who calls this API route? Give a path (any parameter syntax: /users/:id, /users/{id}) and optional method; returns matching endpoints with their statically-detected in-repo HTTP callers (fetch/axios/requests/Guzzle/HttpClient/...), each with file:line and match confidence. External clients are invisible.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "method": { "type": "string" }
-                },
-                "required": ["path"]
-            }
-        },
-        {
-            "name": "get_endpoint",
-            "description": "Full card for one endpoint (`ep:<id>` from list_endpoints): handler function, all matched client calls with confidence.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "endpoint": { "type": "string" } },
-                "required": ["endpoint"]
-            }
-        },
-        {
-            "name": "list_client_calls",
-            "description": "Outbound HTTP calls the codebase makes (fetch, axios, requests/httpx, Guzzle, net/http, HttpClient, HTTParty), with the calling function and any matched endpoints. `unmatched: true` shows calls that hit no known in-repo endpoint.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "unmatched": { "type": "boolean" },
-                    "library": { "type": "string" },
-                    "limit": { "type": "integer" }
-                }
-            }
-        },
-        {
-            "name": "unreferenced_endpoints",
-            "description": "Endpoints with no statically-detected in-repo caller. NOT proof of dead code: external/mobile/cross-repo clients are invisible to static indexing.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "limit": { "type": "integer" } }
-            }
-        },
-        {
             "name": "blast_radius",
-            "description": format!("Pre-emptive change-impact analysis: BEFORE modifying a function (or file), see everything that can transitively reach it — direct and indirect callers by depth, API endpoints whose handlers are implicated, cross-service consumers via correlated HTTP/RPC client calls, React Native bridge call sites, and how many tests the change can dirty. Static closure: dynamic dispatch and external callers are invisible; `heuristic` rows carry at least one uncertain edge. Seed with `function` or `file`. {fn_ref}"),
+            "description": format!("What breaks if I change this? Call BEFORE editing. Everything that transitively reaches the function or file: callers by depth, endpoints whose handlers are implicated, cross-service HTTP/RPC consumers, React Native bridge sites, affected-test count. Static: dynamic dispatch and out-of-repo callers are invisible, and `heuristic` rows rest on at least one uncertain edge. {fn_ref}"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "function": { "type": "string", "description": "Seed function to analyze." },
+                    "function": { "type": "string", "description": "Seed function." },
                     "file": { "type": "string", "description": "Seed with every function in this file instead." },
-                    "max_depth": { "type": "integer", "description": "Caller-chain depth to explore (default 10, max 50)." },
-                    "limit": { "type": "integer", "description": "Max impacted functions listed (counts are always exact)." }
+                    "max_depth": { "type": "integer", "description": "Caller-chain depth (default 10, max 50)." },
+                    "limit": { "type": "integer", "description": "Max functions listed; counts stay exact." }
                 }
             }
         },
         {
             "name": "affected_tests",
-            "description": format!("Which tests can a change to this function/file dirty? Walks the blast radius and returns the tests (and test-file helpers) inside it, grouped by file with the shallowest call depth — the practical 'run these first after editing' list. Detection: test decorations (#[test], @Test, [Fact], pytest.mark), naming conventions (test_*, TestXxx), and test-file paths (tests/, __tests__, *.spec.ts, *_test.go). An empty result narrows the run; it does not prove no test is affected (dynamic dispatch, fixtures, and data-driven tests are invisible). Seed with `function` or `file`. {fn_ref}"),
+            "description": format!("Which tests must I re-run after this edit? The tests inside the change's blast radius, grouped by file (the file is the re-run unit). Pair with test_command to get the command. Empty narrows the run — it does not prove nothing is affected. {fn_ref}"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -337,48 +237,124 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "visualize",
-            "description": "Generate an interactive 3D map of the codebase as one self-contained HTML file (functions clustered by structural similarity, call-graph edges, API endpoints ringed, search + focus). Writes <root>/.gigagraph/map.html and returns its absolute path — tell the user to open that file in a browser.",
-            "inputSchema": { "type": "object", "properties": {} }
-        },
-        {
-            "name": "record_touch",
-            "description": "Record that you just edited files, with a one-line rationale. Appends to a persistent ring of recent touches shared by all agents working on this repo (last 250 entries, max 10 per file). `git log` is the authoritative history — this ring adds the WHY and covers uncommitted work. Call after completing a substantive edit.",
+            "name": "list_tests",
+            "description": "What tests exist? The repo's standing inventory: every named case with its runner and suite, grouped by file. Use for \"is X tested\", \"what framework does this repo use\", \"show me the tests for this module\". (For \"what should I re-run after my edit\", use affected_tests.) Covers annotations, runner naming conventions, and block styles (describe/it, gtest TEST, Catch2 TEST_CASE, bats @test) across every supported language.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "files": { "type": "array", "items": { "type": "string" }, "description": "Edited files (repo-relative or absolute; stored repo-relative)." },
-                    "why": { "type": "string", "description": "One-line rationale for the edit." },
-                    "agent": { "type": "string", "description": "Who is recording (defaults to \"unknown\")." }
-                },
-                "required": ["files", "why"]
-            }
-        },
-        {
-            "name": "recent_touches",
-            "description": "What was recently edited in this repo and why, newest first — as reported by agents and hooks. Check before modifying unfamiliar files. Not authoritative: `git log` is the real history; this ring adds rationale and covers uncommitted work.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "file": { "type": "string", "description": "Only entries mentioning this file (repo-relative or unique suffix)." },
-                    "limit": { "type": "integer", "description": "Max entries (default 10, max 50)." }
-                }
-            }
-        },
-        {
-            "name": "bridge_map",
-            "description": "React Native bridge map: native @ReactMethod (Java/Kotlin) and RCT_EXPORT_METHOD (ObjC) implementations correlated by name with JS NativeModules call sites. Answers 'who calls this native method from JS' across the language boundary that call resolution can't see. getName() aliases and Swift modules are not matched — see the response note.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "module": { "type": "string", "description": "Filter by native module class name or its JS alias." },
+                    "file": { "type": "string", "description": "Substring of the file path — a file or a directory." },
+                    "name": { "type": "string", "description": "Substring of the case name or its suite." },
+                    "framework": { "type": "string", "description": "pytest, unittest, jest, vitest, mocha, node-test, go-test, junit, xunit, nunit, mstest, rust-test, rspec, minitest, phpunit, gtest, catch2, xctest, swift-testing, bats, shunit2, c-test." },
+                    "language": { "type": "string", "description": "python, typescript, go, ..." },
+                    "include_hooks": { "type": "boolean", "description": "Also return suites and setup/teardown/fixtures (default false)." },
                     "limit": { "type": "integer" }
                 }
             }
         },
         {
+            "name": "test_command",
+            "description": "How do I run this test? Turns a test file or case name into the shell command for its runner, using the project's own build tooling (gradle vs maven, swift test vs xcodebuild, bundler or not). Returns both the single-case command and the whole-file one. Use right after list_tests or affected_tests instead of guessing the invocation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string", "description": "Test file (substring of its path)." },
+                    "name": { "type": "string", "description": "Case name; omit to get the whole-file command." },
+                    "framework": { "type": "string", "description": "Narrow when one file holds more than one runner." }
+                }
+            }
+        },
+        {
+            "name": "list_endpoints",
+            "description": "What API surface does this codebase publish? REST routes plus SOAP/XML-RPC/JSON-RPC operations, gRPC services, GraphQL resolvers, and routes declared in IaC (CloudFormation/SAM, serverless.yml, Terraform, CDK) with their Lambda handlers linked. Paths are normalized, so /users/:id and /users/{id} compare equal.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "method": { "type": "string", "description": "GET/POST/PUT/DELETE/PATCH/ANY (RPC rows are ANY)." },
+                    "path": { "type": "string", "description": "Substring of the raw or normalized path / operation name." },
+                    "framework": { "type": "string" },
+                    "kind": { "type": "string", "description": "http, soap, xml-rpc, json-rpc, grpc, graphql." },
+                    "limit": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "find_endpoint_callers",
+            "description": "Who calls this API route? Give a path in any parameter syntax (/users/:id, /users/{id}); returns matching endpoints and the in-repo code that calls them (fetch/axios/requests/Guzzle/HttpClient/...), with file:line. Callers outside this repo are invisible.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "method": { "type": "string" }
+                },
+                "required": ["path"]
+            }
+        },
+        {
+            "name": "get_endpoint",
+            "description": "Full card for one endpoint (`ep:<id>` from list_endpoints): its handler function and every matched client call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "endpoint": { "type": "string" } },
+                "required": ["endpoint"]
+            }
+        },
+        {
+            "name": "list_client_calls",
+            "description": "What outbound HTTP calls does this codebase make? fetch, axios, requests/httpx, Guzzle, net/http, HttpClient, HTTParty — with the calling function and any endpoint they were matched to. `unmatched: true` shows calls hitting no known in-repo route.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "unmatched": { "type": "boolean" },
+                    "library": { "type": "string" },
+                    "limit": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "find_similar",
+            "description": format!("What else is built like this? Ranks functions by structure (callees, AST shape, control flow, transitive effects) blended with name/doc meaning, so fetchUser and loadAccount match. Grep cannot answer this. Use for duplicate logic, convention discovery, refactor targets, and \"show me the existing pattern before I write a new one\". Query by indexed function or raw snippet. {fn_ref}"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "function": { "type": "string", "description": "Indexed function to match against." },
+                    "snippet": { "type": "string", "description": "Raw code to vectorize instead." },
+                    "language": { "type": "string", "description": "Snippet language. Required with `snippet`." },
+                    "limit": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "file_overview",
+            "description": "What is in this file (or this directory)? Imports, classified internal vs external, plus every function defined. Pass `dir` instead of `path` to get a whole package in one call rather than a round trip per file.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "One file: relative path or unique suffix." },
+                    "dir": { "type": "string", "description": "Every indexed file under this directory." },
+                    "limit": { "type": "integer", "description": "Max files for `dir` (default 50)." }
+                }
+            }
+        },
+        {
+            "name": "extract_file",
+            "description": "Why isn't my code showing up? Raw parser output for one file — functions, decorations/annotations, string-literal call arguments, imports, class hierarchy — before any resolution. Use when a function, route, or test you can see in the source is missing from another tool's answer: this shows whether extraction saw it at all. Works on files that are not indexed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "path": { "type": "string", "description": "Relative, absolute, or unique-suffix path." } },
+                "required": ["path"]
+            }
+        },
+        {
+            "name": "supported_languages",
+            "description": "Can this server read that file? Lists every language and the extensions it claims; pass `path` to ask about one file specifically. Check here before concluding code is missing — an unsupported extension is invisible to every other tool.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "path": { "type": "string", "description": "Ask whether this specific file would be indexed." } }
+            }
+        },
+        {
             "name": "unreferenced_functions",
-            "description": "Dead/unused-code review queue: functions whose NAME is referenced nowhere — no call site (even unresolved), no identifier reference (callbacks by value), no import binding. Decorated functions, endpoint handlers, and entry-point conventions (main, dunders, Java_* JNI, on*/handle* callbacks, tests) are auto-excluded; public/exported functions are demoted to a separate list since external callers are invisible. Cross-language dispatch (JNI, RN bridge, reflection) cannot be seen — treat results as candidates to review, never a delete list.",
+            "description": "What code looks dead? Functions whose name appears nowhere else — no call, no identifier reference, no import binding. Entry points, decorated functions, endpoint handlers and tests are excluded; exported functions are demoted to a separate list because callers outside the repo are invisible. A review queue, never a delete list.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -386,6 +362,77 @@ fn tool_definitions() -> Value {
                     "limit": { "type": "integer" }
                 }
             }
+        },
+        {
+            "name": "unreferenced_endpoints",
+            "description": "Which routes have no in-repo caller? Same caveat as dead code, only stronger: browsers, mobile apps and other services are invisible to static indexing, so this is not proof a route is unused.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "limit": { "type": "integer" } }
+            }
+        },
+        {
+            "name": "bridge_map",
+            "description": "Who calls this native module from JS? React Native bridge: native @ReactMethod (Java/Kotlin) and RCT_EXPORT_METHOD (ObjC) implementations matched by name to NativeModules call sites — the language boundary ordinary call resolution cannot cross.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "module": { "type": "string", "description": "Native module class name or its JS alias." },
+                    "limit": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "list_packages",
+            "description": "What does this codebase depend on in practice? External packages ranked by how many call sites actually use them — usage, not the manifest.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "limit": { "type": "integer" } }
+            }
+        },
+        {
+            "name": "recent_touches",
+            "description": "Has someone just changed this file, and why? Recent edits reported by agents and hooks, newest first. Check before editing a file you did not just write — another agent may have changed it minutes ago for reasons `git log` cannot show yet.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string", "description": "Only entries mentioning this file." },
+                    "limit": { "type": "integer", "description": "Default 10, max 50." }
+                }
+            }
+        },
+        {
+            "name": "record_touch",
+            "description": "Log what you just changed and why. Call after finishing a substantive edit — treat it as part of saving the file. Nothing logs edits automatically, so an unrecorded edit is invisible to every other agent working here. Group files that changed for one reason into a single call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "files": { "type": "array", "items": { "type": "string" }, "description": "Edited files." },
+                    "why": { "type": "string", "description": "One line: why, not what." },
+                    "agent": { "type": "string", "description": "Who is recording." }
+                },
+                "required": ["files", "why"]
+            }
+        },
+        {
+            "name": "index_stats",
+            "description": "How much of this repo does the index actually see? File/function/call counts, per-language breakdown, call-resolution rates, endpoint handler links, and the files that were skipped. Read `skipped_paths` when an answer looks incomplete — a skipped file is invisible everywhere.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "index_project",
+            "description": "Rebuild the index. Rarely needed: every tool refreshes automatically when files change. Use `force: true` after upgrading the server or when results look stale despite an unchanged tree.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "force": { "type": "boolean", "description": "Ignore the extraction cache and re-parse everything." }
+                }
+            }
+        },
+        {
+            "name": "visualize",
+            "description": "Build an interactive 3D map of the codebase as one self-contained HTML file: functions clustered by similarity, call edges, endpoints ringed, client-call arcs, search and focus. Writes <root>/.gigagraph/map.html and returns the path — tell the user to open it in a browser.",
+            "inputSchema": { "type": "object", "properties": {} }
         }
     ])
 }

@@ -10,6 +10,7 @@ pub mod indexer;
 pub mod lang;
 pub mod lsp;
 pub mod mcp;
+pub mod tests;
 pub mod touches;
 pub mod types;
 pub mod vector;

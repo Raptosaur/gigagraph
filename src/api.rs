@@ -8,7 +8,7 @@ use crate::indexer::{self, Index};
 use crate::lang;
 use crate::touches;
 use crate::types::{Confidence, Lang, Resolution};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -145,6 +145,8 @@ impl AppState {
             "find_similar" => self.find_similar(args),
             "call_path" => self.call_path(args),
             "file_overview" => self.file_overview(args),
+            "extract_file" => self.extract_file(args),
+            "supported_languages" => self.supported_languages(args),
             "list_packages" => self.list_packages(args),
             "list_endpoints" => self.list_endpoints(args),
             "find_endpoint_callers" => self.find_endpoint_callers(args),
@@ -154,6 +156,8 @@ impl AppState {
             "unreferenced_functions" => self.unreferenced_functions(args),
             "blast_radius" => self.blast_radius(args),
             "affected_tests" => self.affected_tests(args),
+            "list_tests" => self.list_tests(args),
+            "test_command" => self.test_command(args),
             "bridge_map" => self.bridge_map(args),
             "visualize" => self.visualize(args),
             "record_touch" => self.record_touch(args),
@@ -307,6 +311,204 @@ impl AppState {
             "truncated": res.truncated || tests.len() > limit,
             "files": file_rows,
             "note": "Tests reached over static call edges (plus endpoint/bridge correlations). Helpers defined in test files count as tests — the FILE is the re-run unit. Tests that reach the change only through dynamic dispatch, fixtures, or data files are not listed; an empty result narrows the run, it does not prove no test is affected.",
+        }))
+    }
+
+    /// Every named test case in the repo, grouped by file. Unlike
+    /// `affected_tests` this is not change-scoped — it is the inventory: what
+    /// suites exist, under which runner, and where.
+    fn list_tests(&mut self, args: &Value) -> Result<Value> {
+        let limit = limit_arg(args, 200);
+        let path_q = args
+            .get("file")
+            .or_else(|| args.get("path"))
+            .and_then(Value::as_str)
+            .map(str::to_lowercase);
+        let framework_q = args
+            .get("framework")
+            .and_then(Value::as_str)
+            .map(str::to_lowercase);
+        let language_q = args
+            .get("language")
+            .and_then(Value::as_str)
+            .map(str::to_lowercase);
+        let name_q = args
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_lowercase);
+        // Suites and hooks are scaffolding; the default answer is the cases a
+        // runner would actually execute.
+        let include_hooks = args
+            .get("include_hooks")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let index = self.ensure_index()?;
+        let g = &index.graph;
+
+        let mut matched = 0usize;
+        // file id -> rows, preserving first-seen file order (cases are already
+        // sorted by (file, line)).
+        let mut by_file: Vec<(u32, Vec<Value>)> = Vec::new();
+        for case in &g.tests.cases {
+            if !include_hooks && case.kind != crate::tests::TestKind::Case {
+                continue;
+            }
+            let file = &g.files[case.file_id as usize];
+            if let Some(q) = &path_q {
+                if !file.path.to_lowercase().contains(q.as_str()) {
+                    continue;
+                }
+            }
+            if let Some(q) = &framework_q {
+                if !case.framework.eq_ignore_ascii_case(q) {
+                    continue;
+                }
+            }
+            if let Some(q) = &language_q {
+                if !file.language.name().eq_ignore_ascii_case(q) {
+                    continue;
+                }
+            }
+            if let Some(q) = &name_q {
+                let suite_hit = case
+                    .suite
+                    .as_deref()
+                    .is_some_and(|s| s.to_lowercase().contains(q.as_str()));
+                if !case.name.to_lowercase().contains(q.as_str()) && !suite_hit {
+                    continue;
+                }
+            }
+            matched += 1;
+            if matched > limit {
+                continue;
+            }
+            let mut row = json!({
+                "name": case.name,
+                "line": case.line,
+                "framework": case.framework,
+                "kind": case.kind.as_str(),
+            });
+            if let Some(suite) = &case.suite {
+                row["suite"] = json!(suite);
+            }
+            if let Some(fid) = case.function {
+                row["id"] = json!(format!("fn:{fid}"));
+            }
+            match by_file.iter_mut().find(|(f, _)| *f == case.file_id) {
+                Some((_, rows)) => rows.push(row),
+                None => by_file.push((case.file_id, vec![row])),
+            }
+        }
+
+        let files: Vec<Value> = by_file
+            .into_iter()
+            .map(|(fid, tests)| {
+                json!({
+                    "file": g.files[fid as usize].path,
+                    "language": g.files[fid as usize].language.name(),
+                    "count": tests.len(),
+                    "tests": tests,
+                })
+            })
+            .collect();
+        let frameworks: serde_json::Map<String, Value> = g
+            .tests
+            .frameworks()
+            .into_iter()
+            .map(|(name, n)| (name, json!(n)))
+            .collect();
+
+        Ok(json!({
+            "total_cases": g.tests.case_count(),
+            "total_detected": g.tests.len(),
+            "matched": matched,
+            "truncated": matched > limit,
+            "frameworks": frameworks,
+            "files": files,
+            "note": "Static test inventory: annotations (#[test], @Test, [Fact], @pytest.mark), runner naming conventions (test_*, TestXxx, testXxx), and block-style cases (describe/it, TEST_CASE, gtest TEST, bats @test). Cases only unless include_hooks is set. Tests generated at runtime (table-driven subtests, parameterised expansions, dynamically registered suites) count once at their declaration, not once per generated case.",
+        }))
+    }
+
+    /// The shell command that runs a given test (or test file). `list_tests`
+    /// and `affected_tests` say WHAT to run; this says HOW, so the answer is
+    /// executable instead of a name the caller has to translate.
+    fn test_command(&mut self, args: &Value) -> Result<Value> {
+        let file_q = args.get("file").and_then(Value::as_str).map(str::to_string);
+        let name_q = args.get("name").and_then(Value::as_str).map(str::to_string);
+        let framework_q = args
+            .get("framework")
+            .and_then(Value::as_str)
+            .map(str::to_lowercase);
+        if file_q.is_none() && name_q.is_none() && framework_q.is_none() {
+            bail!("pass `file`, `name`, or `framework` (from list_tests / affected_tests)");
+        }
+
+        let index = self.ensure_index()?;
+        let g = &index.graph;
+
+        // Pick the cases this request refers to. A file alone means "run the
+        // whole file"; a name narrows to one case.
+        let mut matches: Vec<&crate::tests::TestCase> = g
+            .tests
+            .cases
+            .iter()
+            .filter(|c| c.kind == crate::tests::TestKind::Case)
+            .filter(|c| {
+                file_q.as_ref().is_none_or(|q| {
+                    g.files[c.file_id as usize]
+                        .path
+                        .to_lowercase()
+                        .contains(&q.to_lowercase())
+                })
+            })
+            .filter(|c| {
+                name_q
+                    .as_ref()
+                    .is_none_or(|q| c.name.to_lowercase().contains(&q.to_lowercase()))
+            })
+            .filter(|c| {
+                framework_q
+                    .as_ref()
+                    .is_none_or(|q| c.framework.eq_ignore_ascii_case(q))
+            })
+            .collect();
+        matches.sort_by_key(|c| (c.file_id, c.line));
+
+        if matches.is_empty() {
+            bail!(
+                "no test matches that file/name/framework — call list_tests first to see what exists"
+            );
+        }
+
+        // One command per (file, framework); a whole-file run is offered
+        // alongside the single-case one because re-running the file is the
+        // safer default after an edit.
+        let markers = ProjectMarkers::detect(g);
+        let mut rows: Vec<Value> = Vec::new();
+        let mut seen: Vec<(u32, &str)> = Vec::new();
+        for case in &matches {
+            let key = (case.file_id, case.framework.as_str());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let path = &g.files[case.file_id as usize].path;
+            let single = name_q.as_ref().map(|_| case);
+            rows.push(json!({
+                "file": path,
+                "framework": case.framework,
+                "suite": case.suite,
+                "case": single.map(|c| c.name.clone()),
+                "command": test_command_for(&case.framework, path, single.map(|c| *c), &markers),
+                "file_command": test_command_for(&case.framework, path, None, &markers),
+            }));
+        }
+
+        Ok(json!({
+            "matched_cases": matches.len(),
+            "commands": rows,
+            "note": "Best-effort commands from the detected build tooling; adjust the runner path/working directory to your project layout. When in doubt run `file_command` — re-running the whole file is the safer default after an edit.",
         }))
     }
 
@@ -569,38 +771,183 @@ impl AppState {
         }))
     }
 
+    /// One file, or every file under a directory prefix. The multi-file form
+    /// exists because "show me this package" is one question, and asking it
+    /// file-by-file costs a round trip per file.
     fn file_overview(&mut self, args: &Value) -> Result<Value> {
-        let path = required_str(args, "path")?.to_string();
+        let limit = limit_arg(args, 50);
+        let single = args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let prefix = args
+            .get("dir")
+            .or_else(|| args.get("prefix"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if single.is_none() && prefix.is_none() {
+            bail!("pass `path` (one file) or `dir` (every file under a directory)");
+        }
+
         let index = self.ensure_index()?;
         let g = &index.graph;
+
+        if let Some(dir) = prefix {
+            let needle = dir.trim_end_matches('/').to_string();
+            let mut ids: Vec<u32> = g
+                .files
+                .iter()
+                .filter(|f| f.path == needle || f.path.starts_with(&format!("{needle}/")))
+                .map(|f| f.id)
+                .collect();
+            if ids.is_empty() {
+                bail!("no indexed files under {dir}");
+            }
+            let total = ids.len();
+            ids.truncate(limit);
+            let files: Vec<Value> = ids.iter().map(|&id| file_overview_json(g, id)).collect();
+            return Ok(json!({
+                "dir": needle,
+                "total_files": total,
+                "truncated": total > files.len(),
+                "files": files,
+            }));
+        }
+
+        let path = single.expect("checked above");
         let file_id = resolve_file_ref(g, &path)?;
-        let file = &g.files[file_id as usize];
-        let imports: Vec<Value> = file
-            .imports
+        Ok(file_overview_json(g, file_id))
+    }
+
+    /// Raw extraction for ONE file, straight from the parser — no index, no
+    /// resolution. This is the "why isn't my function/route/test showing up"
+    /// tool: it shows exactly what the tree-sitter query saw, including the
+    /// decorations and string-literal call arguments that the resolved graph
+    /// throws away.
+    fn extract_file(&mut self, args: &Value) -> Result<Value> {
+        let path = required_str(args, "path")?.to_string();
+        // Accept an indexed path, a repo-relative path, or an absolute one —
+        // the file does not have to be indexed at all.
+        let abs = {
+            let direct = std::path::Path::new(&path);
+            if direct.is_absolute() && direct.is_file() {
+                direct.to_path_buf()
+            } else if self.root.join(&path).is_file() {
+                self.root.join(&path)
+            } else {
+                let rel = {
+                    let index = self.ensure_index()?;
+                    let file_id = resolve_file_ref(&index.graph, &path)?;
+                    index.graph.files[file_id as usize].path.clone()
+                };
+                self.root.join(rel)
+            }
+        };
+        let source = std::fs::read_to_string(&abs)
+            .with_context(|| format!("cannot read {}", abs.display()))?;
+        let ext = abs
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let spec = crate::lang::spec_for_ext(&ext).ok_or_else(|| {
+            anyhow!(
+                "no parser for extension .{ext} — this file is invisible to the index. \
+                 Call supported_languages to see what is covered."
+            )
+        })?;
+        let ex = crate::extract::extract(spec, &source)
+            .ok_or_else(|| anyhow!("extraction failed for {}", abs.display()))?;
+
+        let functions: Vec<Value> = ex
+            .functions
             .iter()
-            .map(|imp| {
+            .map(|f| {
+                let decorations: Vec<&str> =
+                    f.decorations.iter().map(|d| d.name.as_str()).collect();
+                // Only calls carrying literals are worth returning here: they
+                // are what endpoint/test/client detection keys off.
+                let calls: Vec<Value> = f
+                    .calls
+                    .iter()
+                    .filter(|c| !c.arg_lits.is_empty())
+                    .map(|c| {
+                        json!({
+                            "name": c.name,
+                            "receiver": c.receiver,
+                            "line": c.line,
+                            "args": c.arg_count,
+                            "literals": c.arg_lits.iter().map(|l| &l.text).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
                 json!({
-                    "path": imp.path,
-                    "names": imp.names,
-                    "line": imp.line,
-                    "external_package": imp.external_package,
-                    "resolved_file": imp.resolved_file.map(|id| g.files[id as usize].path.clone()),
+                    "name": f.name,
+                    "lines": format!("{}-{}", f.start_line, f.end_line),
+                    "signature": f.signature,
+                    "containing_type": f.containing_type,
+                    "params": f.param_count,
+                    "exported": f.is_exported,
+                    "toplevel": f.is_toplevel,
+                    "decorations": decorations,
+                    "literal_calls": calls,
                 })
             })
             .collect();
-        let functions: Vec<Value> = g
-            .functions
-            .iter()
-            .filter(|f| f.file_id == file_id)
-            .map(|f| function_summary(g, f.id))
-            .collect();
+
         Ok(json!({
-            "path": file.path,
-            "language": file.language.name(),
-            "package": file.package,
-            "imports": imports,
+            "path": path,
+            "language": ex.language.name(),
+            "package": ex.package,
+            "function_count": ex.functions.iter().filter(|f| !f.is_toplevel).count(),
             "functions": functions,
+            "imports": ex.imports.iter().map(|i| json!({
+                "path": i.path, "names": i.names, "line": i.line, "system": i.system,
+            })).collect::<Vec<_>>(),
+            "type_decorations": ex.type_decorations.iter()
+                .map(|(ty, d)| json!({ "type": ty, "name": d.name, "line": d.line }))
+                .collect::<Vec<_>>(),
+            "hierarchy": ex.hierarchy.iter()
+                .map(|(d, b)| json!({ "type": d, "base": b }))
+                .collect::<Vec<_>>(),
+            "consts": ex.consts.iter()
+                .map(|(n, v)| json!({ "name": n, "value": v }))
+                .collect::<Vec<_>>(),
+            "note": "Pre-resolution view: `(toplevel)` is the synthetic holder for a file's top-level statements, and only calls carrying literal arguments are listed.",
         }))
+    }
+
+    /// What this server can and cannot read. Optionally answers the narrower
+    /// question "would THIS file be indexed?", which is the real reason to
+    /// call it.
+    fn supported_languages(&mut self, args: &Value) -> Result<Value> {
+        let mut rows: Vec<Value> = crate::lang::registry()
+            .iter()
+            .map(|spec| {
+                json!({
+                    "language": spec.lang.name(),
+                    "extensions": spec.extensions,
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| a["language"].as_str().cmp(&b["language"].as_str()));
+
+        let mut out = json!({
+            "languages": rows,
+            "note": "Terraform (.tf), CloudFormation/SAM and serverless.yml are scanned for endpoints without a full parser, so they carry routes but no functions.",
+        });
+        if let Some(path) = args.get("path").and_then(Value::as_str) {
+            let ext = std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let language = crate::lang::spec_for_ext(&ext).map(|s| s.lang.name());
+            out["path"] = json!(path);
+            out["indexable"] = json!(language.is_some());
+            out["path_language"] = json!(language);
+        }
+        Ok(out)
     }
 
     fn list_packages(&mut self, args: &Value) -> Result<Value> {
@@ -1168,6 +1515,222 @@ fn client_json(g: &GigaGraph, c: &endpoints::ClientCall) -> Value {
         "library": c.library,
         "caller": function_summary(g, c.caller),
         "at": format!("{}:{}", file.path, c.line),
+    })
+}
+
+/// Build-tool evidence, read off the indexed tree. Which wrapper a project
+/// uses changes the command shape entirely (`./mvnw test -Dtest=X` vs
+/// `./gradlew test --tests X`), and the marker files are already indexed.
+struct ProjectMarkers {
+    maven: bool,
+    gradle: bool,
+    swift_package: bool,
+    composer: bool,
+    gemfile: bool,
+}
+
+impl ProjectMarkers {
+    fn detect(g: &GigaGraph) -> ProjectMarkers {
+        let has = |name: &str| {
+            std::path::Path::new(&g.root).join(name).exists()
+                || g.files
+                    .iter()
+                    .any(|f| f.path == name || f.path.ends_with(&format!("/{name}")))
+        };
+        ProjectMarkers {
+            maven: has("pom.xml"),
+            gradle: has("build.gradle") || has("build.gradle.kts"),
+            swift_package: has("Package.swift"),
+            composer: has("composer.json"),
+            gemfile: has("Gemfile"),
+        }
+    }
+}
+
+/// Shell command for one framework. `case = None` means "run the whole file".
+///
+/// These are the commands a developer would type, not a guaranteed-correct
+/// invocation: working directory, runner path and module layout vary per
+/// project, and some runners (gtest, Catch2) execute a compiled binary whose
+/// name is nowhere in the source.
+fn test_command_for(
+    framework: &str,
+    path: &str,
+    case: Option<&crate::tests::TestCase>,
+    m: &ProjectMarkers,
+) -> String {
+    let name = case.map(|c| c.name.as_str());
+    let suite = case.and_then(|c| c.suite.as_deref());
+    // Rust's own `mod tests` names are unique enough to filter on directly;
+    // an integration test additionally needs its binary (the file stem).
+    let rust_binary = path
+        .strip_prefix("tests/")
+        .and_then(|rest| rest.strip_suffix(".rs"))
+        .filter(|stem| !stem.contains('/'));
+
+    match framework {
+        "pytest" | "unittest" => match name {
+            Some(n) => format!("pytest {path} -k {}", quote(n)),
+            None => format!("pytest {path}"),
+        },
+        "jest" => match name {
+            Some(n) => format!("npx jest {path} -t {}", quote(n)),
+            None => format!("npx jest {path}"),
+        },
+        "vitest" => match name {
+            Some(n) => format!("npx vitest run {path} -t {}", quote(n)),
+            None => format!("npx vitest run {path}"),
+        },
+        "mocha" => match name {
+            Some(n) => format!("npx mocha {path} --grep {}", quote(n)),
+            None => format!("npx mocha {path}"),
+        },
+        "node-test" => format!("node --test {path}"),
+        "go-test" => {
+            let pkg = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
+            match name {
+                Some(n) => format!("go test -run '^{n}$' ./{pkg}"),
+                None => format!("go test ./{pkg}"),
+            }
+        }
+        "rust-test" => {
+            let filter = name.unwrap_or("");
+            match (rust_binary, filter.is_empty()) {
+                (Some(bin), true) => format!("cargo test --test {bin}"),
+                (Some(bin), false) => format!("cargo test --test {bin} {filter}"),
+                (None, true) => format!("cargo test  # {path}"),
+                (None, false) => format!("cargo test {filter}"),
+            }
+        }
+        "junit" => {
+            let target = match (suite, name) {
+                (Some(s), Some(n)) if m.gradle => format!("--tests {}", quote(&format!("{s}.{n}"))),
+                (Some(s), Some(n)) => format!("-Dtest={s}#{n}"),
+                (Some(s), None) if m.gradle => format!("--tests {}", quote(s)),
+                (Some(s), None) => format!("-Dtest={s}"),
+                _ => String::new(),
+            };
+            if m.gradle {
+                format!("./gradlew test {target}").trim_end().to_string()
+            } else if m.maven {
+                format!("./mvnw test {target}").trim_end().to_string()
+            } else {
+                format!("mvn test {target}").trim_end().to_string()
+            }
+        }
+        "xunit" | "nunit" | "mstest" => {
+            let filter = match (suite, name) {
+                (Some(s), Some(n)) => format!("FullyQualifiedName~{s}.{n}"),
+                (Some(s), None) => format!("FullyQualifiedName~{s}"),
+                (None, Some(n)) => format!("FullyQualifiedName~{n}"),
+                _ => String::new(),
+            };
+            if filter.is_empty() {
+                "dotnet test".to_string()
+            } else {
+                format!("dotnet test --filter {}", quote(&filter))
+            }
+        }
+        "phpunit" => {
+            let runner = if m.composer {
+                "vendor/bin/phpunit"
+            } else {
+                "phpunit"
+            };
+            match name {
+                Some(n) => format!("{runner} --filter {} {path}", quote(n)),
+                None => format!("{runner} {path}"),
+            }
+        }
+        "rspec" => {
+            let runner = if m.gemfile { "bundle exec rspec" } else { "rspec" };
+            match case {
+                // RSpec addresses a case by line, which survives renames.
+                Some(c) => format!("{runner} {path}:{}", c.line),
+                None => format!("{runner} {path}"),
+            }
+        }
+        "minitest" => {
+            let prefix = if m.gemfile { "bundle exec " } else { "" };
+            match name {
+                Some(n) => format!("{prefix}ruby -Itest {path} -n {n}"),
+                None => format!("{prefix}ruby -Itest {path}"),
+            }
+        }
+        "xctest" | "swift-testing" => {
+            if m.swift_package {
+                match (suite, name) {
+                    (Some(s), Some(n)) => format!("swift test --filter {s}/{n}"),
+                    (Some(s), None) => format!("swift test --filter {s}"),
+                    (None, Some(n)) => format!("swift test --filter {n}"),
+                    _ => "swift test".to_string(),
+                }
+            } else {
+                match (suite, name) {
+                    (Some(s), Some(n)) => format!(
+                        "xcodebuild test -only-testing:'<Scheme>/{s}/{n}'  # set the test target"
+                    ),
+                    (Some(s), _) => {
+                        format!("xcodebuild test -only-testing:'<Scheme>/{s}'  # set the test target")
+                    }
+                    _ => "xcodebuild test".to_string(),
+                }
+            }
+        }
+        "gtest" => match (suite, name) {
+            // The gtest runner is a compiled binary whose name never appears
+            // in the sources — hence the placeholder.
+            (Some(s), Some(n)) => format!("<test-binary> --gtest_filter={s}.{n}"),
+            (Some(s), None) => format!("<test-binary> --gtest_filter={s}.*"),
+            _ => "ctest".to_string(),
+        },
+        "catch2" => match name {
+            Some(n) => format!("<test-binary> {}", quote(n)),
+            None => "ctest".to_string(),
+        },
+        "bats" => match name {
+            Some(n) => format!("bats {path} -f {}", quote(n)),
+            None => format!("bats {path}"),
+        },
+        "shunit2" => format!("sh {path}"),
+        "c-test" => format!("<test-binary>  # built from {path}"),
+        _ => format!("<runner> {path}"),
+    }
+}
+
+/// Single-quote for a POSIX shell, escaping embedded quotes.
+fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// A file's imports + functions, the shape `file_overview` returns per file.
+fn file_overview_json(g: &GigaGraph, file_id: u32) -> Value {
+    let file = &g.files[file_id as usize];
+    let imports: Vec<Value> = file
+        .imports
+        .iter()
+        .map(|imp| {
+            json!({
+                "path": imp.path,
+                "names": imp.names,
+                "line": imp.line,
+                "external_package": imp.external_package,
+                "resolved_file": imp.resolved_file.map(|id| g.files[id as usize].path.clone()),
+            })
+        })
+        .collect();
+    let functions: Vec<Value> = g
+        .functions
+        .iter()
+        .filter(|f| f.file_id == file_id)
+        .map(|f| function_summary(g, f.id))
+        .collect();
+    json!({
+        "path": file.path,
+        "language": file.language.name(),
+        "package": file.package,
+        "imports": imports,
+        "functions": functions,
     })
 }
 

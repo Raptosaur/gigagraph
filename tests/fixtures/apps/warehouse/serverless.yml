@@ -1,0 +1,17 @@
+service: warehouse-jobs
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+
+functions:
+  reindex:
+    handler: jobs/reindex.handler
+    events:
+      - httpApi:
+          method: POST
+          path: /jobs/reindex
+  nightlyCount:
+    handler: jobs/count.handler
+    events:
+      - schedule: rate(1 day)

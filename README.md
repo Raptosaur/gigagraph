@@ -6,8 +6,9 @@ packages it depends on — rather than embedding source text. Written in Rust
 with tree-sitter parsing and rayon multithreading; built to chew through large
 multi-language monorepos.
 
-**Languages:** C, C++, C#, Bash, Go, Java, JavaScript, Kotlin, Objective-C,
-PHP, Python, Ruby, Rust, Swift, TypeScript (+TSX) — plus schema languages:
+**Languages:** C, C++, C#, Bash (incl. `.bats`), Go, Java, JavaScript, Kotlin,
+Objective-C, PHP, Python, Ruby, Rust, Swift, TypeScript (+TSX) — plus schema
+languages:
 SQL (tables, views, functions, and their dependency edges), Prisma (models +
 relations), GraphQL SDL (types + type dependencies), and shallow YAML.
 
@@ -163,14 +164,16 @@ tool calls) — see `docs/HOOKS.md`.
 | Tool | What it answers |
 |---|---|
 | `index_project` | (Re)index the tree. Incremental; `force` re-parses all. |
-| `index_stats` | Files/functions/calls, resolution rates, per-language counts. |
+| `index_stats` | Files/functions/calls, resolution rates, per-language counts, endpoint handler links, and skipped files. |
 | `search_functions` | Find functions by name (exact/prefix/substring/fuzzy). |
 | `get_function` | Full card: location, signature, calls out (resolved), packages used, callers. |
 | `get_callers` | Who calls this? Call sites with file:line, ambiguity flagged. |
 | `get_callees` | Everything this calls: internal, external package, unresolved. |
 | `find_similar` | Structurally similar functions — by indexed function or raw snippet. |
 | `call_path` | Shortest call chain between two functions (BFS). |
-| `file_overview` | One file's imports (classified) + functions. |
+| `file_overview` | One file's imports (classified) + functions — or a whole directory via `dir`. |
+| `extract_file` | Raw parser output for one file (functions, annotations, literal call args) — why something isn't showing up. |
+| `supported_languages` | Languages + extensions; `path` answers "would this file be indexed?". |
 | `list_packages` | External packages ranked by call-site count. |
 | `list_endpoints` | Published API surface: REST routes, SOAP/XML-RPC/JSON-RPC operations, gRPC services, GraphQL/AppSync resolvers, and IaC-declared routes (`kind` filter). |
 | `find_endpoint_callers` | Who calls `POST /api/users/:id`? Endpoints + their in-repo HTTP callers. |
@@ -180,6 +183,8 @@ tool calls) — see `docs/HOOKS.md`.
 | `unreferenced_functions` | Dead-code review queue; framework/entry-point conventions auto-excluded. |
 | `blast_radius` | Pre-emptive change impact: transitive callers by depth, implicated endpoints, cross-service consumers via correlated HTTP/RPC calls, RN bridge sites, affected-test count. |
 | `affected_tests` | Which tests can a change to this function/file dirty, grouped by file (the re-run unit). |
+| `list_tests` | The standing test inventory: every named case with its runner and suite (`file`/`name`/`framework`/`language` filters). |
+| `test_command` | The shell command that runs a given test file/case, using the project's own build tooling. |
 | `bridge_map` | React Native bridge: native methods ↔ JS `NativeModules` call sites. |
 | `visualize` | Self-contained 3D HTML map of the codebase. |
 | `record_touch` / `recent_touches` | Shared editing memory: what was changed and why, across agents. |
@@ -203,6 +208,7 @@ src/
   lang/        one tree-sitter query + metadata per language (docs/QUERY_CONTRACT.md)
   extract.rs   generic query-driven extraction: functions, calls, imports, features
   graph.rs     id assignment, import classification, heuristic call resolution
+  tests.rs     test discovery: annotations, runner naming conventions, BDD blocks
   vector.rs    feature-hashed structural vectors + parallel blended cosine top-k
   verbs.rs     identifier word-splitting + verb-synonym bucketing
   embed.rs     compiled-in distilled static embeddings (src/embed/, ~2.2 MB)
@@ -215,6 +221,38 @@ src/
 Parsing is per-file parallel (rayon); resolution is per-function parallel;
 similarity search is chunk-parallel. Adding a language = one file with a
 tree-sitter query following the capture contract, plus fixtures.
+
+## Testing
+
+Three layers, all under `tests/`:
+
+- **Per-language extraction tests** (`python_test.rs`, `swift_test.rs`, …) —
+  spot-checks that a construct is handled.
+- **App fixtures** (`tests/fixtures/apps/`, asserted by `apps_test.rs` and
+  `list_tests_test.rs`) — eight small but realistic applications spanning all
+  twenty languages, each with its own idiomatic test suite. `apps_test.rs`
+  asserts **set equality** between the functions a file defines and the
+  functions extracted, so a regression that silently stops extracting a
+  construct fails even when every spot-check still passes. Constructs the
+  extractor genuinely cannot see are asserted as *absent*, so the day one
+  starts working is a deliberate change rather than a surprise.
+- **Real-world corpus** (`tests/corpus.json`, `corpus_test.rs`) — thirteen
+  open-source applications (Spring PetClinic, axum, googletest, bats-core,
+  Vapor, AFNetworking, the RealWorld reference apps, …) cloned at pinned
+  commits. Fixtures prove a construct is handled; the corpus proves the
+  handling survives vendored trees, generated files and scale.
+
+```sh
+cargo test                                        # fixtures + unit tests (offline)
+scripts/fetch-corpus.sh                           # clone the pinned corpus
+scripts/fetch-corpus.sh --report                  # measured counts + suggested floors
+cargo test --test corpus_test -- --ignored        # validate against real apps
+```
+
+Corpus expectations are floors, not equalities — regression detectors rather
+than quality bars. Where an application's architecture defeats static
+resolution (Rails autoloading, MediatR indirection), the floor is honestly low
+and the reason is recorded in the manifest.
 
 ## Benchmarks
 
